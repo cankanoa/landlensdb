@@ -269,17 +269,19 @@ class Mapillary:
                     img.get("captured_at"), lat, lng
                 )
 
-            # Set image URL from available options
-            image_url_found = False
+            # Store thumb_*_url temporarily for download, then remove from final dataframe
+            download_url = None
             for key in self.IMAGE_URL_KEYS:
                 if key in img:
-                    img["image_url"] = str(img.pop(key))  # Explicitly convert to string
-                    image_url_found = True
+                    download_url = str(img.pop(key))  # Get URL for download but don't store in dataframe
                     break
-
-            # If no image URL was found, set a placeholder URL
-            if not image_url_found:
-                img["image_url"] = f"placeholder://mapillary/{img['mly_id']}"
+            
+            # Store the download URL temporarily (will be used in download_images)
+            if download_url:
+                img["_temp_download_url"] = download_url
+            
+            # Set image_url as placeholder - will be updated to local path after download
+            img["image_url"] = f"pending://local/{img['mly_id']}.jpg"
 
             # Convert list parameters to strings
             for key in ["camera_parameters", "computed_rotation"]:
@@ -473,7 +475,8 @@ class Mapillary:
             max_retries (int, optional): Maximum number of retries for failed downloads. Defaults to 3.
 
         Returns:
-            tuple: (success_count, failed_list) - Number of successfully downloaded images and list of failed IDs
+            tuple: (success_count, failed_list, updated_geoimageframe) - Number of successfully downloaded images, 
+                   list of failed IDs, and GeoImageFrame with updated local image paths
         """
         # Create output directory if it doesn't exist
         output_dir = Path(output_dir)
@@ -507,13 +510,42 @@ class Mapillary:
                     f"Filtered out {filtered_count} images below quality threshold {quality_threshold}"
                 )
 
-        # Find already downloaded images
-        existing_files = []
+        # Find already downloaded images by checking database
+        existing_mly_ids = set()
         if skip_existing:
-            existing_files = set(f.stem for f in output_dir.glob("*.png"))
-            print(
-                f"Found {len(existing_files)} existing images in the output directory"
-            )
+            try:
+                # Import here to avoid circular imports
+                import os
+                from sqlalchemy import create_engine, text
+                
+                # Get database connection from environment
+                database_url = os.environ.get("DATABASE_URL")
+                if database_url:
+                    engine = create_engine(database_url)
+                    
+                    # Query for existing mly_ids that have local image_url paths
+                    query = text("""
+                        SELECT DISTINCT mly_id 
+                        FROM mapillary 
+                        WHERE mly_id IS NOT NULL 
+                        AND image_url IS NOT NULL 
+                        AND image_url NOT LIKE 'http%' 
+                        AND image_url NOT LIKE 'pending:%'
+                    """)
+                    
+                    with engine.connect() as conn:
+                        result = conn.execute(query)
+                        existing_mly_ids = set(str(row[0]) for row in result.fetchall())
+                    
+                    print(f"Found {len(existing_mly_ids)} existing images in database")
+                else:
+                    print("No DATABASE_URL found, falling back to directory scan")
+                    existing_mly_ids = set(f.stem for f in output_dir.glob("*.jpg"))
+                    
+            except Exception as e:
+                print(f"Error checking database for existing images: {e}")
+                print("Falling back to directory scan")
+                existing_mly_ids = set(f.stem for f in output_dir.glob("*.jpg"))
 
         # Filter out images that have already been downloaded or failed permanently
         df = geoimageframe.copy()
@@ -530,7 +562,7 @@ class Mapillary:
 
         # Filter out already downloaded images
         if skip_existing:
-            df = df[~df["mly_id"].isin(existing_files)]
+            df = df[~df["mly_id"].isin(existing_mly_ids)]
             df = df[
                 ~df["mly_id"].isin(
                     [
@@ -543,42 +575,35 @@ class Mapillary:
 
         if len(df) == 0:
             print("No new images to download")
-            return 0, []
+            # Update image_url for existing files
+            updated_geoimageframe = geoimageframe.copy()
+            for idx, row in updated_geoimageframe.iterrows():
+                image_id = str(row.get("mly_id", row.get("id", "")))
+                if image_id in existing_mly_ids:
+                    updated_geoimageframe.at[idx, "image_url"] = str(output_dir / f"{image_id}.jpg")
+            return 0, [], updated_geoimageframe
 
         print(f"Preparing to download {len(df)} images")
 
-        # Check for image_url column, fallback to constructing URLs
-        has_image_url = (
-            "image_url" in df.columns
-            and not df["image_url"].str.contains("placeholder").any()
-        )
-
-        # If no image_url but we have a specific resolution, check for thumb_*_url
-        url_column = f"thumb_{resolution}_url"
-        if not has_image_url and url_column in df.columns:
-            has_image_url = True
-            df["image_url"] = df[url_column]
+        # Check if we have temporary download URLs
+        has_temp_url = "_temp_download_url" in df.columns
 
         # Function to download a single image with rate limiting
         def download_single_image(row):
             image_id = str(row["mly_id"])
 
-            # Get URL from the dataframe if it exists, otherwise construct it
-            if (
-                has_image_url
-                and not pd.isna(row["image_url"])
-                and not row["image_url"].startswith("placeholder")
-            ):
-                url = row["image_url"]
+            # Get URL from temporary download URL if it exists, otherwise construct it
+            if has_temp_url and not pd.isna(row.get("_temp_download_url")):
+                url = row["_temp_download_url"]
             else:
                 # Construct URL for the image using the API
                 url = f"https://graph.mapillary.com/{image_id}/thumbnail?access_token={self.TOKEN}&height={resolution}"
 
-            image_path = output_dir / f"{image_id}.png"
+            image_path = output_dir / f"{image_id}.jpg"
 
             # Skip if already downloaded
             if image_path.exists():
-                return True, image_id, "skipped"
+                return True, image_id, "skipped", str(image_path)
 
             for retry in range(max_retries):
                 try:
@@ -603,11 +628,11 @@ class Mapillary:
                                 )
                                 # Continue anyway since we have the full image
 
-                        return True, image_id, "success"
+                        return True, image_id, "success", str(image_path)
 
                     elif response.status_code == 404:
                         # Permanent failure, don't retry
-                        return False, image_id, "failed_permanent"
+                        return False, image_id, "failed_permanent", None
 
                     elif response.status_code == 429:
                         # Rate limit exceeded - this shouldn't happen with our rate limiter
@@ -635,11 +660,12 @@ class Mapillary:
                     time.sleep(wait_time)
 
             # If we get here, all retries failed
-            return False, image_id, "failed_temporary"
+            return False, image_id, "failed_temporary", None
 
         # Process in batches
         success_count = 0
         failed_ids = []
+        downloaded_paths = {}  # Track downloaded image paths
 
         # Calculate number of batches
         num_batches = (len(df) + batch_size - 1) // batch_size
@@ -663,14 +689,16 @@ class Mapillary:
                     total=len(future_to_row),
                     desc=f"Batch {batch_idx + 1}",
                 ):
-                    success, image_id, status = future.result()
-                    batch_results.append((success, image_id, status))
+                    success, image_id, status, local_path = future.result()
+                    batch_results.append((success, image_id, status, local_path))
 
                     # Update status cache
                     download_status[image_id] = status
 
                     if success:
                         success_count += 1
+                        if local_path:
+                            downloaded_paths[image_id] = local_path
                     elif status == "failed_temporary":
                         failed_ids.append(image_id)
 
@@ -679,7 +707,7 @@ class Mapillary:
                 json.dump(download_status, f)
 
             # Calculate and display batch success rate
-            batch_success = sum(1 for success, _, _ in batch_results if success)
+            batch_success = sum(1 for success, _, _, _ in batch_results if success)
             batch_size_actual = len(batch_df)
             print(
                 f"Batch {batch_idx + 1} complete: {batch_success}/{batch_size_actual} images downloaded successfully"
@@ -692,7 +720,21 @@ class Mapillary:
         if failed_ids:
             print(f"Failed to download {len(failed_ids)} images")
 
-        return success_count, failed_ids
+        # Update the GeoImageFrame with local paths
+        updated_geoimageframe = geoimageframe.copy()
+        for idx, row in updated_geoimageframe.iterrows():
+            image_id = str(row.get("mly_id", row.get("id", "")))
+            # Check if this image was downloaded or already exists
+            if image_id in downloaded_paths:
+                updated_geoimageframe.at[idx, "image_url"] = downloaded_paths[image_id]
+            elif image_id in existing_mly_ids:
+                updated_geoimageframe.at[idx, "image_url"] = str(output_dir / f"{image_id}.jpg")
+        
+        # Remove temporary download URL column if it exists
+        if "_temp_download_url" in updated_geoimageframe.columns:
+            updated_geoimageframe = updated_geoimageframe.drop(columns=["_temp_download_url"])
+
+        return success_count, failed_ids, updated_geoimageframe
 
     def _fetch_coverage_tile(
         self, zoom, x, y, start_timestamp=None, end_timestamp=None
