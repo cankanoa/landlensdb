@@ -40,9 +40,9 @@ class Mapillary:
     TILES_URL = "https://tiles.mapillary.com"
 
     # API rate limits (conservative to avoid timeouts)
-    ENTITY_LIMIT = 30000  # 30,000 requests per minute for entity API (conservative)
-    SEARCH_LIMIT = 5000   # 5,000 requests per minute for search API (conservative)
-    TILES_LIMIT = 25000   # 25,000 requests per day for tiles API (conservative)
+    ENTITY_LIMIT = 59000  # 60,000 requests per minute for entity API
+    SEARCH_LIMIT = 9000   # 10,000 requests per minute for search API 
+    TILES_LIMIT = 49000   # 50,000 requests per day for tiles API
 
     # Results limit for recursive fetch
     LIMIT = 2000  # Maximum number of results per API call
@@ -186,7 +186,7 @@ class Mapillary:
 
         # Add timeout if not provided (longer for traditional API)
         if "timeout" not in kwargs:
-            kwargs["timeout"] = 60  # Increased timeout to 60 seconds
+            kwargs["timeout"] = 10  # Increased timeout to 10 seconds
 
         # Make the request with retry logic
         max_retries = 3
@@ -736,6 +736,34 @@ class Mapillary:
 
         return success_count, failed_ids, updated_geoimageframe
 
+
+    def _detect_login_page(self, response):
+        """
+        Detect if the response is a login page instead of vector tile data.
+        
+        Args:
+            response: HTTP response object
+            
+        Returns:
+            bool: True if this is a login page
+        """
+        content_type = response.headers.get('content-type', '')
+        
+        # Check for HTML content type
+        if 'text/html' in content_type:
+            try:
+                text_content = response.text
+                # Check for Japanese login messages
+                if 'ログインしていません' in text_content or 'ログインしてください' in text_content:
+                    return True
+                # Check for English login messages
+                if 'not logged in' in text_content.lower() or 'please log in' in text_content.lower():
+                    return True
+            except:
+                pass
+        
+        return False
+
     def _fetch_coverage_tile(
         self, zoom, x, y, start_timestamp=None, end_timestamp=None
     ):
@@ -761,6 +789,11 @@ class Mapillary:
         try:
             response = self._rate_limited_request(url, api_type="tiles")
             if response.status_code == 200:
+                # Check for authentication issues first
+                if self._detect_login_page(response):
+                    warnings.warn(f"Authentication required for tile {x},{y} - falling back to traditional API")
+                    return []
+                
                 # Vector tiles are binary, not JSON
                 if "application/x-protobuf" in response.headers.get("content-type", ""):
                     try:
