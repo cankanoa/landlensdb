@@ -6,7 +6,8 @@ import folium
 import requests
 from folium.features import CustomIcon
 from geopandas import GeoDataFrame
-from shapely.geometry import Point
+from osgeo.gdal import Dataset
+from shapely.geometry import Point, Polygon
 from sqlalchemy import MetaData
 from sqlalchemy.inspection import inspect
 from sqlalchemy.sql import text
@@ -65,17 +66,46 @@ def _generate_arrow_svg(compass_angle):
 
 
 class GeoImageFrame(GeoDataFrame):
-    """A GeoDataFrame extension for managing geolocated images.
+    """A `GeoDataFrame` specialized for image-centric geospatial records.
 
-    Attributes:
-        image_url (str): URL to the image file.
-        name (str): Name or label for the image.
-        geometry (shapely.geometry.Point): Geolocation of the image.
+    Required columns:
+        `name` (str): Image name or identifier.
+        `image_url` (str): Source path or URL for the original image.
+        `geometry` (shapely.geometry.Point or shapely.geometry.Polygon):
+            Image location in EPSG:4326.
+
+    Common optional columns:
+        `thumbnail`: In-memory thumbnail representation for the image as a
+            3-dimensional NumPy array.
+        `thumbnail_geotransform`: GDAL geotransform paired with `thumbnail`.
+        `metadata` (dict): Parsed metadata dictionary for the import type.
+        `captured_at` (str): ISO-8601 capture timestamp.
+        `camera_type` (str): Derived camera type label.
+        `camera_parameters` (str): Serialized camera parameter payload.
+        `altitude` (float): Image altitude from metadata.
+        `compass_angle` (float): Image heading in degrees.
+        `exif_orientation` (float): EXIF orientation flag.
 
     Example:
-        geo_frame = GeoImageFrame({'image_url': ['http://example.com/image.jpg'], 'name': ['Sample'], 'geometry': [Point(0, 0)]})
+        geo_frame = GeoImageFrame(
+            {
+                "image_url": ["http://example.com/image.jpg"],
+                "name": ["Sample"],
+                "metadata": [{"source": {"path": "http://example.com/image.jpg"}}],
+                "geometry": [Point(0, 0)],
+            }
+        )
     """
+    required_columns = {
+        "image_url": str,
+        "name": str,
+        "geometry": (Point, Polygon),
+    }
 
+    optional_columns = {
+        "metadata": dict,
+        "thumbnail": Dataset,
+    }
     def __init__(self, *args, **kwargs):
         """Initialize the GeoImageFrame object.
 
@@ -87,17 +117,29 @@ class GeoImageFrame(GeoDataFrame):
         self._verify_structure()
 
     def _verify_structure(self):
-        """Verifies the structure of the GeoImageFrame to ensure it has the required columns and datatypes."""
-        required_columns = {"image_url": str, "name": str, "geometry": Point}
-
-        for col, dtype in required_columns.items():
+        """Verify required columns, optional columns, uniqueness, and CRS."""
+        for col, dtype in self.required_columns.items():
             if col not in self.columns:
                 raise ValueError(f"The required column '{col}' is missing.")
 
-            # Check if the elements are of the correct type
             wrong_type_mask = ~self[col].apply(lambda x: isinstance(x, dtype))
             if wrong_type_mask.any():
                 raise TypeError(f"Column '{col}' contains wrong data type.")
+
+        for col, dtype in self.optional_columns.items():
+            if col not in self.columns:
+                continue
+
+            wrong_type_mask = ~self[col].apply(
+                lambda x: x is None or isinstance(x, dtype)
+            )
+            if wrong_type_mask.any():
+                raise TypeError(f"Column '{col}' contains wrong data type.")
+
+        if "image_url" in self.columns and self["image_url"].duplicated().any():
+            raise ValueError(
+                "'image_url' column has duplicate entries. It must be unique."
+            )
 
     def to_dict_records(self):
         """Converts the GeoImageFrame to a dictionary representation.
@@ -136,33 +178,25 @@ class GeoImageFrame(GeoDataFrame):
             ValueError: If required columns are missing or if the CRS is incorrect.
             TypeError: If the columns contain incorrect data types.
         """
-        required_columns = ["name", "image_url", "geometry"]
-        for col in required_columns:
-            if col not in self.columns:
-                raise ValueError(f"Column '{col}' is missing.")
+        self._verify_structure()
 
-        if not self["name"].apply(isinstance, args=(str,)).all():
-            raise TypeError("All entries in 'name' column must be of type string.")
-
-        if not self["image_url"].apply(isinstance, args=(str,)).all():
-            raise TypeError("All entries in 'image_url' column must be of type string.")
-
-        if self["image_url"].duplicated().any():
-            raise ValueError(
-                "'image_url' column has duplicate entries. It must be unique."
-            )
-
-        if not all(geom.geom_type == "Point" for geom in self["geometry"]):
+        if not all(isinstance(geom, Point) for geom in self["geometry"]):
             raise TypeError("All geometries must be of type Point.")
 
         if self.crs != "EPSG:4326":
             raise ValueError("CRS must be EPSG:4326.")
 
+        gdf_to_write = GeoDataFrame(
+            self.drop(columns=["thumbnail"], errors="ignore"),
+            geometry="geometry",
+            crs=self.crs,
+        )
+
         metadata = MetaData()
         metadata.reflect(bind=engine)
 
         if not inspect(engine).has_table(name):
-            super().to_postgis(name, engine, if_exists=if_exists, *args, **kwargs)
+            gdf_to_write.to_postgis(name, engine, if_exists=if_exists, *args, **kwargs)
         else:
             if if_exists == "fail":
                 raise ValueError(f"Table '{name}' already exists.")
@@ -170,16 +204,18 @@ class GeoImageFrame(GeoDataFrame):
                 table = metadata.tables[name]
                 with engine.connect() as conn:
                     table.drop(conn)
-                super().to_postgis(name, engine, if_exists="replace", *args, **kwargs)
+                gdf_to_write.to_postgis(name, engine, if_exists="replace", *args, **kwargs)
 
             elif if_exists == "append":
-                super().to_postgis(name, engine, if_exists="append", *args, **kwargs)
+                gdf_to_write.to_postgis(name, engine, if_exists="append", *args, **kwargs)
 
         metadata.reflect(bind=engine)
         table = metadata.tables[name]
 
         with engine.connect() as conn:
-            for col in required_columns:
+            conn.execute(text("SET postgis.gdal_enabled_drivers = 'GTiff'"))
+
+            for col in self.required_columns:
                 stmt = text(f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL")
                 conn.execute(stmt)
 
@@ -190,7 +226,50 @@ class GeoImageFrame(GeoDataFrame):
                 f"ADD CONSTRAINT {constraint_name} UNIQUE (image_url)"
             )
             conn.execute(stmt)
+
+            if "thumbnail" in self.columns:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table.name} "
+                        f"ADD COLUMN IF NOT EXISTS thumbnail raster"
+                    )
+                )
+
+                update_stmt = text(
+                    f"UPDATE {table.name} "
+                    f"SET thumbnail = ST_FromGDALRaster(:thumbnail_raster) "
+                    f"WHERE image_url = :image_url"
+                )
+
+                for _, row in self.iterrows():
+                    thumbnail_dataset = row.get("thumbnail")
+                    if thumbnail_dataset is None:
+                        continue
+
+                    thumbnail_raster = self._thumbnail_to_gdal_raster(thumbnail_dataset)
+                    conn.execute(
+                        update_stmt,
+                        {
+                            "thumbnail_raster": thumbnail_raster,
+                            "image_url": row["image_url"],
+                        },
+                    )
+
             conn.connection.commit()
+
+    @staticmethod
+    def _thumbnail_to_gdal_raster(thumbnail_dataset):
+        """Convert a GDAL dataset into raster bytes for PostGIS."""
+        from osgeo import gdal
+
+        vsi_path = f"/vsimem/{os.urandom(16).hex()}.tif"
+        try:
+            gtiff_driver = gdal.GetDriverByName("GTiff")
+            gtiff_driver.CreateCopy(vsi_path, thumbnail_dataset)
+            raster_bytes = gdal.VSIGetMemFileBuffer_unsafe(vsi_path)
+            return bytes(raster_bytes)
+        finally:
+            gdal.Unlink(vsi_path)
 
     @staticmethod
     def _download_image_from_url(
