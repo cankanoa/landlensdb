@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import warnings
 
@@ -9,6 +10,7 @@ from geopandas import GeoDataFrame
 from osgeo.gdal import Dataset
 from shapely.geometry import Point, Polygon
 from sqlalchemy import MetaData
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.inspection import inspect
 from sqlalchemy.sql import text
 from tqdm import tqdm
@@ -152,6 +154,10 @@ class GeoImageFrame(GeoDataFrame):
                 raise ValueError(
                     "'fingerprint' must be set for all rows or omitted for all rows."
                 )
+            if fingerprint_present.any() and self.loc[fingerprint_present, "fingerprint"].duplicated().any():
+                raise ValueError(
+                    "'fingerprint' column has duplicate entries. It must be unique when set."
+                )
 
         if "image_url" in self.columns and self["image_url"].duplicated().any():
             raise ValueError(
@@ -205,12 +211,18 @@ class GeoImageFrame(GeoDataFrame):
             geometry="geometry",
             crs=self.crs,
         )
+        dtype = kwargs.pop("dtype", {}).copy()
+        if "metadata" in gdf_to_write.columns:
+            dtype["metadata"] = JSONB
+            gdf_to_write["metadata"] = gdf_to_write["metadata"].apply(
+                lambda value: json.dumps(value) if isinstance(value, dict) else value
+            )
 
         metadata = MetaData()
         metadata.reflect(bind=engine)
 
         if not inspect(engine).has_table(name):
-            gdf_to_write.to_postgis(name, engine, if_exists=if_exists, *args, **kwargs)
+            gdf_to_write.to_postgis(name, engine, if_exists=if_exists, *args, dtype=dtype, **kwargs)
         else:
             if if_exists == "fail":
                 raise ValueError(f"Table '{name}' already exists.")
@@ -218,28 +230,36 @@ class GeoImageFrame(GeoDataFrame):
                 table = metadata.tables[name]
                 with engine.connect() as conn:
                     table.drop(conn)
-                gdf_to_write.to_postgis(name, engine, if_exists="replace", *args, **kwargs)
+                gdf_to_write.to_postgis(name, engine, if_exists="replace", *args, dtype=dtype, **kwargs)
 
             elif if_exists == "append":
-                gdf_to_write.to_postgis(name, engine, if_exists="append", *args, **kwargs)
+                gdf_to_write.to_postgis(name, engine, if_exists="append", *args, dtype=dtype, **kwargs)
 
         metadata.reflect(bind=engine)
         table = metadata.tables[name]
 
         with engine.connect() as conn:
             conn.execute(text("SET postgis.gdal_enabled_drivers = 'GTiff'"))
+            if "metadata" in gdf_to_write.columns:
+                conn.execute(
+                    text(
+                        f'ALTER TABLE "{table.name}" '
+                        f'ALTER COLUMN "metadata" TYPE jsonb USING "metadata"::jsonb'
+                    )
+                )
 
             for col in self.required_columns:
                 stmt = text(f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL")
                 conn.execute(stmt)
 
-            constraint_name = f"{table.name}_image_url_key"
-
-            stmt = text(
-                f"ALTER TABLE {table.name} "
-                f"ADD CONSTRAINT {constraint_name} UNIQUE (image_url)"
-            )
-            conn.execute(stmt)
+            self._ensure_unique_constraint(conn, table.name, f"{table.name}_image_url_key", "image_url")
+            if "fingerprint" in self.columns:
+                self._ensure_unique_constraint(
+                    conn,
+                    table.name,
+                    f"{table.name}_fingerprint_key",
+                    "fingerprint",
+                )
 
             if "thumbnail" in self.columns:
                 conn.execute(
@@ -284,6 +304,32 @@ class GeoImageFrame(GeoDataFrame):
             return bytes(raster_bytes)
         finally:
             gdal.Unlink(vsi_path)
+
+    @staticmethod
+    def _ensure_unique_constraint(conn, table_name, constraint_name, column_name):
+        """Add a unique constraint when it does not already exist."""
+        table_ident = table_name.replace('"', '""')
+        constraint_ident = constraint_name.replace('"', '""')
+        column_ident = column_name.replace('"', '""')
+        conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = '{constraint_ident}'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE "{table_ident}" '
+                             || 'ADD CONSTRAINT "{constraint_ident}" '
+                             || 'UNIQUE ("{column_ident}")';
+                    END IF;
+                END
+                $$;
+                """
+            )
+        )
 
     @staticmethod
     def _download_image_from_url(
