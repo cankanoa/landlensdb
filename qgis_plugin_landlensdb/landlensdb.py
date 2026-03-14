@@ -163,7 +163,7 @@ class Landlensdb:
         icon_path = ':/plugins/landlensdb/icon.png'
         self.add_action(
             icon_path,
-            text=self.tr(u'Landlensdb'),
+            text=self.tr(u'Connection'),
             callback=self.run,
             parent=self.iface.mainWindow())
 
@@ -187,14 +187,9 @@ class Landlensdb:
         # Only create GUI ONCE in callback, so that it will only load when the plugin is started
         if self.first_start == True:
             self.first_start = False
-            self.dlg = LandlensdbDialog()
+            self.dlg = LandlensdbDialog(self.iface, self.iface.mainWindow())
 
         # show the dialog
         self.dlg.show()
-        # Run the dialog event loop
-        result = self.dlg.exec_()
-        # See if OK was pressed
-        if result:
-            # Do something useful here - delete the line containing pass and
-            # substitute with your code.
-            pass
+        self.dlg.raise_()
+        self.dlg.activateWindow()

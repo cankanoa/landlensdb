@@ -1,20 +1,11 @@
 # coding=utf-8
-"""Dialog test.
-
-.. note:: This program is free software; you can redistribute it and/or modify
-     it under the terms of the GNU General Public License as published by
-     the Free Software Foundation; either version 2 of the License, or
-     (at your option) any later version.
-
-"""
+"""Dialog test."""
 
 __author__ = 'cankanoa@gmail.com'
 __date__ = '2026-03-13'
 __copyright__ = 'Copyright 2026, Kanoa Lindiwe LLC'
 
 import unittest
-
-from qgis.PyQt.QtGui import QDialogButtonBox, QDialog
 
 from landlensdb_dialog import LandlensdbDialog
 
@@ -23,7 +14,7 @@ QGIS_APP = get_qgis_app()
 
 
 class LandlensdbDialogTest(unittest.TestCase):
-    """Test dialog works."""
+    """Test dialog widgets exist."""
 
     def setUp(self):
         """Runs before each test."""
@@ -33,23 +24,19 @@ class LandlensdbDialogTest(unittest.TestCase):
         """Runs after each test."""
         self.dialog = None
 
-    def test_dialog_ok(self):
-        """Test we can click OK."""
+    def test_dialog_has_query_controls(self):
+        """The query workflow widgets should be available."""
+        self.assertTrue(self.dialog.connection_button.text().startswith('Connection'))
+        self.assertEqual(self.dialog.commands_toggle_button.text(), 'Commands')
+        self.assertEqual(self.dialog.history_menu_button.text(), 'History')
+        self.assertEqual(self.dialog.star_menu_button.text(), 'Star')
+        self.assertEqual(self.dialog.results_label.text(), 'Results (0/0)')
+        self.assertEqual(self.dialog.query_button.text(), 'Query')
+        self.assertEqual(self.dialog.add_button.text(), 'Add')
+        self.assertEqual(self.dialog.close_button.text(), 'Close')
 
-        button = self.dialog.button_box.button(QDialogButtonBox.Ok)
-        button.click()
-        result = self.dialog.result()
-        self.assertEqual(result, QDialog.Accepted)
-
-    def test_dialog_cancel(self):
-        """Test we can click cancel."""
-        button = self.dialog.button_box.button(QDialogButtonBox.Cancel)
-        button.click()
-        result = self.dialog.result()
-        self.assertEqual(result, QDialog.Rejected)
 
 if __name__ == "__main__":
     suite = unittest.makeSuite(LandlensdbDialogTest)
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)
-
