@@ -1,6 +1,7 @@
 import numbers
 import re
 import warnings
+import hashlib
 
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ class SearchLocalToGeoImageFrame:
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
+        fingerprint=None,
     ):
         """Return a `GeoImageFrame` directly from the import configuration."""
         if cls is SearchLocalToGeoImageFrame:
@@ -44,6 +46,8 @@ class SearchLocalToGeoImageFrame:
 
             if not import_types:
                 raise ValueError("`import_types` must contain at least one importer class.")
+            if fingerprint not in (None, "robust", "quick"):
+                raise ValueError("`fingerprint` must be one of None, 'robust', or 'quick'.")
 
             all_records = []
             matched_file_count = 0
@@ -64,6 +68,7 @@ class SearchLocalToGeoImageFrame:
                             additional_columns=additional_columns,
                             create_thumbnail=create_thumbnail,
                             thumbnail_size=thumbnail_size,
+                            fingerprint=fingerprint,
                         )
                     except Exception as exc:
                         warnings.warn(f"Error processing {image_path}: {exc}. Skipped.")
@@ -126,12 +131,14 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
+        fingerprint=None,
     ):
         """Load a single geotagged image into a GeoImageFrame-compatible record."""
         with Image.open(image_path) as img:
             exif_data = _normalize_metadata_value(_get_exif_data(img))
 
         source = _extract_source(image_path)
+        fingerprint_data = _calculate_fingerprint(image_path, fingerprint)
         raster = _get_raster_metadata(image_path)
         geometry_data = _extract_latlon_from_metadata(
             image_path=image_path,
@@ -166,6 +173,7 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
         )
         metadata = _build_metadata(
             source=source,
+            fingerprint=fingerprint_data,
             raster=raster,
             exif_data=exif_data,
             geotags=geometry_data["geotags"],
@@ -180,6 +188,7 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
             "geometry": geometry_data["geometry"],
             "metadata": metadata,
             "thumbnail": thumbnail_data,
+            "fingerprint": fingerprint_data["value"] if fingerprint_data else None,
         }
 
         return _apply_additional_columns(
@@ -199,9 +208,11 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
+        fingerprint=None,
     ):
         """Load a single georeferenced raster into a GeoImageFrame-compatible record."""
         source = _extract_source(image_path)
+        fingerprint_data = _calculate_fingerprint(image_path, fingerprint)
         raster = _get_raster_metadata(image_path)
         geometry_data = _extract_geometry_from_geotransform(
             image_path=image_path,
@@ -217,6 +228,7 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
         )
         metadata = {
             "source": source,
+            "fingerprint": fingerprint_data,
             "raster": raster,
         }
 
@@ -226,6 +238,7 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
             "geometry": geometry_data["geometry"],
             "metadata": metadata,
             "thumbnail": thumbnail_data,
+            "fingerprint": fingerprint_data["value"] if fingerprint_data else None,
         }
 
         return _apply_additional_columns(
@@ -407,6 +420,40 @@ def _extract_source(image_path):
     }
 
 
+def _calculate_fingerprint(image_path, mode, sample_size=65536):
+    """Calculate a robust or quick file fingerprint."""
+    if mode is None:
+        return None
+
+    path = Path(image_path)
+    if mode not in ("robust", "quick"):
+        raise ValueError("Fingerprint mode must be None, 'robust', or 'quick'.")
+
+    hasher = hashlib.blake2b(digest_size=32)
+    file_size = path.stat().st_size
+
+    with path.open("rb") as handle:
+        if mode == "robust":
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        else:
+            offsets = [0]
+            if file_size > sample_size:
+                offsets.append(max((file_size // 2) - (sample_size // 2), 0))
+                offsets.append(max(file_size - sample_size, 0))
+
+            for offset in sorted(set(offsets)):
+                handle.seek(offset)
+                hasher.update(handle.read(sample_size))
+            hasher.update(str(file_size).encode("utf-8"))
+
+    return {
+        "mode": mode,
+        "algorithm": "blake2b",
+        "value": hasher.hexdigest(),
+    }
+
+
 def _extract_latlon_from_metadata(image_path, exif_data, get_geotagging, get_coordinates):
     """Extract normalized GPS metadata and geometry."""
     geotags = get_geotagging(exif_data)
@@ -524,6 +571,7 @@ def _extract_thumbnail(image_path, create_thumbnail, thumbnail_size):
 
 def _build_metadata(
     source,
+    fingerprint,
     raster,
     exif_data,
     geotags,
@@ -534,6 +582,7 @@ def _build_metadata(
     """Build the metadata dictionary stored on the record."""
     return {
         "source": source,
+        "fingerprint": fingerprint,
         "raster": raster,
         "exif": exif_data,
         "gps": geotags,
