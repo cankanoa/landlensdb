@@ -105,6 +105,7 @@ class GeoImageFrame(GeoDataFrame):
     optional_columns = {
         "metadata": dict,
         "thumbnail": Dataset,
+        "fingerprint": str,
     }
 
     def __init__(self, *args, **kwargs):
@@ -142,6 +143,15 @@ class GeoImageFrame(GeoDataFrame):
             )
             if wrong_type_mask.any():
                 raise TypeError(f"Column '{col}' contains wrong data type.")
+
+        if "fingerprint" in self.columns:
+            fingerprint_present = self["fingerprint"].apply(
+                lambda x: isinstance(x, str) and x.strip() != ""
+            )
+            if fingerprint_present.any() and (~fingerprint_present).any():
+                raise ValueError(
+                    "'fingerprint' must be set for all rows or omitted for all rows."
+                )
 
         if "image_url" in self.columns and self["image_url"].duplicated().any():
             raise ValueError(
