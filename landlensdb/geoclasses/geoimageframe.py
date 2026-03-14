@@ -123,6 +123,7 @@ class GeoImageFrame(GeoDataFrame):
         "metadata": dict,
         "thumbnail": Dataset,
     }
+
     def __init__(self, *args, **kwargs):
         """Initialize the GeoImageFrame object.
 
@@ -186,7 +187,13 @@ class GeoImageFrame(GeoDataFrame):
             if col not in self.columns:
                 raise ValueError(f"The required column '{col}' is missing.")
 
-            wrong_type_mask = ~self[col].apply(lambda x: isinstance(x, dtype))
+            if col == "geometry":
+                wrong_type_mask = ~self[col].apply(
+                    lambda x: isinstance(x, (Point, Polygon))
+                )
+            else:
+                wrong_type_mask = ~self[col].apply(lambda x: isinstance(x, dtype))
+
             if wrong_type_mask.any():
                 raise TypeError(f"Column '{col}' contains wrong data type.")
 
@@ -204,6 +211,9 @@ class GeoImageFrame(GeoDataFrame):
             raise ValueError(
                 "'image_url' column has duplicate entries. It must be unique."
             )
+
+        if self.crs is not None and str(self.crs) != "EPSG:4326":
+            raise ValueError("CRS must be EPSG:4326.")
 
     def to_dict_records(self):
         """Converts the GeoImageFrame to a dictionary representation.
@@ -243,12 +253,6 @@ class GeoImageFrame(GeoDataFrame):
             TypeError: If the columns contain incorrect data types.
         """
         self._verify_structure()
-
-        if not all(isinstance(geom, Point) for geom in self["geometry"]):
-            raise TypeError("All geometries must be of type Point.")
-
-        if self.crs != "EPSG:4326":
-            raise ValueError("CRS must be EPSG:4326.")
 
         gdf_to_write = GeoDataFrame(
             self.drop(columns=["thumbnail"], errors="ignore"),

@@ -10,7 +10,7 @@ import pytz
 
 from PIL import Image
 from PIL.ExifTags import GPSTAGS, TAGS
-from shapely import Point
+from shapely import Point, Polygon
 from timezonefinder import TimezoneFinder
 
 from landlensdb.geoclasses.geoimageframe import GeoImageFrame
@@ -173,6 +173,52 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
             camera_data=camera_data,
             sensor_data=sensor_data,
         )
+
+        image_data = {
+            "name": source["name"],
+            "image_url": source["path"],
+            "geometry": geometry_data["geometry"],
+            "metadata": metadata,
+            "thumbnail": thumbnail_data,
+        }
+
+        return _apply_additional_columns(
+            image_data=image_data,
+            metadata=metadata,
+            additional_columns=additional_columns,
+        )
+
+
+class GeoTransformImage(SearchLocalToGeoImageFrame):
+    """Importer for raster images that already contain a geotransform."""
+
+    @classmethod
+    def load(
+        cls,
+        image_path,
+        additional_columns=None,
+        create_thumbnail=True,
+        thumbnail_size=(256, 256),
+    ):
+        """Load a single georeferenced raster into a GeoImageFrame-compatible record."""
+        source = _extract_source(image_path)
+        raster = _get_raster_metadata(image_path)
+        geometry_data = _extract_geometry_from_geotransform(
+            image_path=image_path,
+            raster=raster,
+        )
+        if geometry_data is None:
+            return None
+
+        thumbnail_data = _extract_thumbnail(
+            image_path=image_path,
+            create_thumbnail=create_thumbnail,
+            thumbnail_size=thumbnail_size,
+        )
+        metadata = {
+            "source": source,
+            "raster": raster,
+        }
 
         image_data = {
             "name": source["name"],
@@ -377,6 +423,44 @@ def _extract_latlon_from_metadata(image_path, exif_data, get_geotagging, get_coo
         "latitude": lat,
         "longitude": lon,
         "geometry": Point(lon, lat),
+    }
+
+
+def _extract_geometry_from_geotransform(image_path, raster):
+    """Extract a footprint polygon from raster geotransform metadata."""
+    geotransform = raster.get("geotransform")
+    width = raster.get("width")
+    height = raster.get("height")
+
+    if geotransform is None:
+        warnings.warn(
+            f"Skipping {image_path}: raster geotransform is missing.",
+            stacklevel=2,
+        )
+        return None
+
+    if width is None or height is None:
+        warnings.warn(
+            f"Skipping {image_path}: raster dimensions are missing.",
+            stacklevel=2,
+        )
+        return None
+
+    def _pixel_to_map(pixel_x, pixel_y):
+        origin_x, pixel_width, rotation_x, origin_y, rotation_y, pixel_height = geotransform
+        map_x = origin_x + pixel_x * pixel_width + pixel_y * rotation_x
+        map_y = origin_y + pixel_x * rotation_y + pixel_y * pixel_height
+        return map_x, map_y
+
+    upper_left = _pixel_to_map(0, 0)
+    upper_right = _pixel_to_map(width, 0)
+    lower_right = _pixel_to_map(width, height)
+    lower_left = _pixel_to_map(0, height)
+
+    return {
+        "geometry": Polygon(
+            [upper_left, upper_right, lower_right, lower_left, upper_left]
+        )
     }
 
 
