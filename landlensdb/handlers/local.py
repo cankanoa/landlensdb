@@ -65,6 +65,9 @@ class SearchLocalToGeoImageFrame:
                     try:
                         record = importer_cls.load(
                             image_path=image_path,
+                            query_from=directory,
+                            search_re=pattern,
+                            import_type=importer_cls.__name__,
                             additional_columns=additional_columns,
                             create_thumbnail=create_thumbnail,
                             thumbnail_size=thumbnail_size,
@@ -128,6 +131,9 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
     def load(
         cls,
         image_path,
+        query_from=None,
+        search_re=None,
+        import_type=None,
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
@@ -173,6 +179,9 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
         )
         metadata = _build_metadata(
             source=source,
+            query_from=query_from,
+            import_type=import_type or cls.__name__,
+            search_re=search_re,
             fingerprint=fingerprint_data,
             raster=raster,
             exif_data=exif_data,
@@ -205,6 +214,9 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
     def load(
         cls,
         image_path,
+        query_from=None,
+        search_re=None,
+        import_type=None,
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
@@ -227,6 +239,11 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
             thumbnail_size=thumbnail_size,
         )
         metadata = {
+            "input_params": {
+                "query_from": query_from,
+                "import_type": import_type or cls.__name__,
+                "search_re": search_re,
+            },
             "source": source,
             "fingerprint": fingerprint_data,
             "raster": raster,
@@ -571,6 +588,9 @@ def _extract_thumbnail(image_path, create_thumbnail, thumbnail_size):
 
 def _build_metadata(
     source,
+    query_from,
+    import_type,
+    search_re,
     fingerprint,
     raster,
     exif_data,
@@ -581,6 +601,11 @@ def _build_metadata(
 ):
     """Build the metadata dictionary stored on the record."""
     return {
+        "input_params": {
+            "query_from": query_from,
+            "import_type": import_type,
+            "search_re": search_re,
+        },
         "source": source,
         "fingerprint": fingerprint,
         "raster": raster,
@@ -632,7 +657,6 @@ def _get_raster_metadata(image_path):
         "bands": dataset.RasterCount,
         "projection": projection or None,
         "geotransform": tuple(geotransform) if geotransform is not None else None,
-        "info": gdal.Info(dataset),
         "format": dataset.GetDriver().ShortName,
     }
 
