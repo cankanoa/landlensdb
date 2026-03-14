@@ -28,7 +28,7 @@ class LandlensdbDialog(QtWidgets.QDialog):
         layout.addWidget(self.tab_widget)
 
         self.setup_tab = SetupTab(iface, self)
-        self.import_tab = ImportTab(self)
+        self.import_tab = ImportTab(iface, self)
         self.query_tab = QueryTab(iface, self)
 
         self.tab_widget.addTab(self.setup_tab, 'Setup')
@@ -37,3 +37,4 @@ class LandlensdbDialog(QtWidgets.QDialog):
 
         self.setup_tab.connectionSaved.connect(self.query_tab.reload_connection_settings)
         self.query_tab.connectionSaved.connect(self.setup_tab.set_connection_values)
+        self.setup_tab.connectionSaved.connect(self.import_tab.reload_connection_settings)

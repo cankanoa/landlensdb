@@ -1,9 +1,7 @@
-import json
-
 from geoalchemy2 import WKBElement
 from shapely.wkb import loads
 from shapely import Point
-from sqlalchemy import create_engine, MetaData, Table, select, and_
+from sqlalchemy import create_engine, MetaData, Table, select, and_, update
 from sqlalchemy.dialects.postgresql import insert
 
 from landlensdb.geoclasses.geoimageframe import GeoImageFrame
@@ -51,17 +49,14 @@ class Postgres:
     @staticmethod
     def _convert_dicts_to_json(record):
         """
-        Converts dictionary values in a record to JSON strings.
+        Preserve dictionary values for JSON/JSONB columns.
 
         Args:
             record (dict): A dictionary where values may include other dictionaries.
 
         Returns:
-            dict: The modified record with dict values converted to JSON strings.
+            dict: The unmodified record.
         """
-        for key, value in record.items():
-            if isinstance(value, dict):
-                record[key] = json.dumps(value)
         return record
 
     def table(self, table_name):
@@ -216,6 +211,28 @@ class Postgres:
             for record in data:
                 record = self._convert_points_to_wkt(record)
                 record = self._convert_dicts_to_json(record)
+                fingerprint_value = record.get("fingerprint")
+
+                if conflict == "update" and fingerprint_value and "fingerprint" in table.columns:
+                    updates = {
+                        key: value
+                        for key, value in record.items()
+                    }
+                    fingerprint_update = (
+                        update(table)
+                        .where(table.c.fingerprint == fingerprint_value)
+                        .values(**updates)
+                    )
+                    fingerprint_result = conn.execute(fingerprint_update)
+                    if fingerprint_result.rowcount:
+                        continue
+                elif conflict == "nothing" and fingerprint_value and "fingerprint" in table.columns:
+                    fingerprint_exists = conn.execute(
+                        select(table.c.fingerprint).where(table.c.fingerprint == fingerprint_value)
+                    ).first()
+                    if fingerprint_exists:
+                        continue
+
                 insert_stmt = insert(table).values(**record)
                 if conflict == "update":
                     updates = {
