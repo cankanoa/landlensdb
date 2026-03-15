@@ -14,7 +14,7 @@ from PIL.ExifTags import GPSTAGS, TAGS
 from shapely import Point, Polygon
 from timezonefinder import TimezoneFinder
 
-from landlensdb.geoclasses.geoimageframe import GeoImageFrame
+from ..geoclasses.geoimageframe import GeoImageFrame
 
 try:
     from osgeo import gdal

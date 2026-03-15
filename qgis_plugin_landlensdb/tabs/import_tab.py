@@ -13,25 +13,12 @@ from ..shared.connection_utils import (
     test_connection_values,
     validate_connection_values,
 )
+import psycopg2
+from psycopg2 import sql
+from sqlalchemy import create_engine
 
-try:
-    import psycopg2
-    from psycopg2 import sql
-except ImportError:  # pragma: no cover
-    psycopg2 = None
-    sql = None
+from ..landlensdb import SearchLocalToGeoImageFrame, Postgres
 
-try:
-    from sqlalchemy import create_engine
-except ImportError:  # pragma: no cover
-    create_engine = None
-
-try:
-    from landlensdb import SearchLocalToGeoImageFrame
-    from landlensdb.handlers.db import Postgres
-except ImportError:  # pragma: no cover
-    SearchLocalToGeoImageFrame = None
-    Postgres = None
 
 
 class AddTableDialog(QtWidgets.QDialog):
@@ -375,9 +362,6 @@ class ImportTab(QtWidgets.QWidget):
         table_name = self.current_table_name()
         if not table_name:
             self._show_message('Choose a table first.', Qgis.Critical)
-            return
-        if SearchLocalToGeoImageFrame is None or Postgres is None or create_engine is None:
-            self._show_message('landlensdb or SQLAlchemy is not available in this QGIS Python environment.', Qgis.Critical)
             return
 
         query_from_item = self.import_table.item(row_index, 0)

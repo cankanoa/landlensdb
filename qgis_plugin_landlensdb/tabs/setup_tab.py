@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import shlex
 import sys
 
 from qgis.PyQt import QtCore, QtGui, QtWidgets
@@ -16,21 +17,16 @@ from ..shared.connection_utils import load_connection_settings, save_connection_
 class SetupTab(QtWidgets.QWidget):
     connectionSaved = QtCore.pyqtSignal(dict)
 
-    RUNTIME_PREFIX = 'Landlensdb/runtime'
-
     def __init__(self, iface, parent=None):
         super(SetupTab, self).__init__(parent)
         self.iface = iface
         self.connection_values = load_connection_settings()
-        self.runtime_values = self._load_runtime_settings()
         self._process = None
         self._process_target = None
 
         self._build_ui()
         self._wire_signals()
-        self._apply_dependency_mode()
         self._apply_server_mode()
-        self._apply_runtime_mode()
         self._refresh_connection_summary()
 
     def _build_ui(self):
@@ -68,25 +64,7 @@ class SetupTab(QtWidgets.QWidget):
         self.dependencies_group.setFrameShape(QtWidgets.QFrame.StyledPanel)
         dependencies_layout = QtWidgets.QVBoxLayout(self.dependencies_group)
         dependencies_layout.setSpacing(10)
-
-        self.pip_radio = QtWidgets.QRadioButton('Python Exacutable')
-        self.conda_radio = QtWidgets.QRadioButton('Conda Environment')
-        self.docker_radio = QtWidgets.QRadioButton('Docker Environment')
-        self.pip_radio.setChecked(True)
-
-        radio_row = QtWidgets.QHBoxLayout()
-        radio_row.addWidget(self.pip_radio)
-        radio_row.addWidget(self.conda_radio)
-        radio_row.addWidget(self.docker_radio)
-        radio_row.addStretch()
-        dependencies_layout.addLayout(radio_row)
-
-        self.dependency_stack = QtWidgets.QStackedWidget()
-        self.dependency_stack.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        dependencies_layout.addWidget(self.dependency_stack)
-        self.dependency_stack.addWidget(self._build_pip_panel())
-        self.dependency_stack.addWidget(self._build_conda_panel())
-        self.dependency_stack.addWidget(self._build_docker_panel())
+        dependencies_layout.addWidget(self._build_pip_panel())
         dependencies_section_layout.addWidget(self.dependencies_group)
         layout.addWidget(dependencies_section)
 
@@ -159,52 +137,6 @@ class SetupTab(QtWidgets.QWidget):
         )
         server_section_layout.addWidget(self.server_group)
         layout.addWidget(server_section)
-
-        runtime_section = QtWidgets.QWidget()
-        runtime_section_layout = QtWidgets.QVBoxLayout(runtime_section)
-        runtime_section_layout.setContentsMargins(0, 0, 0, 0)
-        runtime_section_layout.setSpacing(6)
-
-        runtime_header = QtWidgets.QHBoxLayout()
-        runtime_title = QtWidgets.QLabel('Choose Python Environment')
-        runtime_header.addWidget(runtime_title)
-        runtime_header.addStretch()
-        self.reset_runtime_button = QtWidgets.QPushButton('Reset')
-        runtime_header.addWidget(self.reset_runtime_button)
-        runtime_section_layout.addLayout(runtime_header)
-
-        self.runtime_group = QtWidgets.QFrame()
-        self.runtime_group.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        runtime_layout = QtWidgets.QVBoxLayout(self.runtime_group)
-        runtime_layout.setSpacing(10)
-
-        self.runtime_python_radio = QtWidgets.QRadioButton('Python Exacutable')
-        self.runtime_conda_radio = QtWidgets.QRadioButton('Conda Environment')
-        self.runtime_docker_radio = QtWidgets.QRadioButton('Docker Environment')
-
-        runtime_radio_row = QtWidgets.QHBoxLayout()
-        runtime_radio_row.addWidget(self.runtime_python_radio)
-        runtime_radio_row.addWidget(self.runtime_conda_radio)
-        runtime_radio_row.addWidget(self.runtime_docker_radio)
-        runtime_radio_row.addStretch()
-        runtime_layout.addLayout(runtime_radio_row)
-
-        self.runtime_stack = QtWidgets.QStackedWidget()
-        self.runtime_stack.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        runtime_layout.addWidget(self.runtime_stack)
-        self.runtime_stack.addWidget(self._build_runtime_python_panel())
-        self.runtime_stack.addWidget(self._build_runtime_conda_panel())
-        self.runtime_stack.addWidget(self._build_runtime_docker_panel())
-
-        runtime_test_row = QtWidgets.QHBoxLayout()
-        self.runtime_test_button = QtWidgets.QPushButton('Test Installation')
-        self.runtime_test_feedback = QtWidgets.QLabel('')
-        runtime_test_row.addWidget(self.runtime_test_button)
-        runtime_test_row.addWidget(self.runtime_test_feedback)
-        runtime_test_row.addStretch()
-        runtime_layout.addLayout(runtime_test_row)
-        runtime_section_layout.addWidget(self.runtime_group)
-        layout.addWidget(runtime_section)
 
         connection_section = QtWidgets.QWidget()
         connection_section_layout = QtWidgets.QVBoxLayout(connection_section)
@@ -288,58 +220,19 @@ class SetupTab(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setSpacing(8)
 
-        path_row = QtWidgets.QHBoxLayout()
-        path_row.addWidget(QtWidgets.QLabel('Python interpreter'))
-        self.python_path_input = QtWidgets.QLineEdit(self._default_python_executable())
-        path_row.addWidget(self.python_path_input, 1)
-        self.python_browse_button = QtWidgets.QPushButton('Browse')
-        path_row.addWidget(self.python_browse_button)
-        layout.addLayout(path_row)
+        self.python_runtime_label = QtWidgets.QLabel()
+        self.python_runtime_label.setWordWrap(True)
+        layout.addWidget(self.python_runtime_label)
 
         command_row = QtWidgets.QHBoxLayout()
         self.pip_command_preview = QtWidgets.QLineEdit()
+        self.pip_command_preview.setReadOnly(True)
         command_row.addWidget(self.pip_command_preview, 1)
         self.pip_run_button = QtWidgets.QPushButton('Run')
         command_row.addWidget(self.pip_run_button)
         layout.addLayout(command_row)
 
         self._update_pip_preview()
-        return widget
-
-    def _build_conda_panel(self):
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setSpacing(10)
-
-        self.conda_commands_edit = QtWidgets.QPlainTextEdit()
-        self.conda_commands_edit.setPlainText(self._default_conda_commands())
-        self.conda_commands_edit.setMinimumHeight(92)
-        self.conda_commands_edit.setMaximumHeight(92)
-        layout.addWidget(self.conda_commands_edit, 1)
-
-        button_column = QtWidgets.QVBoxLayout()
-        self.conda_run_button = QtWidgets.QPushButton('Run')
-        button_column.addWidget(self.conda_run_button)
-        button_column.addStretch()
-        layout.addLayout(button_column)
-        return widget
-
-    def _build_docker_panel(self):
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setSpacing(10)
-
-        self.docker_commands_edit = QtWidgets.QPlainTextEdit()
-        self.docker_commands_edit.setPlainText(self._default_docker_commands())
-        self.docker_commands_edit.setMinimumHeight(92)
-        self.docker_commands_edit.setMaximumHeight(92)
-        layout.addWidget(self.docker_commands_edit, 1)
-
-        button_column = QtWidgets.QVBoxLayout()
-        self.docker_run_button = QtWidgets.QPushButton('Run')
-        button_column.addWidget(self.docker_run_button)
-        button_column.addStretch()
-        layout.addLayout(button_column)
         return widget
 
     def _build_single_command_panel(self, description, command, button_text, prefix):
@@ -362,41 +255,6 @@ class SetupTab(QtWidgets.QWidget):
         setattr(self, '{}_button'.format(prefix), button)
         return widget
 
-    def _build_runtime_python_panel(self):
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setSpacing(10)
-
-        self.runtime_python_path_input = QtWidgets.QLineEdit(
-            self._normalize_python_executable(
-                self.runtime_values.get('python_path', self._default_python_executable())
-            )
-        )
-        layout.addWidget(self.runtime_python_path_input, 1)
-        self.runtime_python_browse_button = QtWidgets.QPushButton('Browse')
-        layout.addWidget(self.runtime_python_browse_button)
-        return widget
-
-    def _build_runtime_conda_panel(self):
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setSpacing(10)
-
-        self.runtime_conda_name_input = QtWidgets.QLineEdit(self.runtime_values.get('conda_env', 'landlensdb_env'))
-        self.runtime_conda_name_input.setPlaceholderText('Conda environment name')
-        layout.addWidget(self.runtime_conda_name_input)
-        return widget
-
-    def _build_runtime_docker_panel(self):
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setSpacing(10)
-
-        self.runtime_docker_name_input = QtWidgets.QLineEdit(self.runtime_values.get('docker_container', 'landlensdb-local'))
-        self.runtime_docker_name_input.setPlaceholderText('Docker container name')
-        layout.addWidget(self.runtime_docker_name_input)
-        return widget
-
     def _create_shell_input(self):
         if QgsCodeEditorShell is not None:
             shell = QgsCodeEditorShell(self)
@@ -412,19 +270,9 @@ class SetupTab(QtWidgets.QWidget):
     def _wire_signals(self):
         self.reset_dependencies_button.clicked.connect(self._reset_dependency_defaults)
         self.reset_server_button.clicked.connect(self._reset_server_defaults)
-        self.reset_runtime_button.clicked.connect(self._reset_runtime_defaults)
         self.reset_connection_button.clicked.connect(self._reset_connection_defaults)
 
-        self.python_browse_button.clicked.connect(lambda: self._browse_into(self.python_path_input))
-        self.python_path_input.textChanged.connect(self._update_pip_preview)
         self.pip_run_button.clicked.connect(self._run_pip_preview)
-
-        self.conda_run_button.clicked.connect(
-            lambda: self._run_multiline_commands(self.conda_commands_edit.toPlainText(), 'Conda dependencies')
-        )
-        self.docker_run_button.clicked.connect(
-            lambda: self._run_multiline_commands(self.docker_commands_edit.toPlainText(), 'Docker environment')
-        )
 
         self.server_installer_button.clicked.connect(
             lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl(self.server_installer_command_input.text().strip()))
@@ -439,14 +287,6 @@ class SetupTab(QtWidgets.QWidget):
             lambda: self._run_single_command(self.server_conda_command_input.text().strip(), 'Conda PostgreSQL install')
         )
 
-        self.runtime_python_browse_button.clicked.connect(
-            lambda: self._browse_into(self.runtime_python_path_input, save_runtime=True)
-        )
-        self.runtime_python_path_input.textChanged.connect(self._save_runtime_settings)
-        self.runtime_conda_name_input.textChanged.connect(self._save_runtime_settings)
-        self.runtime_docker_name_input.textChanged.connect(self._save_runtime_settings)
-        self.runtime_test_button.clicked.connect(self._test_runtime_installation)
-
         self.connection_name_input.textChanged.connect(self._store_connection_form)
         self.connection_service_input.textChanged.connect(self._store_connection_form)
         self.connection_host_input.textChanged.connect(self._store_connection_form)
@@ -456,18 +296,10 @@ class SetupTab(QtWidgets.QWidget):
         self.connection_test_button.clicked.connect(self._test_connection_form)
         self.run_manual_button.clicked.connect(self._run_manual_command)
 
-        self.pip_radio.toggled.connect(self._apply_dependency_mode)
-        self.conda_radio.toggled.connect(self._apply_dependency_mode)
-        self.docker_radio.toggled.connect(self._apply_dependency_mode)
-
         self.server_installer_radio.toggled.connect(self._apply_server_mode)
         self.server_homebrew_radio.toggled.connect(self._apply_server_mode)
         self.server_windows_radio.toggled.connect(self._apply_server_mode)
         self.server_conda_radio.toggled.connect(self._apply_server_mode)
-
-        self.runtime_python_radio.toggled.connect(self._apply_runtime_mode)
-        self.runtime_conda_radio.toggled.connect(self._apply_runtime_mode)
-        self.runtime_docker_radio.toggled.connect(self._apply_runtime_mode)
 
     def set_connection_values(self, values=None):
         self.connection_values = dict(values or load_connection_settings())
@@ -503,16 +335,6 @@ class SetupTab(QtWidgets.QWidget):
         self.connection_database_input.blockSignals(False)
         self.connection_schema_input.blockSignals(False)
 
-    def _apply_dependency_mode(self):
-        if self.pip_radio.isChecked():
-            self.dependency_stack.setCurrentIndex(0)
-        elif self.conda_radio.isChecked():
-            self.dependency_stack.setCurrentIndex(1)
-        else:
-            self.dependency_stack.setCurrentIndex(2)
-        self.server_group.setVisible(not self.docker_radio.isChecked())
-        self._shrink_stack(self.dependency_stack)
-
     def _apply_server_mode(self):
         if self.server_installer_radio.isChecked():
             self.server_stack.setCurrentIndex(0)
@@ -524,29 +346,6 @@ class SetupTab(QtWidgets.QWidget):
             self.server_stack.setCurrentIndex(3)
         self._shrink_stack(self.server_stack)
 
-    def _apply_runtime_mode(self):
-        mode = self.runtime_values.get('mode', 'python')
-        if self.runtime_python_radio.isChecked():
-            self.runtime_stack.setCurrentIndex(0)
-            mode = 'python'
-        elif self.runtime_conda_radio.isChecked():
-            self.runtime_stack.setCurrentIndex(1)
-            mode = 'conda'
-        elif self.runtime_docker_radio.isChecked():
-            self.runtime_stack.setCurrentIndex(2)
-            mode = 'docker'
-        else:
-            if mode == 'conda':
-                self.runtime_conda_radio.setChecked(True)
-            elif mode == 'docker':
-                self.runtime_docker_radio.setChecked(True)
-            else:
-                self.runtime_python_radio.setChecked(True)
-                mode = 'python'
-        self.runtime_values['mode'] = mode
-        self._save_runtime_settings()
-        self._shrink_stack(self.runtime_stack)
-
     def _shrink_stack(self, stack):
         current = stack.currentWidget()
         if current is None:
@@ -555,57 +354,39 @@ class SetupTab(QtWidgets.QWidget):
         stack.setMinimumHeight(height)
         stack.setMaximumHeight(height)
 
-    def _browse_into(self, line_edit, save_runtime=False):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            'Select Python Interpreter',
-            line_edit.text(),
-        )
-        if file_path:
-            line_edit.setText(self._normalize_python_executable(file_path))
-            if save_runtime:
-                self._save_runtime_settings()
-
     def _update_pip_preview(self):
-        python_path = self._normalize_python_executable(
-            self.python_path_input.text().strip() or self._default_python_executable()
-        )
-        if self.python_path_input.text().strip() != python_path:
-            self.python_path_input.blockSignals(True)
-            self.python_path_input.setText(python_path)
-            self.python_path_input.blockSignals(False)
-        self.pip_command_preview.setText(
-            '"{}" -m pip install --upgrade pip && "{}" -m pip install landlensdb'.format(
+        python_path = self._default_python_executable()
+        self.python_runtime_label.setText('QGIS Python interpreter: {}'.format(python_path))
+        dependencies = self._requirements_dependencies()
+        install_command = '"{}" -m pip install --upgrade pip'.format(python_path)
+        if dependencies:
+            install_command = '{} && "{}" -m pip install {}'.format(
+                install_command,
                 python_path,
-                python_path,
+                ' '.join(shlex.quote(dep) for dep in dependencies),
             )
-        )
+        preview_text = install_command.replace(' && ', '\n')
+        if hasattr(self.pip_command_preview, 'setPlainText'):
+            self.pip_command_preview.setPlainText(preview_text)
+        else:
+            self.pip_command_preview.setText(preview_text.replace('\n', ' && '))
 
     def _run_pip_preview(self):
-        command = self.pip_command_preview.text().strip()
+        if hasattr(self.pip_command_preview, 'toPlainText'):
+            command = self.pip_command_preview.toPlainText().strip().replace('\n', ' && ')
+        else:
+            command = self.pip_command_preview.text().strip()
         self._run_single_command(command, 'Python executable dependencies')
 
-    def _test_runtime_installation(self):
-        if self.runtime_python_radio.isChecked():
-            label = 'Python environment test'
-            command = '"{}" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec(\'landlensdb\') else 1)"'.format(
-                self._normalize_python_executable(
-                    self.runtime_python_path_input.text().strip() or self._default_python_executable()
-                )
-            )
-        elif self.runtime_conda_radio.isChecked():
-            env_name = self.runtime_conda_name_input.text().strip() or 'landlensdb_env'
-            label = 'Conda environment test'
-            command = 'conda run -n "{}" python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec(\'landlensdb\') else 1)"'.format(
-                env_name
-            )
-        else:
-            container_name = self.runtime_docker_name_input.text().strip() or 'landlensdb-local'
-            label = 'Docker environment test'
-            command = 'docker exec "{}" python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec(\'landlensdb\') else 1)"'.format(
-                container_name
-            )
-        self._run_probe_command(command, label, self.runtime_test_feedback, 'landlensdb is installed.', 'landlensdb is not installed.')
+    def _requirements_dependencies(self):
+        requirements_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', 'requirements.txt')
+        )
+        if not os.path.exists(requirements_path):
+            return []
+
+        with open(requirements_path, 'r', encoding='utf-8') as handle:
+            return [line.strip() for line in handle if line.strip()]
 
     def _store_connection_form(self):
         self.connection_values = {
@@ -711,34 +492,8 @@ class SetupTab(QtWidgets.QWidget):
         self._process = None
         self._process_target = None
 
-    def _load_runtime_settings(self):
-        settings = QtCore.QSettings()
-        return {
-            'mode': settings.value('{}/mode'.format(self.RUNTIME_PREFIX), 'python'),
-            'python_path': settings.value('{}/python_path'.format(self.RUNTIME_PREFIX), self._default_python_executable()),
-            'conda_env': settings.value('{}/conda_env'.format(self.RUNTIME_PREFIX), 'landlensdb_env'),
-            'docker_container': settings.value('{}/docker_container'.format(self.RUNTIME_PREFIX), 'landlensdb-local'),
-        }
-
-    def _save_runtime_settings(self):
-        if hasattr(self, 'runtime_python_path_input'):
-            self.runtime_values['python_path'] = self._normalize_python_executable(
-                self.runtime_python_path_input.text().strip() or self._default_python_executable()
-            )
-        if hasattr(self, 'runtime_conda_name_input'):
-            self.runtime_values['conda_env'] = self.runtime_conda_name_input.text().strip() or 'landlensdb_env'
-        if hasattr(self, 'runtime_docker_name_input'):
-            self.runtime_values['docker_container'] = self.runtime_docker_name_input.text().strip() or 'landlensdb-local'
-
-        settings = QtCore.QSettings()
-        for key, value in self.runtime_values.items():
-            settings.setValue('{}/{}'.format(self.RUNTIME_PREFIX, key), value)
-
     def _reset_dependency_defaults(self):
-        self.python_path_input.setText(self._default_python_executable())
-        self.conda_commands_edit.setPlainText(self._default_conda_commands())
-        self.docker_commands_edit.setPlainText(self._default_docker_commands())
-        self.pip_radio.setChecked(True)
+        self._update_pip_preview()
         self._log('Python dependency fields reset to defaults.')
 
     def _reset_server_defaults(self):
@@ -748,21 +503,6 @@ class SetupTab(QtWidgets.QWidget):
         self.server_conda_command_input.setText(self._conda_server_command())
         self.server_homebrew_radio.setChecked(True)
         self._log('PostgreSQL setup fields reset to defaults.')
-
-    def _reset_runtime_defaults(self):
-        self.runtime_values = {
-            'mode': 'python',
-            'python_path': self._default_python_executable(),
-            'conda_env': 'landlensdb_env',
-            'docker_container': 'landlensdb-local',
-        }
-        self.runtime_python_radio.setChecked(True)
-        self.runtime_python_path_input.setText(self._default_python_executable())
-        self.runtime_conda_name_input.setText('landlensdb_env')
-        self.runtime_docker_name_input.setText('landlensdb-local')
-        self._save_runtime_settings()
-        self.runtime_test_feedback.setText('')
-        self._log('Python environment fields reset to defaults.')
 
     def _reset_connection_defaults(self):
         self.connection_values = {
@@ -778,23 +518,6 @@ class SetupTab(QtWidgets.QWidget):
         self.connection_feedback.setText('')
         self.connectionSaved.emit(dict(self.connection_values))
         self._log('PostgreSQL connection fields reset to defaults.')
-
-    def _default_conda_commands(self):
-        return '\n'.join([
-            'conda create -n landlensdb_env -c conda-forge "gdal>=3.5"',
-            'conda activate landlensdb_env',
-            'pip install landlensdb',
-        ])
-
-    def _default_docker_commands(self):
-        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        return '\n'.join([
-            'docker build -t landlensdb-local -f "{}" "{}"'.format(
-                os.path.join(root_dir, 'Dockerfile'),
-                root_dir,
-            ),
-            'docker run --rm landlensdb-local python -m pip install landlensdb',
-        ])
 
     def _homebrew_server_command(self):
         return (

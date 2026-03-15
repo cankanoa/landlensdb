@@ -32,5 +32,5 @@ def classFactory(iface):  # pylint: disable=invalid-name
     :type iface: QgsInterface
     """
     #
-    from .landlensdb import Landlensdb
+    from .landlensdb_plug import Landlensdb
     return Landlensdb(iface)
