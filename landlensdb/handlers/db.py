@@ -324,6 +324,49 @@ class Postgres:
 
         return deleted_rows
 
+    def remove_all(
+        self,
+        directory: str,
+        import_types: dict[str | type, str] | None = {"GeoTaggedImage": r".*\.JPG$"},
+    ):
+        if self.selected_table is None:
+            raise ValueError("Select a table first with `table(table_name)`.")
+        if import_types is None:
+            import_types = {"GeoTaggedImage": r".*"}
+        if not isinstance(import_types, dict) or not import_types:
+            raise ValueError("`import_types` must be a non-empty dict.")
+
+        from .local import SearchLocalToGeoImageFrame
+
+        deleted_rows = 0
+        with self.engine.begin() as conn:
+            for importer_ref, pattern in import_types.items():
+                importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(importer_ref)
+                delete_stmt = self.selected_table.delete().where(
+                    and_(
+                        text(
+                            "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = :query_from"
+                        ),
+                        text(
+                            "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
+                        ),
+                        text(
+                            "coalesce(metadata::jsonb->'input_params'->>'search_re', '') = :search_re"
+                        ),
+                    )
+                )
+                result = conn.execute(
+                    delete_stmt,
+                    {
+                        "query_from": directory,
+                        "import_type": importer_cls.__name__,
+                        "search_re": pattern,
+                    },
+                )
+                deleted_rows += result.rowcount or 0
+
+        return deleted_rows
+
     @staticmethod
     def _qualified_table_name(table):
         if table.schema:
