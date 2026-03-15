@@ -26,6 +26,7 @@ This workflow is designed for geo-data scientists, map enthusiasts, and anyone n
 - **EXIF Data Processing**: Extract geolocation, timestamps, and orientation from image metadata.
 - **Database Operations**: Store image records in PostgreSQL; retrieve them by location or time.
 - **Road Network Alignment**: Snap image captures to road networks for precise route mapping.
+- **QGIS Plugin Workflow**: Import local images into PostGIS, skip already ingested files, and remove stale DB rows that no longer exist on disk.
 
 ## Installation
 
@@ -46,7 +47,9 @@ pip install landlensdb
 
 - **GDAL ≥ 3.5** (ensure command-line tools work, e.g., `gdalinfo --version`)
 - **PostgreSQL ≥ 14**  
-- **PostGIS ≥ 3.5** (the extension must be installed in your PostgreSQL database)  
+- **PostGIS ≥ 3.5**
+  - Enable PostGIS: `CREATE EXTENSION postgis_raster;`
+  - Enable GDAL drivers: `ALTER DATABASE landlens_test SET postgis.gdal_enabled_drivers = 'ENABLE_ALL';`
 - **Python ≥ 3.10**
 
 ## Quick Start
@@ -70,6 +73,19 @@ print(geo_frame.head())
 ```
 
 For additional usage examples, see our documentation.
+
+## Local Import and Database Writes
+
+`SearchLocalToGeoImageFrame` supports:
+- threaded local import with `max_workers`
+- progress reporting through `progress_callback(processed, total)`
+- skipping files already present in PostgreSQL with `skip_images_in_postgresql`
+
+`Postgres.upsert_images` is the main database write entry point and supports:
+- `if_exists="fail"`, `"replace"`, and `"append"` for GeoPandas-backed writes
+- `if_exists="upsert"` with `conflict="update"` or `"nothing"` for incremental sync
+- `filter_existing_rows(...)` to keep only paths not already in the selected table
+- `remove_unmatched(...)` to delete rows whose `image_url` is no longer matched on disk for a given import rule
 
 
 ## Documentation
