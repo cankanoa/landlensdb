@@ -460,6 +460,17 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             return
 
         vector_column = self._find_first_column(column_info, {'geometry', 'geography'})
+        geometry_types = []
+        if vector_column:
+            try:
+                with psycopg2.connect(**self._connection_kwargs()) as connection:
+                    with connection.cursor() as cursor:
+                        if schema_name:
+                            self._set_search_path(cursor, schema_name)
+                        geometry_types = self._get_geometry_types(cursor, live_query, vector_column)
+            except Exception as exc:  # pragma: no cover - depends on external DB
+                self._show_error('Could not inspect geometry types: {}'.format(exc))
+                return
         self._populate_preview(column_info, preview_rows, row_count)
         self._add_history_item(sql_text)
         self._last_query_state = {
@@ -467,6 +478,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             'live_query': live_query,
             'raster_source': raster_source,
             'vector_column': vector_column,
+            'geometry_types': geometry_types,
             'raster_row_map': raster_row_map,
             'row_count': row_count,
         }
@@ -485,12 +497,12 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
         vector_column = self._last_query_state['vector_column']
         if vector_column:
-            vector_layer = self._create_vector_layer(
+            for vector_layer in self._create_geometry_layers(
                 self._last_query_state['live_query'],
                 vector_column,
                 query_name,
-            )
-            if vector_layer is not None:
+                self._last_query_state.get('geometry_types') or [],
+            ):
                 added_layers.append(vector_layer.name())
                 self._add_layer_to_group(group, vector_layer)
 
@@ -651,6 +663,17 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         return [row[0] for row in cursor.fetchall()]
 
+    def _table_has_column(self, cursor, raster_source, column_name):
+        cursor.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = %s
+            """,
+            (raster_source['schema'], raster_source['table'], column_name),
+        )
+        return cursor.fetchone() is not None
+
     def _get_raster_row_map(self, cursor, raster_source, key_columns, raster_columns):
         raster_row_map = {}
         if not raster_source or not key_columns:
@@ -663,11 +686,19 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 )
             return raster_row_map
 
+        has_metadata_column = self._table_has_column(cursor, raster_source, 'metadata')
+
         for raster_column in raster_columns:
             filter_parts = []
             if raster_source['where']:
                 filter_parts.append(sql.SQL('({})').format(sql.SQL(raster_source['where'])))
             filter_parts.append(sql.SQL('{} IS NOT NULL').format(sql.Identifier(raster_column)))
+            if has_metadata_column:
+                filter_parts.append(
+                    sql.SQL(
+                        "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = 'GeoTransformImage'"
+                    )
+                )
 
             key_filter_exprs = []
             key_label_exprs = []
@@ -706,6 +737,21 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             if column['udt_name'] in udt_names:
                 return column['name']
         return None
+
+    def _get_geometry_types(self, cursor, query_text, geometry_column):
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT DISTINCT ST_GeometryType(q.{geometry_column})
+                FROM ({query_text}) AS q
+                WHERE q.{geometry_column} IS NOT NULL
+                """
+            ).format(
+                geometry_column=sql.Identifier(geometry_column),
+                query_text=sql.SQL(query_text),
+            )
+        )
+        return [row[0] for row in cursor.fetchall() if row and row[0]]
 
     def _set_results_label(self, preview_count, total_count):
         self.results_label.setText('Results ({}/{})'.format(preview_count, total_count))
@@ -755,6 +801,37 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         uri.setDataSource('', '({})'.format(query_text), geometry_column, '', self.KEY_COLUMN)
         layer = QgsVectorLayer(uri.uri(False), layer_name, 'postgres')
         return layer if layer.isValid() else None
+
+    def _create_geometry_layers(self, query_text, geometry_column, layer_name, geometry_types):
+        if not geometry_types:
+            layer = self._create_vector_layer(query_text, geometry_column, layer_name)
+            return [layer] if layer is not None else []
+
+        if len(geometry_types) == 1:
+            layer = self._create_vector_layer(query_text, geometry_column, layer_name)
+            return [layer] if layer is not None else []
+
+        layers = []
+        for geometry_type in geometry_types:
+            suffix = geometry_type.replace('ST_', '').lower()
+            filtered_query = (
+                "SELECT * FROM ({}) AS q WHERE ST_GeometryType(q.{}) = '{}'".format(
+                    query_text,
+                    self._quote_identifier(geometry_column),
+                    geometry_type.replace("'", "''"),
+                )
+            )
+            layer = self._create_vector_layer(
+                filtered_query,
+                geometry_column,
+                '{} {}'.format(layer_name, suffix),
+            )
+            if layer is not None:
+                layers.append(layer)
+        return layers
+
+    def _quote_identifier(self, value):
+        return '"{}"'.format(value.replace('"', '""'))
 
     def _create_raster_layer(self, raster_source, raster_column, row_filter, layer_name):
         layer = QgsRasterLayer(self._build_postgres_raster_uri(raster_source, raster_column, row_filter), layer_name, 'gdal')
