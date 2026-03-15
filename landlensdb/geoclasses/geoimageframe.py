@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import warnings
 
@@ -8,11 +9,9 @@ from folium.features import CustomIcon
 from geopandas import GeoDataFrame
 from osgeo.gdal import Dataset
 from shapely.geometry import Point, Polygon
-from sqlalchemy import MetaData
-from sqlalchemy.inspection import inspect
 from sqlalchemy.sql import text
 from tqdm import tqdm
-
+from ..handlers.db import Postgres
 
 def _generate_arrow_icon(compass_angle):
     """Generates an arrow icon based on the specified compass angle.
@@ -105,6 +104,7 @@ class GeoImageFrame(GeoDataFrame):
     optional_columns = {
         "metadata": dict,
         "thumbnail": Dataset,
+        "fingerprint": str,
     }
 
     def __init__(self, *args, **kwargs):
@@ -142,6 +142,19 @@ class GeoImageFrame(GeoDataFrame):
             )
             if wrong_type_mask.any():
                 raise TypeError(f"Column '{col}' contains wrong data type.")
+
+        if "fingerprint" in self.columns:
+            fingerprint_present = self["fingerprint"].apply(
+                lambda x: isinstance(x, str) and x.strip() != ""
+            )
+            if fingerprint_present.any() and (~fingerprint_present).any():
+                raise ValueError(
+                    "'fingerprint' must be set for all rows or omitted for all rows."
+                )
+            if fingerprint_present.any() and self.loc[fingerprint_present, "fingerprint"].duplicated().any():
+                raise ValueError(
+                    "'fingerprint' column has duplicate entries. It must be unique when set."
+                )
 
         if "image_url" in self.columns and self["image_url"].duplicated().any():
             raise ValueError(
@@ -188,78 +201,14 @@ class GeoImageFrame(GeoDataFrame):
             ValueError: If required columns are missing or if the CRS is incorrect.
             TypeError: If the columns contain incorrect data types.
         """
-        self._verify_structure()
 
-        gdf_to_write = GeoDataFrame(
-            self.drop(columns=["thumbnail"], errors="ignore"),
-            geometry="geometry",
-            crs=self.crs,
+        return Postgres(engine).upsert_images(
+            self,
+            name,
+            if_exists=if_exists,
+            *args,
+            **kwargs,
         )
-
-        metadata = MetaData()
-        metadata.reflect(bind=engine)
-
-        if not inspect(engine).has_table(name):
-            gdf_to_write.to_postgis(name, engine, if_exists=if_exists, *args, **kwargs)
-        else:
-            if if_exists == "fail":
-                raise ValueError(f"Table '{name}' already exists.")
-            elif if_exists == "replace":
-                table = metadata.tables[name]
-                with engine.connect() as conn:
-                    table.drop(conn)
-                gdf_to_write.to_postgis(name, engine, if_exists="replace", *args, **kwargs)
-
-            elif if_exists == "append":
-                gdf_to_write.to_postgis(name, engine, if_exists="append", *args, **kwargs)
-
-        metadata.reflect(bind=engine)
-        table = metadata.tables[name]
-
-        with engine.connect() as conn:
-            conn.execute(text("SET postgis.gdal_enabled_drivers = 'GTiff'"))
-
-            for col in self.required_columns:
-                stmt = text(f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL")
-                conn.execute(stmt)
-
-            constraint_name = f"{table.name}_image_url_key"
-
-            stmt = text(
-                f"ALTER TABLE {table.name} "
-                f"ADD CONSTRAINT {constraint_name} UNIQUE (image_url)"
-            )
-            conn.execute(stmt)
-
-            if "thumbnail" in self.columns:
-                conn.execute(
-                    text(
-                        f"ALTER TABLE {table.name} "
-                        f"ADD COLUMN IF NOT EXISTS thumbnail raster"
-                    )
-                )
-
-                update_stmt = text(
-                    f"UPDATE {table.name} "
-                    f"SET thumbnail = ST_FromGDALRaster(:thumbnail_raster) "
-                    f"WHERE image_url = :image_url"
-                )
-
-                for _, row in self.iterrows():
-                    thumbnail_dataset = row.get("thumbnail")
-                    if thumbnail_dataset is None:
-                        continue
-
-                    thumbnail_raster = self._thumbnail_to_gdal_raster(thumbnail_dataset)
-                    conn.execute(
-                        update_stmt,
-                        {
-                            "thumbnail_raster": thumbnail_raster,
-                            "image_url": row["image_url"],
-                        },
-                    )
-
-            conn.connection.commit()
 
     @staticmethod
     def _thumbnail_to_gdal_raster(thumbnail_dataset):
@@ -274,6 +223,32 @@ class GeoImageFrame(GeoDataFrame):
             return bytes(raster_bytes)
         finally:
             gdal.Unlink(vsi_path)
+
+    @staticmethod
+    def _ensure_unique_constraint(conn, table_name, constraint_name, column_name):
+        """Add a unique constraint when it does not already exist."""
+        table_ident = table_name.replace('"', '""')
+        constraint_ident = constraint_name.replace('"', '""')
+        column_ident = column_name.replace('"', '""')
+        conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = '{constraint_ident}'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE "{table_ident}" '
+                             || 'ADD CONSTRAINT "{constraint_ident}" '
+                             || 'UNIQUE ("{column_ident}")';
+                    END IF;
+                END
+                $$;
+                """
+            )
+        )
 
     @staticmethod
     def _download_image_from_url(

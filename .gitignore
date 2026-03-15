@@ -152,3 +152,8 @@ cache/
 
 # MacOS
 .DS_Store
+
+
+# Code
+/qgis_plugin_landlensdb/requirements.txt
+/qgis_plugin_landlensdb.zip

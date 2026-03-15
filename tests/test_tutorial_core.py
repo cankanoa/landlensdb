@@ -9,7 +9,7 @@ from sqlalchemy import DateTime, Float, Integer, String, text
 from landlensdb.geoclasses.geoimageframe import GeoImageFrame
 from landlensdb.handlers.cloud import Mapillary
 from landlensdb.handlers.db import Postgres
-from landlensdb.handlers.image import Local
+from landlensdb.handlers.local import GeoTaggedImage, SearchLocalToGeoImageFrame
 from landlensdb.process.road_network import (get_osm_lines,
                                              optimize_network_for_snapping,
                                              validate_network_topology)
@@ -95,6 +95,23 @@ def prepare_data_for_db(images, create_thumbnails=True):
     # Convert data types and handle nulls
     images = images.copy()
 
+    if 'metadata' in images.columns:
+        if 'altitude' not in images.columns:
+            images['altitude'] = images['metadata'].apply(
+                lambda value: (value or {}).get('sensor', {}).get('altitude')
+                if isinstance(value, dict) else None
+            )
+        if 'compass_angle' not in images.columns:
+            images['compass_angle'] = images['metadata'].apply(
+                lambda value: (value or {}).get('sensor', {}).get('compass_angle')
+                if isinstance(value, dict) else None
+            )
+        if 'camera_type' not in images.columns:
+            images['camera_type'] = images['metadata'].apply(
+                lambda value: (value or {}).get('camera', {}).get('camera_type')
+                if isinstance(value, dict) else None
+            )
+
     # Convert numeric fields
     numeric_fields = ['altitude', 'compass_angle', 'computed_compass_angle']
     for field in numeric_fields:
@@ -125,16 +142,22 @@ def prepare_data_for_db(images, create_thumbnails=True):
 
     # Create thumbnails for local images if needed
     if create_thumbnails and 'image_url' in images.columns:
-        images['thumb_url'] = images['image_url'].apply(lambda x: Local.create_thumbnail(x, size=(800, 800)) if os.path.exists(x) else x)
+        images['thumb_url'] = images['image_url'].apply(
+            lambda x: x if os.path.exists(x) else x
+        )
 
     return images
 
 def test_local_images():
     print("\nTesting local image loading...")
-    local_images = Local.load_images("test_data/local")
+    local_images = SearchLocalToGeoImageFrame(
+        "test_data/local",
+        import_types={GeoTaggedImage: r".*\.JPG$"},
+        create_thumbnail=False,
+    )
     print(f"Loaded {len(local_images)} local images")
     print("Sample data:")
-    print(local_images.head())
+    print(pd.DataFrame(local_images).head().to_string())
 
     # Create thumbnails for visualization
     local_images = prepare_data_for_db(local_images, create_thumbnails=True)
@@ -336,7 +359,11 @@ def test_road_network_snapping(images):
         print(f"- Failed to snap: {total_images - snapped_images}")
 
         print("\nSample data with snapped geometry:")
-        print(images[['name', 'geometry', 'snapped_geometry', 'snapped_angle']].head())
+        print(
+            pd.DataFrame(images)[
+                ['name', 'geometry', 'snapped_geometry', 'snapped_angle']
+            ].head().to_string()
+        )
 
         # Generate visualization
         print("\nGenerating map visualization...")

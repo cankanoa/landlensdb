@@ -1,9 +1,11 @@
 import numbers
 import re
 import warnings
-
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Literal
 
 import numpy as np
 import pytz
@@ -13,7 +15,7 @@ from PIL.ExifTags import GPSTAGS, TAGS
 from shapely import Point, Polygon
 from timezonefinder import TimezoneFinder
 
-from landlensdb.geoclasses.geoimageframe import GeoImageFrame
+from ..geoclasses.geoimageframe import GeoImageFrame
 
 try:
     from osgeo import gdal
@@ -26,12 +28,16 @@ class SearchLocalToGeoImageFrame:
 
     def __new__(
         cls,
-        directory,
-        import_types={"GeoTaggedImage": r".*\.JPG$"},
-        additional_columns=None,
-        create_thumbnail=True,
-        thumbnail_size=(256, 256),
-    ):
+        directory: str,
+        import_types: dict[str | type, str] | None = {"GeoTaggedImage": r".*\.JPG$"},
+        additional_columns: list[str | tuple[str, str]] | None = None,
+        create_thumbnail: bool = True,
+        thumbnail_size: tuple[int, int] = (256, 256),
+        fingerprint: Literal["robust", "quick"] | None = None,
+        max_workers: int = 1,
+        progress_callback: Callable[[int, int], None] | None = None,
+        skip_images_in_postgresql: "Postgres | None" = None,
+    ) -> GeoImageFrame:
         """Return a `GeoImageFrame` directly from the import configuration."""
         if cls is SearchLocalToGeoImageFrame:
             if import_types is None:
@@ -44,9 +50,16 @@ class SearchLocalToGeoImageFrame:
 
             if not import_types:
                 raise ValueError("`import_types` must contain at least one importer class.")
+            if fingerprint not in (None, "robust", "quick"):
+                raise ValueError("`fingerprint` must be one of None, 'robust', or 'quick'.")
+            if max_workers is None:
+                max_workers = 1
+            if not isinstance(max_workers, int) or max_workers < 1:
+                raise ValueError("`max_workers` must be an integer greater than or equal to 1.")
 
             all_records = []
             matched_file_count = 0
+            load_tasks = []
 
             for importer_ref, pattern in import_types.items():
                 importer_cls = cls._resolve_importer_class(importer_ref)
@@ -56,24 +69,59 @@ class SearchLocalToGeoImageFrame:
                     )
 
                 image_paths = cls._discover_paths(directory, pattern)
+                if skip_images_in_postgresql is not None:
+                    image_paths = skip_images_in_postgresql.filter_existing_rows(image_paths)
                 matched_file_count += len(image_paths)
                 for image_path in image_paths:
-                    try:
-                        record = importer_cls.load(
-                            image_path=image_path,
-                            additional_columns=additional_columns,
-                            create_thumbnail=create_thumbnail,
-                            thumbnail_size=thumbnail_size,
-                        )
-                    except Exception as exc:
-                        warnings.warn(f"Error processing {image_path}: {exc}. Skipped.")
-                        continue
-
-                    if record is not None:
-                        all_records.append(record)
+                    load_tasks.append(
+                        {
+                            "importer_cls": importer_cls,
+                            "image_path": image_path,
+                            "query_from": directory,
+                            "search_re": pattern,
+                            "import_type": importer_cls.__name__,
+                            "additional_columns": additional_columns,
+                            "create_thumbnail": create_thumbnail,
+                            "thumbnail_size": thumbnail_size,
+                            "fingerprint": fingerprint,
+                        }
+                    )
 
             if matched_file_count == 0:
-                raise ValueError("The directory does not contain any images matching `import_types`.")
+                raise ValueError(
+                    "The directory does not contain any new images matching `import_types`."
+                )
+
+            total_tasks = len(load_tasks)
+            processed_count = 0
+            cls._report_progress(progress_callback, processed_count, total_tasks)
+
+            if max_workers == 1:
+                for task in load_tasks:
+                    record = cls._load_task(task)
+                    processed_count += 1
+                    cls._report_progress(progress_callback, processed_count, total_tasks)
+                    if record is not None:
+                        all_records.append(record)
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(cls._load_task, task): task["image_path"]
+                        for task in load_tasks
+                    }
+                    for future in as_completed(futures):
+                        image_path = futures[future]
+                        try:
+                            record = future.result()
+                        except Exception as exc:
+                            warnings.warn(f"Error processing {image_path}: {exc}. Skipped.")
+                            processed_count += 1
+                            cls._report_progress(progress_callback, processed_count, total_tasks)
+                            continue
+                        processed_count += 1
+                        cls._report_progress(progress_callback, processed_count, total_tasks)
+                        if record is not None:
+                            all_records.append(record)
 
             if not all_records:
                 raise ValueError("No valid images were processed into a GeoImageFrame.")
@@ -116,6 +164,29 @@ class SearchLocalToGeoImageFrame:
                 matched_paths.append(path)
         return sorted(set(matched_paths))
 
+    @staticmethod
+    def _load_task(task):
+        try:
+            return task["importer_cls"].load(
+                image_path=task["image_path"],
+                query_from=task["query_from"],
+                search_re=task["search_re"],
+                import_type=task["import_type"],
+                additional_columns=task["additional_columns"],
+                create_thumbnail=task["create_thumbnail"],
+                thumbnail_size=task["thumbnail_size"],
+                fingerprint=task["fingerprint"],
+            )
+        except Exception as exc:
+            warnings.warn(f"Error processing {task['image_path']}: {exc}. Skipped.")
+            return None
+
+    @staticmethod
+    def _report_progress(progress_callback, processed, total):
+        if progress_callback is None:
+            return
+        progress_callback(processed, total)
+
 class GeoTaggedImage(SearchLocalToGeoImageFrame):
     """Importer for EXIF geotagged images."""
 
@@ -123,15 +194,20 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
     def load(
         cls,
         image_path,
+        query_from=None,
+        search_re=None,
+        import_type=None,
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
+        fingerprint=None,
     ):
         """Load a single geotagged image into a GeoImageFrame-compatible record."""
         with Image.open(image_path) as img:
             exif_data = _normalize_metadata_value(_get_exif_data(img))
 
         source = _extract_source(image_path)
+        fingerprint_data = _calculate_fingerprint(image_path, fingerprint)
         raster = _get_raster_metadata(image_path)
         geometry_data = _extract_latlon_from_metadata(
             image_path=image_path,
@@ -166,6 +242,10 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
         )
         metadata = _build_metadata(
             source=source,
+            query_from=query_from,
+            import_type=import_type or cls.__name__,
+            search_re=search_re,
+            fingerprint=fingerprint_data,
             raster=raster,
             exif_data=exif_data,
             geotags=geometry_data["geotags"],
@@ -180,6 +260,7 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
             "geometry": geometry_data["geometry"],
             "metadata": metadata,
             "thumbnail": thumbnail_data,
+            "fingerprint": fingerprint_data["value"] if fingerprint_data else None,
         }
 
         return _apply_additional_columns(
@@ -196,12 +277,17 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
     def load(
         cls,
         image_path,
+        query_from=None,
+        search_re=None,
+        import_type=None,
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
+        fingerprint=None,
     ):
         """Load a single georeferenced raster into a GeoImageFrame-compatible record."""
         source = _extract_source(image_path)
+        fingerprint_data = _calculate_fingerprint(image_path, fingerprint)
         raster = _get_raster_metadata(image_path)
         geometry_data = _extract_geometry_from_geotransform(
             image_path=image_path,
@@ -216,7 +302,13 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
             thumbnail_size=thumbnail_size,
         )
         metadata = {
+            "input_params": {
+                "query_from": query_from,
+                "import_type": import_type or cls.__name__,
+                "search_re": search_re,
+            },
             "source": source,
+            "fingerprint": fingerprint_data,
             "raster": raster,
         }
 
@@ -226,6 +318,7 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
             "geometry": geometry_data["geometry"],
             "metadata": metadata,
             "thumbnail": thumbnail_data,
+            "fingerprint": fingerprint_data["value"] if fingerprint_data else None,
         }
 
         return _apply_additional_columns(
@@ -407,6 +500,40 @@ def _extract_source(image_path):
     }
 
 
+def _calculate_fingerprint(image_path, mode, sample_size=65536):
+    """Calculate a robust or quick file fingerprint."""
+    if mode is None:
+        return None
+
+    path = Path(image_path)
+    if mode not in ("robust", "quick"):
+        raise ValueError("Fingerprint mode must be None, 'robust', or 'quick'.")
+
+    hasher = hashlib.blake2b(digest_size=32)
+    file_size = path.stat().st_size
+
+    with path.open("rb") as handle:
+        if mode == "robust":
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        else:
+            offsets = [0]
+            if file_size > sample_size:
+                offsets.append(max((file_size // 2) - (sample_size // 2), 0))
+                offsets.append(max(file_size - sample_size, 0))
+
+            for offset in sorted(set(offsets)):
+                handle.seek(offset)
+                hasher.update(handle.read(sample_size))
+            hasher.update(str(file_size).encode("utf-8"))
+
+    return {
+        "mode": mode,
+        "algorithm": "blake2b",
+        "value": hasher.hexdigest(),
+    }
+
+
 def _extract_latlon_from_metadata(image_path, exif_data, get_geotagging, get_coordinates):
     """Extract normalized GPS metadata and geometry."""
     geotags = get_geotagging(exif_data)
@@ -524,6 +651,10 @@ def _extract_thumbnail(image_path, create_thumbnail, thumbnail_size):
 
 def _build_metadata(
     source,
+    query_from,
+    import_type,
+    search_re,
+    fingerprint,
     raster,
     exif_data,
     geotags,
@@ -533,7 +664,13 @@ def _build_metadata(
 ):
     """Build the metadata dictionary stored on the record."""
     return {
+        "input_params": {
+            "query_from": query_from,
+            "import_type": import_type,
+            "search_re": search_re,
+        },
         "source": source,
+        "fingerprint": fingerprint,
         "raster": raster,
         "exif": exif_data,
         "gps": geotags,
@@ -583,7 +720,6 @@ def _get_raster_metadata(image_path):
         "bands": dataset.RasterCount,
         "projection": projection or None,
         "geotransform": tuple(geotransform) if geotransform is not None else None,
-        "info": gdal.Info(dataset),
         "format": dataset.GetDriver().ShortName,
     }
 
