@@ -9,12 +9,9 @@ from folium.features import CustomIcon
 from geopandas import GeoDataFrame
 from osgeo.gdal import Dataset
 from shapely.geometry import Point, Polygon
-from sqlalchemy import MetaData
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.inspection import inspect
 from sqlalchemy.sql import text
 from tqdm import tqdm
-
+from ..handlers.db import Postgres
 
 def _generate_arrow_icon(compass_angle):
     """Generates an arrow icon based on the specified compass angle.
@@ -204,92 +201,14 @@ class GeoImageFrame(GeoDataFrame):
             ValueError: If required columns are missing or if the CRS is incorrect.
             TypeError: If the columns contain incorrect data types.
         """
-        self._verify_structure()
 
-        gdf_to_write = GeoDataFrame(
-            self.drop(columns=["thumbnail"], errors="ignore"),
-            geometry="geometry",
-            crs=self.crs,
+        return Postgres(engine).upsert_images(
+            self,
+            name,
+            if_exists=if_exists,
+            *args,
+            **kwargs,
         )
-        dtype = kwargs.pop("dtype", {}).copy()
-        if "metadata" in gdf_to_write.columns:
-            dtype["metadata"] = JSONB
-            gdf_to_write["metadata"] = gdf_to_write["metadata"].apply(
-                lambda value: json.dumps(value) if isinstance(value, dict) else value
-            )
-
-        metadata = MetaData()
-        metadata.reflect(bind=engine)
-
-        if not inspect(engine).has_table(name):
-            gdf_to_write.to_postgis(name, engine, if_exists=if_exists, *args, dtype=dtype, **kwargs)
-        else:
-            if if_exists == "fail":
-                raise ValueError(f"Table '{name}' already exists.")
-            elif if_exists == "replace":
-                table = metadata.tables[name]
-                with engine.connect() as conn:
-                    table.drop(conn)
-                gdf_to_write.to_postgis(name, engine, if_exists="replace", *args, dtype=dtype, **kwargs)
-
-            elif if_exists == "append":
-                gdf_to_write.to_postgis(name, engine, if_exists="append", *args, dtype=dtype, **kwargs)
-
-        metadata.reflect(bind=engine)
-        table = metadata.tables[name]
-
-        with engine.connect() as conn:
-            conn.execute(text("SET postgis.gdal_enabled_drivers = 'GTiff'"))
-            if "metadata" in gdf_to_write.columns:
-                conn.execute(
-                    text(
-                        f'ALTER TABLE "{table.name}" '
-                        f'ALTER COLUMN "metadata" TYPE jsonb USING "metadata"::jsonb'
-                    )
-                )
-
-            for col in self.required_columns:
-                stmt = text(f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL")
-                conn.execute(stmt)
-
-            self._ensure_unique_constraint(conn, table.name, f"{table.name}_image_url_key", "image_url")
-            if "fingerprint" in self.columns:
-                self._ensure_unique_constraint(
-                    conn,
-                    table.name,
-                    f"{table.name}_fingerprint_key",
-                    "fingerprint",
-                )
-
-            if "thumbnail" in self.columns:
-                conn.execute(
-                    text(
-                        f"ALTER TABLE {table.name} "
-                        f"ADD COLUMN IF NOT EXISTS thumbnail raster"
-                    )
-                )
-
-                update_stmt = text(
-                    f"UPDATE {table.name} "
-                    f"SET thumbnail = ST_FromGDALRaster(:thumbnail_raster) "
-                    f"WHERE image_url = :image_url"
-                )
-
-                for _, row in self.iterrows():
-                    thumbnail_dataset = row.get("thumbnail")
-                    if thumbnail_dataset is None:
-                        continue
-
-                    thumbnail_raster = self._thumbnail_to_gdal_raster(thumbnail_dataset)
-                    conn.execute(
-                        update_stmt,
-                        {
-                            "thumbnail_raster": thumbnail_raster,
-                            "image_url": row["image_url"],
-                        },
-                    )
-
-            conn.connection.commit()
 
     @staticmethod
     def _thumbnail_to_gdal_raster(thumbnail_dataset):

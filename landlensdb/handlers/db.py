@@ -1,14 +1,20 @@
 import json
 import math
 import numbers
+import os
+from typing import TYPE_CHECKING
 
 from geoalchemy2 import WKBElement
+from geopandas import GeoDataFrame
 from shapely.geometry.base import BaseGeometry
 from shapely.wkb import loads
 from sqlalchemy import create_engine, MetaData, Table, select, and_, text, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.inspection import inspect
 
-from ..geoclasses.geoimageframe import GeoImageFrame
+if TYPE_CHECKING:
+    from ..geoclasses.geoimageframe import GeoImageFrame
 
 
 class Postgres:
@@ -30,7 +36,10 @@ class Postgres:
             database_url (str): The URL of the database to connect to.
         """
         self.DATABASE_URL = database_url
-        self.engine = create_engine(self.DATABASE_URL)
+        if hasattr(database_url, "connect"):
+            self.engine = database_url
+        else:
+            self.engine = create_engine(self.DATABASE_URL)
         self.result_set = None
         self.selected_table = None
 
@@ -177,6 +186,8 @@ class Postgres:
         Raises:
             TypeError: If geometries are not of type Point.
         """
+        from ..geoclasses.geoimageframe import GeoImageFrame
+
         with self.engine.connect() as conn:
             result = conn.execute(self.result_set)
             data = [row._asdict() for row in result.fetchall()]
@@ -239,24 +250,208 @@ class Postgres:
         distinct_values = [row[0] for row in result.fetchall()]
         return distinct_values
 
+    def filter_existing_rows(self, image_paths):
+        if self.selected_table is None:
+            raise ValueError("Select a table first with `table(table_name)`.")
+
+        normalized_paths = [str(path) for path in image_paths]
+        if not normalized_paths:
+            return []
+
+        existing_paths = set()
+        image_url_column = getattr(self.selected_table.c, "image_url", None)
+        if image_url_column is None:
+            raise ValueError(
+                f"Column 'image_url' not found in table '{self.selected_table.name}'."
+            )
+
+        with self.engine.connect() as conn:
+            for start in range(0, len(normalized_paths), 1000):
+                chunk = normalized_paths[start:start + 1000]
+                result = conn.execute(
+                    select(image_url_column).where(image_url_column.in_(chunk))
+                )
+                existing_paths.update(row[0] for row in result.fetchall())
+
+        return [path for path in normalized_paths if path not in existing_paths]
+
     @staticmethod
     def _qualified_table_name(table):
         if table.schema:
             return '"{}"."{}"'.format(table.schema, table.name)
         return '"{}"'.format(table.name)
 
-    def upsert_images(self, gif, table_name, conflict="update"):
+    @staticmethod
+    def _thumbnail_to_gdal_raster(thumbnail_dataset):
+        from osgeo import gdal
+
+        vsi_path = f"/vsimem/{os.urandom(16).hex()}.tif"
+        try:
+            gtiff_driver = gdal.GetDriverByName("GTiff")
+            gtiff_driver.CreateCopy(vsi_path, thumbnail_dataset)
+            raster_bytes = gdal.VSIGetMemFileBuffer_unsafe(vsi_path)
+            return bytes(raster_bytes)
+        finally:
+            gdal.Unlink(vsi_path)
+
+    @staticmethod
+    def _ensure_unique_constraint(conn, table_name, constraint_name, column_name):
+        table_ident = table_name.replace('"', '""')
+        constraint_ident = constraint_name.replace('"', '""')
+        column_ident = column_name.replace('"', '""')
+        conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = '{constraint_ident}'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE "{table_ident}" '
+                             || 'ADD CONSTRAINT "{constraint_ident}" '
+                             || 'UNIQUE ("{column_ident}")';
+                    END IF;
+                END
+                $$;
+                """
+            )
+        )
+
+    def upsert_images(self, gif, table_name, conflict="update", if_exists="upsert", *args, **kwargs):
         """
-        Inserts or updates image data in the specified table.
+        Write image data to the specified table.
 
         Args:
             gif (GeoImageFrame): The data frame containing image data.
-            table_name (str): The name of the table to upsert into.
-            conflict (str, optional): Conflict resolution strategy ("update" or "nothing"). Defaults to "update".
+            table_name (str): The name of the table to write into.
+            conflict (str, optional): Conflict resolution strategy for upsert mode
+                ("update" or "nothing"). Defaults to "update".
+            if_exists (str, optional): Write behavior ("fail", "replace",
+                "append", or "upsert"). Defaults to "upsert".
 
         Raises:
-            ValueError: If an invalid conflict resolution type is provided.
+            ValueError: If an invalid write mode or conflict resolution type is provided.
         """
+        gif._verify_structure()
+
+        if if_exists in ("fail", "replace", "append"):
+            gdf_to_write = GeoDataFrame(
+                gif.drop(columns=["thumbnail"], errors="ignore"),
+                geometry="geometry",
+                crs=gif.crs,
+            )
+            dtype = kwargs.pop("dtype", {}).copy()
+            if "metadata" in gdf_to_write.columns:
+                dtype["metadata"] = JSONB
+                gdf_to_write["metadata"] = gdf_to_write["metadata"].apply(
+                    lambda value: json.dumps(self._convert_dicts_to_json(value))
+                    if isinstance(value, dict)
+                    else value
+                )
+
+            metadata = MetaData()
+            metadata.reflect(bind=self.engine)
+
+            if not inspect(self.engine).has_table(table_name):
+                gdf_to_write.to_postgis(
+                    table_name,
+                    self.engine,
+                    if_exists=if_exists,
+                    *args,
+                    dtype=dtype,
+                    **kwargs,
+                )
+            else:
+                if if_exists == "fail":
+                    raise ValueError(f"Table '{table_name}' already exists.")
+                if if_exists == "replace":
+                    table = metadata.tables[table_name]
+                    with self.engine.connect() as conn:
+                        table.drop(conn)
+                    gdf_to_write.to_postgis(
+                        table_name,
+                        self.engine,
+                        if_exists="replace",
+                        *args,
+                        dtype=dtype,
+                        **kwargs,
+                    )
+                elif if_exists == "append":
+                    gdf_to_write.to_postgis(
+                        table_name,
+                        self.engine,
+                        if_exists="append",
+                        *args,
+                        dtype=dtype,
+                        **kwargs,
+                    )
+
+            metadata.reflect(bind=self.engine)
+            table = metadata.tables[table_name]
+
+            with self.engine.connect() as conn:
+                conn.execute(text("SET postgis.gdal_enabled_drivers = 'GTiff'"))
+                if "metadata" in gdf_to_write.columns:
+                    conn.execute(
+                        text(
+                            f'ALTER TABLE "{table.name}" '
+                            f'ALTER COLUMN "metadata" TYPE jsonb USING "metadata"::jsonb'
+                        )
+                    )
+
+                for col in gif.required_columns:
+                    stmt = text(f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL")
+                    conn.execute(stmt)
+
+                self._ensure_unique_constraint(
+                    conn, table.name, f"{table.name}_image_url_key", "image_url"
+                )
+                if "fingerprint" in gif.columns:
+                    self._ensure_unique_constraint(
+                        conn,
+                        table.name,
+                        f"{table.name}_fingerprint_key",
+                        "fingerprint",
+                    )
+
+                if "thumbnail" in gif.columns:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {table.name} "
+                            f"ADD COLUMN IF NOT EXISTS thumbnail raster"
+                        )
+                    )
+
+                    update_stmt = text(
+                        f"UPDATE {table.name} "
+                        f"SET thumbnail = ST_FromGDALRaster(:thumbnail_raster) "
+                        f"WHERE image_url = :image_url"
+                    )
+
+                    for _, row in gif.iterrows():
+                        thumbnail_dataset = row.get("thumbnail")
+                        if thumbnail_dataset is None:
+                            continue
+
+                        thumbnail_raster = self._thumbnail_to_gdal_raster(thumbnail_dataset)
+                        conn.execute(
+                            update_stmt,
+                            {
+                                "thumbnail_raster": thumbnail_raster,
+                                "image_url": row["image_url"],
+                            },
+                        )
+
+                conn.connection.commit()
+            return
+
+        if if_exists != "upsert":
+            raise ValueError(
+                "Invalid if_exists value. Choose 'fail', 'replace', 'append', or 'upsert'."
+            )
+
         data = gif.to_dict(orient="records")
 
         meta = MetaData()
@@ -342,7 +537,7 @@ class Postgres:
                     f"WHERE image_url = :image_url"
                 )
                 for update_values in thumbnail_updates:
-                    thumbnail_raster = gif._thumbnail_to_gdal_raster(
+                    thumbnail_raster = self._thumbnail_to_gdal_raster(
                         update_values["thumbnail"]
                     )
                     conn.execute(
