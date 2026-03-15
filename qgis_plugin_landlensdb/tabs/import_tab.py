@@ -50,13 +50,15 @@ class AddTableDialog(QtWidgets.QDialog):
 
 
 class ImportTab(QtWidgets.QWidget):
-    HEADERS = ['query_from', 'import_type', 'search_re', 'Actions']
+    HEADERS = ['Actions', 'import_type', 'query_from', 'search_re']
     ADD_TABLE_SENTINEL = '__add_table__'
+    IMPORT_TYPES = ['', 'GeoTaggedImage', 'GeoTransformImage']
 
     def __init__(self, iface, parent=None):
         super(ImportTab, self).__init__(parent)
         self.iface = iface
         self.connection_values = load_connection_settings()
+        self._selected_table = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -64,15 +66,12 @@ class ImportTab(QtWidgets.QWidget):
 
         top_row = QtWidgets.QHBoxLayout()
         top_row.addWidget(QtWidgets.QLabel('Table:'))
-        self.table_combo = QtWidgets.QComboBox()
-        self.table_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-        top_row.addWidget(self.table_combo, 1)
-        self.drop_table_button = QtWidgets.QToolButton()
-        self.drop_table_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon))
-        self.drop_table_button.setToolTip('Drop selected table')
-        top_row.addWidget(self.drop_table_button)
-        self.update_button = QtWidgets.QPushButton('Update')
-        top_row.addWidget(self.update_button)
+        self.table_button = QtWidgets.QToolButton()
+        self.table_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.table_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.table_button.setArrowType(QtCore.Qt.DownArrow)
+        self.table_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        top_row.addWidget(self.table_button, 1)
         layout.addLayout(top_row)
 
         self.import_table = QtWidgets.QTableWidget(self)
@@ -80,7 +79,8 @@ class ImportTab(QtWidgets.QWidget):
         self.import_table.setHorizontalHeaderLabels(self.HEADERS)
         self.import_table.verticalHeader().setVisible(False)
         self.import_table.setAlternatingRowColors(True)
-        self.import_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.import_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self.import_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.import_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.import_table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.import_table.horizontalHeader().setStretchLastSection(True)
@@ -93,9 +93,6 @@ class ImportTab(QtWidgets.QWidget):
         layout.addLayout(button_row)
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
-        self.update_button.clicked.connect(self.refresh_table)
-        self.drop_table_button.clicked.connect(self.drop_selected_table)
-        self.table_combo.activated.connect(self._handle_table_choice)
 
         self._update_connection_button_text()
         self._refresh_table_choices()
@@ -104,6 +101,8 @@ class ImportTab(QtWidgets.QWidget):
     def showEvent(self, event):
         super(ImportTab, self).showEvent(event)
         self._refresh_table_choices()
+        if self.current_table_name():
+            self._select_table(self.current_table_name())
 
     def reload_connection_settings(self, values=None):
         self.connection_values = dict(values or load_connection_settings())
@@ -131,36 +130,42 @@ class ImportTab(QtWidgets.QWidget):
         label = self.connection_values.get('name') or self.connection_values.get('database') or 'Connection'
         self.connection_button.setText('Connection' if label == 'Connection' else 'Connection: {}'.format(label))
 
-    def _handle_table_choice(self, index):
-        if self.table_combo.itemData(index) == self.ADD_TABLE_SENTINEL:
-            self.add_table()
-
     def _refresh_table_choices(self, selected_table=None):
         current_table = selected_table or self.current_table_name()
         tables = self._fetch_tables()
 
-        self.table_combo.blockSignals(True)
-        self.table_combo.clear()
-        for table_name in tables:
-            self.table_combo.addItem(table_name, table_name)
-        self.table_combo.addItem('Add Table...', self.ADD_TABLE_SENTINEL)
-
-        if current_table and current_table in tables:
-            self.table_combo.setCurrentIndex(tables.index(current_table))
+        if current_table in tables:
+            self._selected_table = current_table
         elif tables:
-            self.table_combo.setCurrentIndex(0)
+            self._selected_table = tables[0]
         else:
-            self.table_combo.setCurrentIndex(self.table_combo.count() - 1)
-        self.table_combo.blockSignals(False)
+            self._selected_table = None
 
-        has_real_table = bool(tables)
-        self.drop_table_button.setEnabled(has_real_table and self.current_table_name() is not None)
+        menu = QtWidgets.QMenu(self.table_button)
+        for table_name in tables:
+            menu.addAction(table_name, lambda checked=False, name=table_name: self._select_table(name))
+        if tables:
+            menu.addSeparator()
+            delete_menu = menu.addMenu('Delete Table')
+            for table_name in tables:
+                delete_menu.addAction(
+                    table_name,
+                    lambda checked=False, name=table_name: self.drop_selected_table(name),
+                )
+        menu.addAction('Add Table...', self.add_table)
+        menu.setMinimumWidth(max(self.table_button.width(), 240))
+
+        self.table_button.setMenu(menu)
+        button_label = self._selected_table or 'Choose Table'
+        self.table_button.setText(button_label)
 
     def current_table_name(self):
-        data = self.table_combo.currentData()
-        if data == self.ADD_TABLE_SENTINEL:
-            return None
-        return data
+        return self._selected_table
+
+    def _select_table(self, table_name):
+        self._selected_table = table_name
+        self.table_button.setText(table_name)
+        self.refresh_table()
 
     def add_table(self):
         valid, message = validate_connection_values(self.connection_values)
@@ -225,10 +230,11 @@ class ImportTab(QtWidgets.QWidget):
             return
 
         self._refresh_table_choices(selected_table=table_name)
+        self._select_table(table_name)
         self._show_message('Created table "{}".'.format(table_name), Qgis.Info)
 
-    def drop_selected_table(self):
-        table_name = self.current_table_name()
+    def drop_selected_table(self, table_name=None):
+        table_name = table_name or self.current_table_name()
         if not table_name:
             return
 
@@ -335,27 +341,30 @@ class ImportTab(QtWidgets.QWidget):
             unique_rows.append(row)
 
         self.import_table.clearContents()
-        self.import_table.setRowCount(len(unique_rows))
+        self.import_table.setRowCount(len(unique_rows) + 1)
         for row_index, row_values in enumerate(unique_rows):
-            for column_index, value in enumerate(row_values):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setFlags(item.flags() | QtCore.Qt.ItemIsEditable)
-                self.import_table.setItem(row_index, column_index, item)
-
             button = QtWidgets.QPushButton('Update')
+            button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
             button.clicked.connect(lambda _=False, row=row_index: self.run_row_update(row))
-            self.import_table.setCellWidget(row_index, 3, button)
+            self.import_table.setCellWidget(row_index, 0, button)
+            self.import_table.setCellWidget(row_index, 1, self._build_import_type_widget(row_values[1]))
+            self.import_table.setCellWidget(row_index, 2, self._build_query_from_widget(row_values[0]))
+            self.import_table.setCellWidget(row_index, 3, self._build_search_re_widget(row_values[2]))
 
-        if not unique_rows:
-            self.import_table.setRowCount(1)
-            empty_item = QtWidgets.QTableWidgetItem('No import parameter sets yet')
-            empty_item.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
-            self.import_table.setItem(0, 0, empty_item)
-            for column_index in range(1, len(self.HEADERS)):
-                spacer_item = QtWidgets.QTableWidgetItem('')
-                spacer_item.setFlags(QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled)
-                self.import_table.setItem(0, column_index, spacer_item)
+        add_row_index = len(unique_rows)
+        add_button = QtWidgets.QPushButton('Add')
+        add_button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        add_button.clicked.connect(lambda _=False, row=add_row_index: self.run_row_update(row))
+        self.import_table.setCellWidget(add_row_index, 0, add_button)
+        self.import_table.setCellWidget(add_row_index, 1, self._build_import_type_widget(''))
+        self.import_table.setCellWidget(add_row_index, 2, self._build_query_from_widget(''))
+        self.import_table.setCellWidget(add_row_index, 3, self._build_search_re_widget(''))
 
+        header = self.import_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
         self.import_table.resizeColumnsToContents()
 
     def run_row_update(self, row_index):
@@ -364,16 +373,16 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        query_from_item = self.import_table.item(row_index, 0)
-        import_type_item = self.import_table.item(row_index, 1)
-        search_re_item = self.import_table.item(row_index, 2)
-        if query_from_item is None or import_type_item is None or search_re_item is None:
+        import_type_input = self._import_type_input(row_index)
+        query_from_input = self._query_from_input(row_index)
+        search_re_input = self._search_re_input(row_index)
+        if query_from_input is None or import_type_input is None or search_re_input is None:
             self._show_message('Import row is incomplete.', Qgis.Critical)
             return
 
-        query_from = query_from_item.text().strip()
-        import_type = import_type_item.text().strip()
-        search_re = search_re_item.text().strip()
+        query_from = query_from_input.text().strip()
+        import_type = import_type_input.currentText().strip()
+        search_re = search_re_input.text().strip()
         if not query_from or not import_type or not search_re:
             self._show_message('query_from, import_type, and search_re are required.', Qgis.Critical)
             return
@@ -396,6 +405,57 @@ class ImportTab(QtWidgets.QWidget):
         self._show_message('Updated "{}" from {}.'.format(table_name, query_from), Qgis.Info)
         self.refresh_table()
 
+    def _build_query_from_widget(self, value):
+        widget = QtWidgets.QWidget(self.import_table)
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        line_edit = QtWidgets.QLineEdit(value)
+        line_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        browse_button = QtWidgets.QToolButton(widget)
+        browse_button.setText('...')
+        browse_button.clicked.connect(lambda: self._browse_query_from(line_edit))
+        layout.addWidget(line_edit, 1)
+        layout.addWidget(browse_button)
+        widget.line_edit = line_edit
+        min_width = line_edit.fontMetrics().horizontalAdvance(value or 'Select folder') + 48
+        widget.setMinimumWidth(max(180, min_width))
+        return widget
+
+    def _build_import_type_widget(self, value):
+        combo = QtWidgets.QComboBox(self.import_table)
+        combo.addItems(self.IMPORT_TYPES)
+        index = combo.findText(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        return combo
+
+    def _build_search_re_widget(self, value):
+        widget = QtWidgets.QLineEdit(value, self.import_table)
+        min_width = widget.fontMetrics().horizontalAdvance(value or '.*') + 32
+        widget.setMinimumWidth(max(140, min_width))
+        return widget
+
+    def _browse_query_from(self, line_edit):
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            'Select Folder',
+            line_edit.text().strip() or '',
+        )
+        if directory:
+            line_edit.setText(directory)
+
+    def _query_from_input(self, row_index):
+        widget = self.import_table.cellWidget(row_index, 2)
+        return getattr(widget, 'line_edit', None)
+
+    def _import_type_input(self, row_index):
+        widget = self.import_table.cellWidget(row_index, 1)
+        return widget if isinstance(widget, QtWidgets.QComboBox) else None
+
+    def _search_re_input(self, row_index):
+        widget = self.import_table.cellWidget(row_index, 3)
+        return widget if isinstance(widget, QtWidgets.QLineEdit) else None
+
     def _fetch_tables(self):
         valid, _ = validate_connection_values(self.connection_values)
         if not valid:
@@ -414,7 +474,7 @@ class ImportTab(QtWidgets.QWidget):
                         """,
                         (schema_name,),
                     )
-                    return [row[0] for row in cursor.fetchall()]
+                    return [row[0] for row in cursor.fetchall() if row[0] != 'spatial_ref_sys']
         except Exception:  # pragma: no cover
             return []
 

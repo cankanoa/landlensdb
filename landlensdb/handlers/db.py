@@ -1,3 +1,7 @@
+import json
+import math
+import numbers
+
 from geoalchemy2 import WKBElement
 from shapely.geometry.base import BaseGeometry
 from shapely.wkb import loads
@@ -49,15 +53,60 @@ class Postgres:
     @staticmethod
     def _convert_dicts_to_json(record):
         """
-        Preserve dictionary values for JSON/JSONB columns.
+        Normalize records so JSON/JSONB values contain only JSON-serializable types.
 
         Args:
             record (dict): A dictionary where values may include other dictionaries.
 
         Returns:
-            dict: The unmodified record.
+            dict: The normalized record.
         """
-        return record
+        def _clean_string(value):
+            return value.replace("\x00", "")
+
+        def _normalize_json_value(value):
+            if isinstance(value, dict):
+                return {
+                    _clean_string(str(key)): _normalize_json_value(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, (list, tuple, set)):
+                return [_normalize_json_value(item) for item in value]
+            if isinstance(value, str):
+                return _clean_string(value)
+            if value is None or isinstance(value, bool):
+                return value
+            if isinstance(value, BaseGeometry):
+                return value.wkt
+            if hasattr(value, "item"):
+                try:
+                    return _normalize_json_value(value.item())
+                except Exception:
+                    pass
+            if hasattr(value, "tolist"):
+                try:
+                    return _normalize_json_value(value.tolist())
+                except Exception:
+                    pass
+            if hasattr(value, "numerator") and hasattr(value, "denominator"):
+                try:
+                    return _normalize_json_value(float(value))
+                except Exception:
+                    pass
+            if isinstance(value, numbers.Integral):
+                return int(value)
+            if isinstance(value, numbers.Real):
+                numeric_value = float(value)
+                return numeric_value if math.isfinite(numeric_value) else None
+            if isinstance(value, bytes):
+                return _clean_string(value.decode("utf-8", errors="replace"))
+            return _clean_string(str(value))
+
+        def _default_json(value):
+            return _normalize_json_value(value)
+
+        normalized_record = _normalize_json_value(record)
+        return json.loads(json.dumps(normalized_record, default=_default_json, allow_nan=False))
 
     def table(self, table_name):
         """
@@ -190,6 +239,12 @@ class Postgres:
         distinct_values = [row[0] for row in result.fetchall()]
         return distinct_values
 
+    @staticmethod
+    def _qualified_table_name(table):
+        if table.schema:
+            return '"{}"."{}"'.format(table.schema, table.name)
+        return '"{}"'.format(table.name)
+
     def upsert_images(self, gif, table_name, conflict="update"):
         """
         Inserts or updates image data in the specified table.
@@ -209,6 +264,22 @@ class Postgres:
         thumbnail_updates = []
 
         with self.engine.begin() as conn:
+            geometry_column = table.columns.get("geometry")
+            if geometry_column is not None:
+                current_geometry_type = getattr(geometry_column.type, "geometry_type", None)
+                current_geometry_type = (
+                    current_geometry_type.upper() if isinstance(current_geometry_type, str) else None
+                )
+                if current_geometry_type not in (None, "GEOMETRY"):
+                    conn.execute(
+                        text(
+                            "ALTER TABLE {} "
+                            "ALTER COLUMN geometry TYPE geometry(Geometry, 4326) "
+                            "USING ST_SetSRID(geometry, 4326)".format(
+                                self._qualified_table_name(table)
+                            )
+                        )
+                    )
             for record in data:
                 thumbnail_value = record.pop("thumbnail", None)
                 record = self._convert_geometries_to_wkt(record)
