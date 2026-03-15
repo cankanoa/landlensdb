@@ -31,6 +31,7 @@ from ..shared.connection_utils import (
     test_connection_values,
     validate_connection_values,
 )
+from ..shared.import_params import import_parameter_label, normalize_import_parameter_row
 
 try:
     import psycopg2
@@ -449,28 +450,22 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                     preview_rows = self._get_preview_rows(cursor, live_query, column_info)
                     row_count = self._get_row_count(cursor, live_query)
                     raster_key_columns = self._get_raster_key_columns(cursor, raster_source)
-                    raster_row_map = self._get_raster_row_map(
-                        cursor,
-                        raster_source,
-                        raster_key_columns,
-                        [column['name'] for column in column_info if column['udt_name'] == 'raster'],
-                    )
+                    raster_columns = [column['name'] for column in column_info if column['udt_name'] == 'raster']
         except Exception as exc:  # pragma: no cover - depends on external DB
             self._show_error('Query failed: {}'.format(exc))
             return
 
         vector_column = self._find_first_column(column_info, {'geometry', 'geography'})
-        geometry_types = []
-        if vector_column:
-            try:
-                with psycopg2.connect(**self._connection_kwargs()) as connection:
-                    with connection.cursor() as cursor:
-                        if schema_name:
-                            self._set_search_path(cursor, schema_name)
-                        geometry_types = self._get_geometry_types(cursor, live_query, vector_column)
-            except Exception as exc:  # pragma: no cover - depends on external DB
-                self._show_error('Could not inspect geometry types: {}'.format(exc))
-                return
+        import_groups = []
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    import_groups = self._get_query_import_groups(cursor, live_query, column_info)
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not inspect import groups: {}'.format(exc))
+            return
         self._populate_preview(column_info, preview_rows, row_count)
         self._add_history_item(sql_text)
         self._last_query_state = {
@@ -478,8 +473,9 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             'live_query': live_query,
             'raster_source': raster_source,
             'vector_column': vector_column,
-            'geometry_types': geometry_types,
-            'raster_row_map': raster_row_map,
+            'import_groups': import_groups,
+            'raster_columns': raster_columns,
+            'raster_key_columns': raster_key_columns,
             'row_count': row_count,
         }
         self.add_button.setEnabled(True)
@@ -492,31 +488,69 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             return
 
         query_name = self._last_query_state['query_name']
-        group = self._ensure_query_group(query_name)
+        root_group = self._ensure_query_group(query_name)
         added_layers = []
-
+        import_groups = self._last_query_state.get('import_groups') or [None]
         vector_column = self._last_query_state['vector_column']
-        if vector_column:
-            for vector_layer in self._create_geometry_layers(
-                self._last_query_state['live_query'],
-                vector_column,
-                query_name,
-                self._last_query_state.get('geometry_types') or [],
-            ):
-                added_layers.append(vector_layer.name())
-                self._add_layer_to_group(group, vector_layer)
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
 
-        for raster_column, row_filters in self._last_query_state['raster_row_map'].items():
-            for row_filter, row_label in row_filters:
-                raster_layer = self._create_raster_layer(
-                    self._last_query_state['raster_source'],
-                    raster_column,
-                    row_filter,
-                    '{} {} {}'.format(query_name, raster_column, row_label),
-                )
-                if raster_layer is not None:
-                    added_layers.append(raster_layer.name())
-                    self._add_layer_to_group(group, raster_layer)
+        for import_group in import_groups:
+            group_name = import_parameter_label(import_group) if import_group else query_name
+            group = root_group.addGroup(group_name)
+            filtered_query = self._build_import_group_query(
+                self._last_query_state['live_query'],
+                import_group,
+            )
+
+            geometry_types = []
+            if vector_column:
+                try:
+                    with psycopg2.connect(**self._connection_kwargs()) as connection:
+                        with connection.cursor() as cursor:
+                            if schema_name:
+                                self._set_search_path(cursor, schema_name)
+                            geometry_types = self._get_geometry_types(cursor, filtered_query, vector_column)
+                except Exception as exc:  # pragma: no cover - depends on external DB
+                    self._show_error('Could not inspect geometry types: {}'.format(exc))
+                    continue
+
+                for vector_layer in self._create_geometry_layers(
+                    filtered_query,
+                    vector_column,
+                    group_name,
+                    geometry_types,
+                ):
+                    added_layers.append(vector_layer.name())
+                    self._add_layer_to_group(group, vector_layer)
+
+            if import_group and import_group[1] == 'GeoTransformImage':
+                try:
+                    with psycopg2.connect(**self._connection_kwargs()) as connection:
+                        with connection.cursor() as cursor:
+                            if schema_name:
+                                self._set_search_path(cursor, schema_name)
+                            raster_row_map = self._get_raster_row_map(
+                                cursor,
+                                self._last_query_state['raster_source'],
+                                self._last_query_state['raster_key_columns'],
+                                self._last_query_state['raster_columns'],
+                                import_group=import_group,
+                            )
+                except Exception as exc:  # pragma: no cover - depends on external DB
+                    self._show_error('Could not inspect raster rows: {}'.format(exc))
+                    continue
+
+                for raster_column, row_filters in raster_row_map.items():
+                    for row_filter, row_label in row_filters:
+                        raster_layer = self._create_raster_layer(
+                            self._last_query_state['raster_source'],
+                            raster_column,
+                            row_filter,
+                            '{} {} {}'.format(group_name, raster_column, row_label),
+                        )
+                        if raster_layer is not None:
+                            added_layers.append(raster_layer.name())
+                            self._add_layer_to_group(group, raster_layer)
 
         if added_layers:
             self._show_info(
@@ -674,7 +708,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         return cursor.fetchone() is not None
 
-    def _get_raster_row_map(self, cursor, raster_source, key_columns, raster_columns):
+    def _get_raster_row_map(self, cursor, raster_source, key_columns, raster_columns, import_group=None):
         raster_row_map = {}
         if not raster_source or not key_columns:
             if raster_source and raster_columns:
@@ -699,6 +733,22 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                         "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = 'GeoTransformImage'"
                     )
                 )
+                if import_group:
+                    filter_parts.append(
+                        sql.SQL(
+                            "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = {}"
+                        ).format(sql.Literal(import_group[0]))
+                    )
+                    filter_parts.append(
+                        sql.SQL(
+                            "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = {}"
+                        ).format(sql.Literal(import_group[1]))
+                    )
+                    filter_parts.append(
+                        sql.SQL(
+                            "coalesce(metadata::jsonb->'input_params'->>'search_re', '') = {}"
+                        ).format(sql.Literal(import_group[2]))
+                    )
 
             key_filter_exprs = []
             key_label_exprs = []
@@ -737,6 +787,29 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             if column['udt_name'] in udt_names:
                 return column['name']
         return None
+
+    def _get_query_import_groups(self, cursor, query_text, column_info):
+        column_names = {column['name'] for column in column_info}
+        if 'metadata' not in column_names:
+            return []
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT DISTINCT
+                    q.metadata::jsonb->'input_params'->>'query_from' AS query_from,
+                    q.metadata::jsonb->'input_params'->>'import_type' AS import_type,
+                    q.metadata::jsonb->'input_params'->>'search_re' AS search_re
+                FROM ({}) AS q
+                WHERE q.metadata::jsonb ? 'input_params'
+                ORDER BY 1, 2, 3
+                """
+            ).format(sql.SQL(query_text))
+        )
+        return [
+            normalize_import_parameter_row(row[0], row[1], row[2])
+            for row in cursor.fetchall()
+        ]
 
     def _get_geometry_types(self, cursor, query_text, geometry_column):
         cursor.execute(
@@ -832,6 +905,23 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
     def _quote_identifier(self, value):
         return '"{}"'.format(value.replace('"', '""'))
+
+    def _build_import_group_query(self, query_text, import_group):
+        if not import_group:
+            return query_text
+
+        query_from, import_type, search_re = import_group
+        return (
+            "SELECT * FROM ({}) AS q "
+            "WHERE coalesce(q.metadata::jsonb->'input_params'->>'query_from', '') = '{}' "
+            "AND coalesce(q.metadata::jsonb->'input_params'->>'import_type', '') = '{}' "
+            "AND coalesce(q.metadata::jsonb->'input_params'->>'search_re', '') = '{}'"
+        ).format(
+            query_text,
+            query_from.replace("'", "''"),
+            import_type.replace("'", "''"),
+            search_re.replace("'", "''"),
+        )
 
     def _create_raster_layer(self, raster_source, raster_column, row_filter, layer_name):
         layer = QgsRasterLayer(self._build_postgres_raster_uri(raster_source, raster_column, row_filter), layer_name, 'gdal')

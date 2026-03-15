@@ -13,6 +13,7 @@ from ..shared.connection_utils import (
     test_connection_values,
     validate_connection_values,
 )
+from ..shared.import_params import unique_import_parameter_rows
 import psycopg2
 from psycopg2 import sql
 from sqlalchemy import create_engine
@@ -324,21 +325,7 @@ class ImportTab(QtWidgets.QWidget):
         self._show_message('Loaded {} import parameter set(s).'.format(len(records)), Qgis.Info)
 
     def load_records(self, records):
-        unique_rows = []
-        seen = set()
-
-        for record in records or []:
-            metadata = record.get('metadata') if isinstance(record, dict) else None
-            input_params = metadata.get('input_params', {}) if isinstance(metadata, dict) else {}
-            row = (
-                str(input_params.get('query_from', '') or ''),
-                str(input_params.get('import_type', '') or ''),
-                str(input_params.get('search_re', '') or ''),
-            )
-            if row in seen or not any(row):
-                continue
-            seen.add(row)
-            unique_rows.append(row)
+        unique_rows = unique_import_parameter_rows(records)
 
         self.import_table.clearContents()
         self.import_table.setRowCount(len(unique_rows) + 1)
