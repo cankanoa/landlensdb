@@ -1,10 +1,10 @@
 from geoalchemy2 import WKBElement
+from shapely.geometry.base import BaseGeometry
 from shapely.wkb import loads
-from shapely import Point
-from sqlalchemy import create_engine, MetaData, Table, select, and_, update
+from sqlalchemy import create_engine, MetaData, Table, select, and_, text, update
 from sqlalchemy.dialects.postgresql import insert
 
-from landlensdb.geoclasses.geoimageframe import GeoImageFrame
+from ..geoclasses.geoimageframe import GeoImageFrame
 
 
 class Postgres:
@@ -31,18 +31,18 @@ class Postgres:
         self.selected_table = None
 
     @staticmethod
-    def _convert_points_to_wkt(record):
+    def _convert_geometries_to_wkt(record):
         """
-        Converts Point objects to WKT (Well-Known Text) format.
+        Converts Shapely geometries to WKT (Well-Known Text) format.
 
         Args:
-            record (dict): A dictionary containing keys and values, where values can be Point objects.
+            record (dict): A dictionary containing keys and values, where values can be Shapely geometries.
 
         Returns:
-            dict: The record with Point objects converted to WKT strings.
+            dict: The record with geometry objects converted to WKT strings.
         """
         for key, value in record.items():
-            if isinstance(value, Point):
+            if isinstance(value, BaseGeometry):
                 record[key] = value.wkt
         return record
 
@@ -206,10 +206,12 @@ class Postgres:
 
         meta = MetaData()
         table = Table(table_name, meta, autoload_with=self.engine)
+        thumbnail_updates = []
 
         with self.engine.begin() as conn:
             for record in data:
-                record = self._convert_points_to_wkt(record)
+                thumbnail_value = record.pop("thumbnail", None)
+                record = self._convert_geometries_to_wkt(record)
                 record = self._convert_dicts_to_json(record)
                 fingerprint_value = record.get("fingerprint")
 
@@ -253,3 +255,29 @@ class Postgres:
                     )
 
                 conn.execute(on_conflict_stmt)
+
+                if thumbnail_value is not None:
+                    thumbnail_updates.append(
+                        {
+                            "image_url": record["image_url"],
+                            "thumbnail": thumbnail_value,
+                        }
+                    )
+
+            if thumbnail_updates and "thumbnail" in table.columns:
+                update_stmt = text(
+                    f"UPDATE {table.name} "
+                    f"SET thumbnail = ST_FromGDALRaster(:thumbnail_raster) "
+                    f"WHERE image_url = :image_url"
+                )
+                for update_values in thumbnail_updates:
+                    thumbnail_raster = gif._thumbnail_to_gdal_raster(
+                        update_values["thumbnail"]
+                    )
+                    conn.execute(
+                        update_stmt,
+                        {
+                            "thumbnail_raster": thumbnail_raster,
+                            "image_url": update_values["image_url"],
+                        },
+                    )

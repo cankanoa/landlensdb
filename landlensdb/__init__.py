@@ -1,10 +1,10 @@
-from landlensdb.geoclasses.geoimageframe import GeoImageFrame
-from landlensdb.handlers.local import (
+from .geoclasses.geoimageframe import GeoImageFrame
+from .handlers.local import (
     GeoTaggedImage,
     GeoTransformImage,
     SearchLocalToGeoImageFrame,
 )
-from landlensdb.handlers.db import Postgres
+from .handlers.db import Postgres
 
 __all__ = [
     "GeoImageFrame",
