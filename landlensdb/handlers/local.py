@@ -2,9 +2,10 @@ import numbers
 import re
 import warnings
 import hashlib
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Literal
 
 import numpy as np
 import pytz
@@ -27,13 +28,16 @@ class SearchLocalToGeoImageFrame:
 
     def __new__(
         cls,
-        directory,
-        import_types={"GeoTaggedImage": r".*\.JPG$"},
-        additional_columns=None,
-        create_thumbnail=True,
-        thumbnail_size=(256, 256),
-        fingerprint=None,
-    ):
+        directory: str,
+        import_types: dict[str | type, str] | None = {"GeoTaggedImage": r".*\.JPG$"},
+        additional_columns: list[str | tuple[str, str]] | None = None,
+        create_thumbnail: bool = True,
+        thumbnail_size: tuple[int, int] = (256, 256),
+        fingerprint: Literal["robust", "quick"] | None = None,
+        max_workers: int = 1,
+        progress_callback: Callable[[int, int], None] | None = None,
+        skip_images_in_postgresql: "Postgres | None" = None,
+    ) -> GeoImageFrame:
         """Return a `GeoImageFrame` directly from the import configuration."""
         if cls is SearchLocalToGeoImageFrame:
             if import_types is None:
@@ -48,9 +52,14 @@ class SearchLocalToGeoImageFrame:
                 raise ValueError("`import_types` must contain at least one importer class.")
             if fingerprint not in (None, "robust", "quick"):
                 raise ValueError("`fingerprint` must be one of None, 'robust', or 'quick'.")
+            if max_workers is None:
+                max_workers = 1
+            if not isinstance(max_workers, int) or max_workers < 1:
+                raise ValueError("`max_workers` must be an integer greater than or equal to 1.")
 
             all_records = []
             matched_file_count = 0
+            load_tasks = []
 
             for importer_ref, pattern in import_types.items():
                 importer_cls = cls._resolve_importer_class(importer_ref)
@@ -60,28 +69,59 @@ class SearchLocalToGeoImageFrame:
                     )
 
                 image_paths = cls._discover_paths(directory, pattern)
+                if skip_images_in_postgresql is not None:
+                    image_paths = skip_images_in_postgresql.filter_existing_rows(image_paths)
                 matched_file_count += len(image_paths)
                 for image_path in image_paths:
-                    try:
-                        record = importer_cls.load(
-                            image_path=image_path,
-                            query_from=directory,
-                            search_re=pattern,
-                            import_type=importer_cls.__name__,
-                            additional_columns=additional_columns,
-                            create_thumbnail=create_thumbnail,
-                            thumbnail_size=thumbnail_size,
-                            fingerprint=fingerprint,
-                        )
-                    except Exception as exc:
-                        warnings.warn(f"Error processing {image_path}: {exc}. Skipped.")
-                        continue
-
-                    if record is not None:
-                        all_records.append(record)
+                    load_tasks.append(
+                        {
+                            "importer_cls": importer_cls,
+                            "image_path": image_path,
+                            "query_from": directory,
+                            "search_re": pattern,
+                            "import_type": importer_cls.__name__,
+                            "additional_columns": additional_columns,
+                            "create_thumbnail": create_thumbnail,
+                            "thumbnail_size": thumbnail_size,
+                            "fingerprint": fingerprint,
+                        }
+                    )
 
             if matched_file_count == 0:
-                raise ValueError("The directory does not contain any images matching `import_types`.")
+                raise ValueError(
+                    "The directory does not contain any new images matching `import_types`."
+                )
+
+            total_tasks = len(load_tasks)
+            processed_count = 0
+            cls._report_progress(progress_callback, processed_count, total_tasks)
+
+            if max_workers == 1:
+                for task in load_tasks:
+                    record = cls._load_task(task)
+                    processed_count += 1
+                    cls._report_progress(progress_callback, processed_count, total_tasks)
+                    if record is not None:
+                        all_records.append(record)
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(cls._load_task, task): task["image_path"]
+                        for task in load_tasks
+                    }
+                    for future in as_completed(futures):
+                        image_path = futures[future]
+                        try:
+                            record = future.result()
+                        except Exception as exc:
+                            warnings.warn(f"Error processing {image_path}: {exc}. Skipped.")
+                            processed_count += 1
+                            cls._report_progress(progress_callback, processed_count, total_tasks)
+                            continue
+                        processed_count += 1
+                        cls._report_progress(progress_callback, processed_count, total_tasks)
+                        if record is not None:
+                            all_records.append(record)
 
             if not all_records:
                 raise ValueError("No valid images were processed into a GeoImageFrame.")
@@ -123,6 +163,29 @@ class SearchLocalToGeoImageFrame:
             if compiled_pattern.search(relative_path) or compiled_pattern.search(file_name):
                 matched_paths.append(path)
         return sorted(set(matched_paths))
+
+    @staticmethod
+    def _load_task(task):
+        try:
+            return task["importer_cls"].load(
+                image_path=task["image_path"],
+                query_from=task["query_from"],
+                search_re=task["search_re"],
+                import_type=task["import_type"],
+                additional_columns=task["additional_columns"],
+                create_thumbnail=task["create_thumbnail"],
+                thumbnail_size=task["thumbnail_size"],
+                fingerprint=task["fingerprint"],
+            )
+        except Exception as exc:
+            warnings.warn(f"Error processing {task['image_path']}: {exc}. Skipped.")
+            return None
+
+    @staticmethod
+    def _report_progress(progress_callback, processed, total):
+        if progress_callback is None:
+            return
+        progress_callback(processed, total)
 
 class GeoTaggedImage(SearchLocalToGeoImageFrame):
     """Importer for EXIF geotagged images."""
