@@ -81,6 +81,9 @@ class ImportTab(QtWidgets.QWidget):
             lambda: self.run_all_updates(skip_existing=True)
         )
         top_row.addWidget(self.update_all_new_button)
+        self.drop_old_all_button = QtWidgets.QPushButton('Drop Old')
+        self.drop_old_all_button.clicked.connect(self.run_all_drop_old)
+        top_row.addWidget(self.drop_old_all_button)
         layout.addLayout(top_row)
 
         self.import_table = QtWidgets.QTableWidget(self)
@@ -467,6 +470,87 @@ class ImportTab(QtWidgets.QWidget):
         )
         self.refresh_table()
 
+    def run_all_drop_old(self):
+        table_name = self.current_table_name()
+        if not table_name:
+            self._show_message('Choose a table first.', Qgis.Critical)
+            return
+
+        update_rows = []
+        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
+            import_type_input = self._import_type_input(row_index)
+            query_from_input = self._query_from_input(row_index)
+            search_re_input = self._search_re_input(row_index)
+            if query_from_input is None or import_type_input is None or search_re_input is None:
+                continue
+
+            query_from = query_from_input.text().strip()
+            import_type = import_type_input.currentText().strip()
+            search_re = search_re_input.text().strip()
+            if not query_from or not import_type or not search_re:
+                continue
+            update_rows.append((query_from, import_type, search_re))
+
+        if not update_rows:
+            self._show_message('No saved import parameter rows to prune.', Qgis.Critical)
+            return
+
+        deleted_rows = 0
+        for query_from, import_type, search_re in update_rows:
+            try:
+                deleted_rows += self._run_drop_old(
+                    table_name,
+                    query_from,
+                    import_type,
+                    search_re,
+                )
+            except Exception as exc:  # pragma: no cover
+                self._show_message('Drop Old failed: {}'.format(exc), Qgis.Critical)
+                return
+
+        self._show_message(
+            'Dropped {} old row(s) from "{}".'.format(deleted_rows, table_name),
+            Qgis.Info,
+        )
+        self.refresh_table()
+
+    def run_row_drop_old(self, row_index):
+        table_name = self.current_table_name()
+        if not table_name:
+            self._show_message('Choose a table first.', Qgis.Critical)
+            return
+
+        import_type_input = self._import_type_input(row_index)
+        query_from_input = self._query_from_input(row_index)
+        search_re_input = self._search_re_input(row_index)
+        if query_from_input is None or import_type_input is None or search_re_input is None:
+            self._show_message('Import row is incomplete.', Qgis.Critical)
+            return
+
+        query_from = query_from_input.text().strip()
+        import_type = import_type_input.currentText().strip()
+        search_re = search_re_input.text().strip()
+        if not query_from or not import_type or not search_re:
+            self._show_message('query_from, import_type, and search_re are required.', Qgis.Critical)
+            return
+
+        try:
+            deleted_rows = self._run_drop_old(
+                table_name,
+                query_from,
+                import_type,
+                search_re,
+            )
+        except Exception as exc:  # pragma: no cover
+            self._show_message('Drop Old failed: {}'.format(exc), Qgis.Critical)
+            return
+
+        self._show_message(
+            'Dropped {} old row(s) from "{}".'.format(deleted_rows, table_name),
+            Qgis.Info,
+        )
+        self.refresh_table()
+
     def _build_query_from_widget(self, value):
         widget = QtWidgets.QWidget(self.import_table)
         layout = QtWidgets.QHBoxLayout(widget)
@@ -593,6 +677,16 @@ class ImportTab(QtWidgets.QWidget):
             )
             layout.addWidget(update_new_button)
 
+            drop_old_button = QtWidgets.QPushButton('Drop Old')
+            drop_old_button.setSizePolicy(
+                QtWidgets.QSizePolicy.Fixed,
+                QtWidgets.QSizePolicy.Fixed,
+            )
+            drop_old_button.clicked.connect(
+                lambda _=False, row=row_index: self.run_row_drop_old(row)
+            )
+            layout.addWidget(drop_old_button)
+
         return widget
 
     def _run_import_update(self, table_name, query_from, import_type, search_re, skip_existing=False):
@@ -612,6 +706,18 @@ class ImportTab(QtWidgets.QWidget):
             skip_images_in_postgresql=db if skip_existing else None,
         )
         db.upsert_images(images, table_name, conflict='update')
+
+    def _run_drop_old(self, table_name, query_from, import_type, search_re):
+        db = Postgres(self._build_database_url())
+        db.engine = create_engine(
+            self._build_database_url(),
+            connect_args=self._engine_connect_args(),
+        )
+        db.table(table_name)
+        return db.remove_unmatched(
+            query_from,
+            import_types={import_type: search_re},
+        )
 
     def _reset_progress(self):
         self.import_progress_bar.setRange(0, 1)

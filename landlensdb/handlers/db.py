@@ -275,6 +275,55 @@ class Postgres:
 
         return [path for path in normalized_paths if path not in existing_paths]
 
+    def remove_unmatched(
+        self,
+        directory: str,
+        import_types: dict[str | type, str] | None = {"GeoTaggedImage": r".*\.JPG$"},
+    ):
+        if self.selected_table is None:
+            raise ValueError("Select a table first with `table(table_name)`.")
+        if import_types is None:
+            import_types = {"GeoTaggedImage": r".*"}
+        if not isinstance(import_types, dict) or not import_types:
+            raise ValueError("`import_types` must be a non-empty dict.")
+
+        from .local import SearchLocalToGeoImageFrame
+
+        deleted_rows = 0
+        with self.engine.begin() as conn:
+            for importer_ref, pattern in import_types.items():
+                importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(importer_ref)
+                matched_paths = [
+                    str(path)
+                    for path in SearchLocalToGeoImageFrame._discover_paths(directory, pattern)
+                ]
+
+                delete_filters = [
+                    text(
+                        "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = :query_from"
+                    ),
+                    text(
+                        "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
+                    ),
+                    text(
+                        "coalesce(metadata::jsonb->'input_params'->>'search_re', '') = :search_re"
+                    ),
+                ]
+                params = {
+                    "query_from": directory,
+                    "import_type": importer_cls.__name__,
+                    "search_re": pattern,
+                }
+
+                if matched_paths:
+                    delete_filters.append(~self.selected_table.c.image_url.in_(matched_paths))
+
+                delete_stmt = self.selected_table.delete().where(and_(*delete_filters))
+                result = conn.execute(delete_stmt, params)
+                deleted_rows += result.rowcount or 0
+
+        return deleted_rows
+
     @staticmethod
     def _qualified_table_name(table):
         if table.schema:
