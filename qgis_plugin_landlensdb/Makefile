@@ -48,7 +48,7 @@ PY_FILES = \
 
 UI_FILES = landlensdb_dialog_base.ui
 
-EXTRAS = metadata.txt icon.png
+EXTRAS = metadata.txt landlensdb.png
 
 EXTRA_DIRS =
 

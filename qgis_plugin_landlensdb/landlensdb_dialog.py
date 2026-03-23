@@ -8,10 +8,12 @@
 """
 
 from qgis.PyQt import QtWidgets
+from qgis.PyQt.QtGui import QIcon
 
 from .tabs.import_tab import ImportTab
 from .tabs.query_tab import QueryTab
 from .tabs.setup_tab import SetupTab
+import os
 
 
 class LandlensdbDialog(QtWidgets.QDialog):
@@ -19,6 +21,9 @@ class LandlensdbDialog(QtWidgets.QDialog):
         super(LandlensdbDialog, self).__init__(parent)
         self.iface = iface
         self.setWindowTitle('Landlensdb')
+        self.setWindowIcon(
+            QIcon(os.path.join(os.path.dirname(__file__), 'landlensdb.png'))
+        )
         self.resize(1120, 780)
 
         layout = QtWidgets.QVBoxLayout(self)
