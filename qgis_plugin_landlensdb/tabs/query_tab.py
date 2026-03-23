@@ -52,7 +52,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     HISTORY_KEY = 'Landlensdb/query_history'
     STAR_KEY = 'Landlensdb/starred_queries'
     NAME_KEY = 'Landlensdb/query_names'
-    PREVIEW_LIMIT = 5
+    PREVIEW_LIMIT = 10
     HISTORY_LIMIT = 25
     KEY_COLUMN = '__lldb_rowid__'
     SIMPLE_SELECT_RE = re.compile(
@@ -79,6 +79,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._history_menu = QtWidgets.QMenu(self)
         self._star_menu = QtWidgets.QMenu(self)
         self._last_query_state = None
+        self._preview_start = 0
+        self._preview_end = self.PREVIEW_LIMIT
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
@@ -95,6 +97,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.results_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.results_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.add_button.setEnabled(False)
+        self._setup_results_controls()
 
         self._load_settings()
         self._populate_static_buttons()
@@ -426,6 +429,14 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._render_dynamic_buttons(tables, columns)
 
     def run_query(self):
+        self._run_query_preview(add_to_history=True)
+
+    def _run_query_preview(self, add_to_history):
+        start_row, end_row = self._validated_preview_range()
+        if end_row == start_row:
+            self._show_error('Results range must span at least one row.')
+            return
+
         valid, message = self._validate_connection_values(self.connection_values)
         if not valid:
             self._show_error(message)
@@ -447,8 +458,14 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                     if schema_name:
                         self._set_search_path(cursor, schema_name)
                     column_info = self._get_column_info(cursor, live_query)
-                    preview_rows = self._get_preview_rows(cursor, live_query, column_info)
                     row_count = self._get_row_count(cursor, live_query)
+                    preview_rows = self._get_preview_rows(
+                        cursor,
+                        live_query,
+                        column_info,
+                        start_row,
+                        end_row,
+                    )
                     raster_key_columns = self._get_raster_key_columns(cursor, raster_source)
                     raster_columns = [column['name'] for column in column_info if column['udt_name'] == 'raster']
         except Exception as exc:  # pragma: no cover - depends on external DB
@@ -467,7 +484,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             self._show_error('Could not inspect import groups: {}'.format(exc))
             return
         self._populate_preview(column_info, preview_rows, row_count)
-        self._add_history_item(sql_text)
+        if add_to_history:
+            self._add_history_item(sql_text)
         self._last_query_state = {
             'query_name': query_name,
             'live_query': live_query,
@@ -641,7 +659,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             type_names = {oid: name for oid, name in cursor.fetchall()}
         return [{'name': description.name, 'udt_name': type_names.get(description.type_code, '')} for description in descriptions]
 
-    def _get_preview_rows(self, cursor, query_text, column_info):
+    def _get_preview_rows(self, cursor, query_text, column_info, start_row, end_row):
         select_items = []
         for column in column_info:
             column_name = sql.Identifier(column['name'])
@@ -651,11 +669,13 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 select_items.append(sql.SQL("'[raster]' AS {}").format(column_name))
             else:
                 select_items.append(sql.SQL('q.{}').format(column_name))
+        limit_value = max(0, end_row - start_row)
         cursor.execute(
-            sql.SQL('SELECT {} FROM ({}) AS q LIMIT {}').format(
+            sql.SQL('SELECT {} FROM ({}) AS q OFFSET {} LIMIT {}').format(
                 sql.SQL(', ').join(select_items),
                 sql.SQL(query_text),
-                sql.Literal(self.PREVIEW_LIMIT),
+                sql.Literal(start_row),
+                sql.Literal(limit_value),
             )
         )
         return cursor.fetchall()
@@ -827,8 +847,77 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         return [row[0] for row in cursor.fetchall() if row and row[0]]
 
+    def _setup_results_controls(self):
+        header_layout = self.results_tab_layout
+        results_label_index = header_layout.indexOf(self.results_label)
+        if results_label_index < 0:
+            return
+
+        header_layout.removeWidget(self.results_label)
+        self.results_label.hide()
+
+        self.results_header_widget = QtWidgets.QWidget(self.results_tab)
+        self.results_header_layout = QtWidgets.QHBoxLayout(self.results_header_widget)
+        self.results_header_layout.setContentsMargins(0, 0, 0, 0)
+        self.results_header_layout.setSpacing(6)
+
+        self.results_prefix_label = QtWidgets.QLabel('Results (', self.results_header_widget)
+        self.results_header_layout.addWidget(self.results_prefix_label)
+
+        self.results_start_spin = QtWidgets.QSpinBox(self.results_header_widget)
+        self.results_start_spin.setRange(0, 1000000000)
+        self.results_start_spin.setValue(0)
+        self.results_start_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.results_start_spin.setMinimumWidth(64)
+        self.results_header_layout.addWidget(self.results_start_spin)
+
+        self.results_dash_label = QtWidgets.QLabel('-', self.results_header_widget)
+        self.results_header_layout.addWidget(self.results_dash_label)
+
+        self.results_end_spin = QtWidgets.QSpinBox(self.results_header_widget)
+        self.results_end_spin.setRange(0, 1000000000)
+        self.results_end_spin.setValue(self.PREVIEW_LIMIT)
+        self.results_end_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.results_end_spin.setMinimumWidth(64)
+        self.results_header_layout.addWidget(self.results_end_spin)
+
+        self.results_total_label = QtWidgets.QLabel('/ 0)', self.results_header_widget)
+        self.results_header_layout.addWidget(self.results_total_label)
+
+        self.results_update_button = QtWidgets.QPushButton('Update', self.results_header_widget)
+        self.results_update_button.clicked.connect(self._update_results_preview)
+        self.results_header_layout.addWidget(self.results_update_button)
+        self.results_header_layout.addStretch()
+
+        header_layout.insertWidget(results_label_index, self.results_header_widget)
+
+    def _preview_start_value(self):
+        return self.results_start_spin.value()
+
+    def _preview_end_value(self):
+        return self.results_end_spin.value()
+
+    def _validated_preview_range(self):
+        start_row = self._preview_start_value()
+        end_row = self._preview_end_value()
+        if end_row < start_row:
+            start_row, end_row = end_row, start_row
+            self.results_start_spin.setValue(start_row)
+            self.results_end_spin.setValue(end_row)
+        return start_row, end_row
+
+    def _update_results_preview(self):
+        self._run_query_preview(add_to_history=False)
+
     def _set_results_label(self, preview_count, total_count):
-        self.results_label.setText('Results ({}/{})'.format(preview_count, total_count))
+        start_row, end_row = self._validated_preview_range()
+        actual_start = min(start_row, total_count)
+        actual_end = min(end_row, total_count)
+        if actual_end < actual_start:
+            actual_end = actual_start
+        self.results_total_label.setText('/ {})'.format(total_count))
+        self.results_start_spin.setValue(actual_start)
+        self.results_end_spin.setValue(actual_end if total_count else end_row)
 
     def _populate_preview(self, column_info, rows, total_count):
         self.results_table.clear()
