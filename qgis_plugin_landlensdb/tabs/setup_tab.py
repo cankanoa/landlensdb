@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import platform
 import shlex
 import sys
 
@@ -546,20 +547,30 @@ class SetupTab(QtWidgets.QWidget):
         self.setup_log.appendPlainText('[{}] {}'.format(timestamp, message))
 
     def _default_python_executable(self):
-        return self._normalize_python_executable(sys.executable)
+        return self._python_command()
 
-    def _normalize_python_executable(self, path):
-        cleaned = (path or '').strip()
-        if not cleaned:
+    def _python_command(self):
+        if os.path.exists(os.path.join(sys.prefix, 'conda-meta')):
+            return 'python'
+
+        if platform.system() == 'Windows':
+            for file_name in ('python.exe', 'python3.exe'):
+                candidate = os.path.join(sys.prefix, file_name)
+                if os.path.isfile(candidate):
+                    return candidate
             return sys.executable
-        basename = os.path.basename(cleaned).lower()
-        directory = os.path.dirname(cleaned)
-        if basename in ('qgis', 'qgis-bin', 'qgis-ltr'):
-            sibling_python = os.path.join(directory, 'python')
-            if os.path.exists(sibling_python):
-                return sibling_python
-        if cleaned.endswith('.app'):
-            app_python = os.path.join(cleaned, 'Contents', 'MacOS', 'python')
-            if os.path.exists(app_python):
-                return app_python
-        return cleaned
+
+        if platform.system() == 'Darwin':
+            base_paths = [
+                sys.prefix,
+                os.path.join(sys.prefix, 'bin'),
+                os.path.dirname(sys.executable),
+            ]
+            for base_path in base_paths:
+                for file_name in ('python', 'python3'):
+                    candidate = os.path.join(base_path, file_name)
+                    if os.path.isfile(candidate):
+                        return candidate
+            return sys.executable
+
+        return sys.executable
