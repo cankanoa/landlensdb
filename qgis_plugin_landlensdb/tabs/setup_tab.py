@@ -163,13 +163,18 @@ class SetupTab(QtWidgets.QWidget):
         self.connection_port_input = QtWidgets.QLineEdit()
         self.connection_database_input = QtWidgets.QLineEdit()
         self.connection_schema_input = QtWidgets.QLineEdit()
+        self.connection_user_input = QtWidgets.QLineEdit()
+        self.connection_password_input = QtWidgets.QLineEdit()
+        self.connection_password_input.setEchoMode(QtWidgets.QLineEdit.Password)
         connection_fields = [
             ('Name', self.connection_name_input, 0, 0),
             ('Service', self.connection_service_input, 0, 1),
             ('Host', self.connection_host_input, 0, 2),
-            ('Port', self.connection_port_input, 1, 0),
-            ('Database', self.connection_database_input, 1, 1),
-            ('Schema', self.connection_schema_input, 1, 2),
+            ('Port', self.connection_port_input, 0, 3),
+            ('Database', self.connection_database_input, 1, 0),
+            ('Schema', self.connection_schema_input, 1, 1),
+            ('User', self.connection_user_input, 1, 2),
+            ('Password', self.connection_password_input, 1, 3),
         ]
         for label_text, widget, row, column in connection_fields:
             field_layout = QtWidgets.QVBoxLayout()
@@ -179,10 +184,11 @@ class SetupTab(QtWidgets.QWidget):
         connection_layout.addLayout(connection_grid)
 
         connection_test_row = QtWidgets.QHBoxLayout()
-        self.connection_test_button = QtWidgets.QPushButton('Test Connection')
+        self.connection_test_button = QtWidgets.QPushButton('Set Connection')
         self.connection_feedback = QtWidgets.QLabel('')
+        self.connection_feedback.setWordWrap(True)
         connection_test_row.addWidget(self.connection_test_button)
-        connection_test_row.addWidget(self.connection_feedback)
+        connection_test_row.addWidget(self.connection_feedback, 1)
         connection_test_row.addStretch()
         connection_layout.addLayout(connection_test_row)
         connection_section_layout.addWidget(self.connection_group)
@@ -287,12 +293,6 @@ class SetupTab(QtWidgets.QWidget):
             lambda: self._run_single_command(self.server_conda_command_input.text().strip(), 'Conda PostgreSQL install')
         )
 
-        self.connection_name_input.textChanged.connect(self._store_connection_form)
-        self.connection_service_input.textChanged.connect(self._store_connection_form)
-        self.connection_host_input.textChanged.connect(self._store_connection_form)
-        self.connection_port_input.textChanged.connect(self._store_connection_form)
-        self.connection_database_input.textChanged.connect(self._store_connection_form)
-        self.connection_schema_input.textChanged.connect(self._store_connection_form)
         self.connection_test_button.clicked.connect(self._test_connection_form)
         self.run_manual_button.clicked.connect(self._run_manual_command)
 
@@ -322,18 +322,24 @@ class SetupTab(QtWidgets.QWidget):
         self.connection_port_input.blockSignals(True)
         self.connection_database_input.blockSignals(True)
         self.connection_schema_input.blockSignals(True)
+        self.connection_user_input.blockSignals(True)
+        self.connection_password_input.blockSignals(True)
         self.connection_name_input.setText(self.connection_values.get('name', ''))
         self.connection_service_input.setText(self.connection_values.get('service', ''))
         self.connection_host_input.setText(self.connection_values.get('host', ''))
         self.connection_port_input.setText(self.connection_values.get('port', '5432'))
         self.connection_database_input.setText(self.connection_values.get('database', 'landlensdb'))
         self.connection_schema_input.setText(self.connection_values.get('schema', 'public'))
+        self.connection_user_input.setText(self.connection_values.get('user', ''))
+        self.connection_password_input.setText(self.connection_values.get('password', ''))
         self.connection_name_input.blockSignals(False)
         self.connection_service_input.blockSignals(False)
         self.connection_host_input.blockSignals(False)
         self.connection_port_input.blockSignals(False)
         self.connection_database_input.blockSignals(False)
         self.connection_schema_input.blockSignals(False)
+        self.connection_user_input.blockSignals(False)
+        self.connection_password_input.blockSignals(False)
 
     def _apply_server_mode(self):
         if self.server_installer_radio.isChecked():
@@ -396,9 +402,9 @@ class SetupTab(QtWidgets.QWidget):
             'port': self.connection_port_input.text().strip() or '5432',
             'database': self.connection_database_input.text().strip() or 'landlensdb',
             'schema': self.connection_schema_input.text().strip() or 'public',
+            'user': self.connection_user_input.text().strip(),
+            'password': self.connection_password_input.text(),
         }
-        save_connection_settings(self.connection_values)
-        self.connectionSaved.emit(dict(self.connection_values))
 
     def _test_connection_form(self):
         self._store_connection_form()
@@ -512,6 +518,8 @@ class SetupTab(QtWidgets.QWidget):
             'port': '5432',
             'database': 'landlensdb',
             'schema': 'public',
+            'user': '',
+            'password': '',
         }
         save_connection_settings(self.connection_values)
         self._refresh_connection_summary()
