@@ -20,6 +20,8 @@ def load_connection_settings():
         'port': settings.value('{}/port'.format(SETTINGS_PREFIX), '5432'),
         'database': settings.value('{}/database'.format(SETTINGS_PREFIX), 'landlensdb'),
         'schema': settings.value('{}/schema'.format(SETTINGS_PREFIX), 'public'),
+        'user': settings.value('{}/user'.format(SETTINGS_PREFIX), ''),
+        'password': settings.value('{}/password'.format(SETTINGS_PREFIX), ''),
     }
 
 
@@ -49,6 +51,12 @@ def connection_kwargs(values):
     else:
         kwargs['host'] = values.get('host', '').strip()
         kwargs['port'] = values.get('port', '').strip() or '5432'
+    user = values.get('user', '').strip()
+    password = values.get('password', '')
+    if user:
+        kwargs['user'] = user
+    if password:
+        kwargs['password'] = password
     return kwargs
 
 

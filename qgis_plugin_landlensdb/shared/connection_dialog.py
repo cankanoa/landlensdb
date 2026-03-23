@@ -6,7 +6,7 @@ class ConnectionDialog(QtWidgets.QDialog):
         super(ConnectionDialog, self).__init__(parent)
         self._test_callback = test_callback
         self.setWindowTitle('Connection')
-        self.resize(520, 220)
+        self.resize(520, 300)
 
         layout = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QGridLayout()
@@ -18,7 +18,11 @@ class ConnectionDialog(QtWidgets.QDialog):
         self.port_input = QtWidgets.QLineEdit(values.get('port', '5432'))
         self.database_input = QtWidgets.QLineEdit(values.get('database', 'landlensdb'))
         self.schema_input = QtWidgets.QLineEdit(values.get('schema', 'public'))
+        self.user_input = QtWidgets.QLineEdit(values.get('user', ''))
+        self.password_input = QtWidgets.QLineEdit(values.get('password', ''))
+        self.password_input.setEchoMode(QtWidgets.QLineEdit.Password)
         self.feedback_label = QtWidgets.QLabel('')
+        self.feedback_label.setWordWrap(True)
 
         controls = [
             ('Name', self.name_input),
@@ -27,6 +31,8 @@ class ConnectionDialog(QtWidgets.QDialog):
             ('Port', self.port_input),
             ('Database', self.database_input),
             ('Schema', self.schema_input),
+            ('User', self.user_input),
+            ('Password', self.password_input),
         ]
         for row, (label_text, widget) in enumerate(controls):
             form.addWidget(QtWidgets.QLabel(label_text), row, 0)
@@ -34,17 +40,14 @@ class ConnectionDialog(QtWidgets.QDialog):
 
         buttons = QtWidgets.QHBoxLayout()
         layout.addLayout(buttons)
-        self.test_button = QtWidgets.QPushButton('Test Connection')
-        self.save_button = QtWidgets.QPushButton('Save')
+        self.test_button = QtWidgets.QPushButton('Set Connection')
         self.cancel_button = QtWidgets.QPushButton('Cancel')
         buttons.addWidget(self.test_button)
         buttons.addWidget(self.feedback_label)
         buttons.addStretch()
-        buttons.addWidget(self.save_button)
         buttons.addWidget(self.cancel_button)
 
         self.test_button.clicked.connect(self.test_connection)
-        self.save_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
 
     def values(self):
@@ -55,6 +58,8 @@ class ConnectionDialog(QtWidgets.QDialog):
             'port': self.port_input.text().strip() or '5432',
             'database': self.database_input.text().strip(),
             'schema': self.schema_input.text().strip() or 'public',
+            'user': self.user_input.text().strip(),
+            'password': self.password_input.text(),
         }
 
     def test_connection(self):
@@ -62,3 +67,5 @@ class ConnectionDialog(QtWidgets.QDialog):
         color = '#1b8a3a' if success else '#b42318'
         self.feedback_label.setText(message)
         self.feedback_label.setStyleSheet('color: {}; font-weight: 600;'.format(color))
+        if success:
+            self.accept()
