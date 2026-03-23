@@ -875,12 +875,24 @@ class ImportTab(QtWidgets.QWidget):
         values = self.connection_values
         database = quote_plus(values.get('database', '').strip())
         service = values.get('service', '').strip()
+        user = quote_plus(values.get('user', '').strip())
+        password = quote_plus(values.get('password', ''))
+        auth = ''
+        if user:
+            auth = user
+            if values.get('password', ''):
+                auth = '{}:{}'.format(auth, password)
+            auth = '{}@'.format(auth)
         if service:
-            return 'postgresql+psycopg2:///{database}'.format(database=database)
+            return 'postgresql+psycopg2://{auth}/{database}'.format(
+                auth=auth,
+                database=database,
+            )
 
         host = values.get('host', '').strip()
         port = values.get('port', '').strip() or '5432'
-        return 'postgresql+psycopg2://{host}:{port}/{database}'.format(
+        return 'postgresql+psycopg2://{auth}{host}:{port}/{database}'.format(
+            auth=auth,
             host=host,
             port=port,
             database=database,
@@ -894,6 +906,12 @@ class ImportTab(QtWidgets.QWidget):
         }
         if service:
             connect_args['service'] = service
+        user = self.connection_values.get('user', '').strip()
+        password = self.connection_values.get('password', '')
+        if user:
+            connect_args['user'] = user
+        if password:
+            connect_args['password'] = password
         return connect_args
 
     def _show_message(self, message, level):
