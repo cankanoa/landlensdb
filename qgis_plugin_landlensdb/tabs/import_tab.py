@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import threading
 from urllib.parse import quote_plus
 
 from qgis.PyQt import QtCore, QtWidgets
@@ -19,6 +20,7 @@ from psycopg2 import sql
 from sqlalchemy import create_engine
 
 from ..landlensdb import SearchLocalToGeoImageFrame, Postgres
+from ..landlensdb.handlers.local import ImportCancelledError
 
 
 
@@ -51,15 +53,22 @@ class AddTableDialog(QtWidgets.QDialog):
 
 
 class ImportTab(QtWidgets.QWidget):
-    HEADERS = ['Actions', 'import_type', 'query_from', 'search_re']
+    STATUS_COLUMN = 0
+    ACTIONS_COLUMN = 1
+    IMPORT_TYPE_COLUMN = 2
+    QUERY_FROM_COLUMN = 3
+    SEARCH_RE_COLUMN = 4
+    HEADERS = ['', 'Actions', 'import_type', 'query_from', 'search_re']
     ADD_TABLE_SENTINEL = '__add_table__'
-    IMPORT_TYPES = ['', 'GeoTaggedImage', 'GeoTransformImage']
+    IMPORT_TYPES = ['', 'GeoTaggedImage', 'GeoTransformImage', 'WorldView3Image']
 
     def __init__(self, iface, parent=None):
         super(ImportTab, self).__init__(parent)
         self.iface = iface
         self.connection_values = load_connection_settings()
         self._selected_table = None
+        self._cancel_import_event = threading.Event()
+        self._import_active = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -73,21 +82,34 @@ class ImportTab(QtWidgets.QWidget):
         self.table_button.setArrowType(QtCore.Qt.DownArrow)
         self.table_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         top_row.addWidget(self.table_button, 1)
+        self.refresh_table_button = QtWidgets.QToolButton()
+        self.refresh_table_button.setAutoRaise(True)
+        self.refresh_table_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
+        )
+        self.refresh_table_button.setToolTip('Refresh import parameter rows from the selected table.')
+        self.refresh_table_button.clicked.connect(self.refresh_table)
+        top_row.addWidget(self.refresh_table_button)
         self.update_all_button = QtWidgets.QPushButton('Update')
+        self.update_all_button.setToolTip('Update all saved trios in the selected table.')
         self.update_all_button.clicked.connect(self.run_all_updates)
         top_row.addWidget(self.update_all_button)
         self.update_all_new_button = QtWidgets.QPushButton('Update New')
+        self.update_all_new_button.setToolTip('Update all saved trios, skipping images already in PostgreSQL.')
         self.update_all_new_button.clicked.connect(
             lambda: self.run_all_updates(skip_existing=True)
         )
         top_row.addWidget(self.update_all_new_button)
         self.drop_old_all_button = QtWidgets.QPushButton('Drop Old')
+        self.drop_old_all_button.setToolTip('Remove rows whose source files no longer exist on disk.')
         self.drop_old_all_button.clicked.connect(self.run_all_drop_old)
         top_row.addWidget(self.drop_old_all_button)
         self.drop_all_button = QtWidgets.QPushButton('Drop All')
+        self.drop_all_button.setToolTip('Remove all rows for all saved trios in this table.')
         self.drop_all_button.clicked.connect(self.run_all_drop_all)
         top_row.addWidget(self.drop_all_button)
         self.sync_all_button = QtWidgets.QPushButton('Sync')
+        self.sync_all_button.setToolTip('Drop old rows, then update all saved trios.')
         self.sync_all_button.clicked.connect(self.run_all_sync)
         top_row.addWidget(self.sync_all_button)
         layout.addLayout(top_row)
@@ -128,6 +150,12 @@ class ImportTab(QtWidgets.QWidget):
         )
         button_row.addWidget(self.import_progress_bar, 1)
         button_row.addWidget(self.import_progress_label)
+        self.cancel_import_button = QtWidgets.QToolButton(self)
+        self.cancel_import_button.setText('x')
+        self.cancel_import_button.setAutoRaise(True)
+        self.cancel_import_button.setToolTip('Cancel the active import.')
+        self.cancel_import_button.clicked.connect(self._cancel_active_import)
+        button_row.addWidget(self.cancel_import_button)
         layout.addLayout(button_row)
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
@@ -136,6 +164,7 @@ class ImportTab(QtWidgets.QWidget):
         self._refresh_table_choices()
         self.load_records([])
         self._reset_progress()
+        self._set_import_active(False)
 
     def showEvent(self, event):
         super(ImportTab, self).showEvent(event)
@@ -330,12 +359,14 @@ class ImportTab(QtWidgets.QWidget):
                     cursor.execute(
                         sql.SQL(
                             """
-                            SELECT DISTINCT
+                            SELECT
                                 metadata::jsonb->'input_params'->>'query_from' AS query_from,
                                 metadata::jsonb->'input_params'->>'import_type' AS import_type,
-                                metadata::jsonb->'input_params'->>'search_re' AS search_re
+                                metadata::jsonb->'input_params'->>'search_re' AS search_re,
+                                COUNT(*) AS row_count
                             FROM {}.{}
                             WHERE metadata::jsonb ? 'input_params'
+                            GROUP BY 1, 2, 3
                             ORDER BY 1, 2, 3
                             """
                         ).format(
@@ -350,6 +381,7 @@ class ImportTab(QtWidgets.QWidget):
                                     'query_from': row[0],
                                     'import_type': row[1],
                                     'search_re': row[2],
+                                    'row_count': row[3],
                                 }
                             }
                         }
@@ -364,34 +396,61 @@ class ImportTab(QtWidgets.QWidget):
 
     def load_records(self, records):
         unique_rows = unique_import_parameter_rows(records)
+        row_counts = {}
+        for record in records:
+            input_params = (record.get('metadata') or {}).get('input_params') or {}
+            trio = (
+                input_params.get('query_from') or '',
+                input_params.get('import_type') or '',
+                input_params.get('search_re') or '',
+            )
+            row_counts[trio] = input_params.get('row_count', row_counts.get(trio, 0))
 
         self.import_table.clearContents()
         self.import_table.setRowCount(len(unique_rows) + 1)
         for row_index, row_values in enumerate(unique_rows):
             self.import_table.setCellWidget(
                 row_index,
-                0,
+                self.STATUS_COLUMN,
+                self._build_status_widget(
+                    row_index,
+                    row_values,
+                    row_counts.get(row_values, 0),
+                    editable=True,
+                ),
+            )
+            self.import_table.setCellWidget(
+                row_index,
+                self.ACTIONS_COLUMN,
                 self._build_actions_widget(row_index, include_update_new=True),
             )
-            self.import_table.setCellWidget(row_index, 1, self._build_import_type_widget(row_values[1]))
-            self.import_table.setCellWidget(row_index, 2, self._build_query_from_widget(row_values[0]))
-            self.import_table.setCellWidget(row_index, 3, self._build_search_re_widget(row_values[2]))
+            self.import_table.setCellWidget(row_index, self.IMPORT_TYPE_COLUMN, self._build_import_type_widget(row_values[1], row_index))
+            self.import_table.setCellWidget(row_index, self.QUERY_FROM_COLUMN, self._build_query_from_widget(row_values[0], row_index))
+            self.import_table.setCellWidget(row_index, self.SEARCH_RE_COLUMN, self._build_search_re_widget(row_values[2], row_index))
+            self._update_status_widget(row_index)
 
         add_row_index = len(unique_rows)
         self.import_table.setCellWidget(
             add_row_index,
-            0,
+            self.STATUS_COLUMN,
+            self._build_status_widget(add_row_index, None, 0, editable=False),
+        )
+        self.import_table.setCellWidget(
+            add_row_index,
+            self.ACTIONS_COLUMN,
             self._build_actions_widget(add_row_index, include_update_new=False),
         )
-        self.import_table.setCellWidget(add_row_index, 1, self._build_import_type_widget(''))
-        self.import_table.setCellWidget(add_row_index, 2, self._build_query_from_widget(''))
-        self.import_table.setCellWidget(add_row_index, 3, self._build_search_re_widget(''))
+        self.import_table.setCellWidget(add_row_index, self.IMPORT_TYPE_COLUMN, self._build_import_type_widget('', add_row_index))
+        self.import_table.setCellWidget(add_row_index, self.QUERY_FROM_COLUMN, self._build_query_from_widget('', add_row_index))
+        self.import_table.setCellWidget(add_row_index, self.SEARCH_RE_COLUMN, self._build_search_re_widget('', add_row_index))
+        self._update_status_widget(add_row_index)
 
         header = self.import_table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
         self.import_table.resizeColumnsToContents()
 
     def run_row_update(self, row_index, skip_existing=False):
@@ -422,6 +481,10 @@ class ImportTab(QtWidgets.QWidget):
                 search_re,
                 skip_existing=skip_existing,
             )
+        except ImportCancelledError:
+            self._show_message('Import cancelled.', Qgis.Warning)
+            self.refresh_table()
+            return
         except Exception as exc:  # pragma: no cover
             self._show_message('Import update failed: {}'.format(exc), Qgis.Critical)
             return
@@ -463,6 +526,10 @@ class ImportTab(QtWidgets.QWidget):
                     search_re,
                     skip_existing=skip_existing,
                 )
+            except ImportCancelledError:
+                self._show_message('Import cancelled.', Qgis.Warning)
+                self.refresh_table()
+                return
             except Exception as exc:  # pragma: no cover
                 self._show_message('Import update failed: {}'.format(exc), Qgis.Critical)
                 return
@@ -715,6 +782,10 @@ class ImportTab(QtWidgets.QWidget):
                 search_re,
                 skip_existing=False,
             )
+        except ImportCancelledError:
+            self._show_message('Sync cancelled.', Qgis.Warning)
+            self.refresh_table()
+            return
         except Exception as exc:  # pragma: no cover
             self._show_message('Sync failed: {}'.format(exc), Qgis.Critical)
             return
@@ -722,13 +793,15 @@ class ImportTab(QtWidgets.QWidget):
         self._show_message('Synced "{}" from {}.'.format(table_name, query_from), Qgis.Info)
         self.refresh_table()
 
-    def _build_query_from_widget(self, value):
+    def _build_query_from_widget(self, value, row_index):
         widget = QtWidgets.QWidget(self.import_table)
         layout = QtWidgets.QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         line_edit = QtWidgets.QLineEdit(value)
+        line_edit.setPlaceholderText('/folder/to/search')
         line_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        line_edit.textChanged.connect(lambda _text, row=row_index: self._mark_row_dirty(row))
         browse_button = QtWidgets.QToolButton(widget)
         browse_button.setText('...')
         browse_button.clicked.connect(lambda: self._browse_query_from(line_edit))
@@ -739,15 +812,18 @@ class ImportTab(QtWidgets.QWidget):
         widget.setMinimumWidth(max(180, min_width))
         return widget
 
-    def _build_import_type_widget(self, value):
+    def _build_import_type_widget(self, value, row_index):
         combo = QtWidgets.QComboBox(self.import_table)
         combo.addItems(self.IMPORT_TYPES)
         index = combo.findText(value)
         combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.currentTextChanged.connect(lambda _text, row=row_index: self._mark_row_dirty(row))
         return combo
 
-    def _build_search_re_widget(self, value):
+    def _build_search_re_widget(self, value, row_index):
         widget = QtWidgets.QLineEdit(value, self.import_table)
+        widget.setPlaceholderText(r'.*\.JPG$')
+        widget.textChanged.connect(lambda _text, row=row_index: self._mark_row_dirty(row))
         min_width = widget.fontMetrics().horizontalAdvance(value or '.*') + 32
         widget.setMinimumWidth(max(140, min_width))
         return widget
@@ -762,15 +838,15 @@ class ImportTab(QtWidgets.QWidget):
             line_edit.setText(directory)
 
     def _query_from_input(self, row_index):
-        widget = self.import_table.cellWidget(row_index, 2)
+        widget = self.import_table.cellWidget(row_index, self.QUERY_FROM_COLUMN)
         return getattr(widget, 'line_edit', None)
 
     def _import_type_input(self, row_index):
-        widget = self.import_table.cellWidget(row_index, 1)
+        widget = self.import_table.cellWidget(row_index, self.IMPORT_TYPE_COLUMN)
         return widget if isinstance(widget, QtWidgets.QComboBox) else None
 
     def _search_re_input(self, row_index):
-        widget = self.import_table.cellWidget(row_index, 3)
+        widget = self.import_table.cellWidget(row_index, self.SEARCH_RE_COLUMN)
         return widget if isinstance(widget, QtWidgets.QLineEdit) else None
 
     def _fetch_tables(self):
@@ -832,6 +908,11 @@ class ImportTab(QtWidgets.QWidget):
 
         primary_button = QtWidgets.QPushButton('Update' if include_update_new else 'Add')
         primary_button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        primary_button.setToolTip(
+            'Update this trio from disk into the selected table.'
+            if include_update_new else
+            'Add this trio to the selected table.'
+        )
         primary_button.clicked.connect(
             lambda _=False, row=row_index: self.run_row_update(row)
         )
@@ -843,6 +924,7 @@ class ImportTab(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Fixed,
                 QtWidgets.QSizePolicy.Fixed,
             )
+            update_new_button.setToolTip('Update this trio, skipping images already in PostgreSQL.')
             update_new_button.clicked.connect(
                 lambda _=False, row=row_index: self.run_row_update(row, skip_existing=True)
             )
@@ -853,6 +935,7 @@ class ImportTab(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Fixed,
                 QtWidgets.QSizePolicy.Fixed,
             )
+            drop_old_button.setToolTip('Remove rows for this trio whose files no longer exist on disk.')
             drop_old_button.clicked.connect(
                 lambda _=False, row=row_index: self.run_row_drop_old(row)
             )
@@ -863,6 +946,7 @@ class ImportTab(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Fixed,
                 QtWidgets.QSizePolicy.Fixed,
             )
+            drop_all_button.setToolTip('Remove all rows currently stored for this trio.')
             drop_all_button.clicked.connect(
                 lambda _=False, row=row_index: self.run_row_drop_all(row)
             )
@@ -873,6 +957,7 @@ class ImportTab(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Fixed,
                 QtWidgets.QSizePolicy.Fixed,
             )
+            sync_button.setToolTip('Drop old rows, then update this trio from disk.')
             sync_button.clicked.connect(
                 lambda _=False, row=row_index: self.run_row_sync(row)
             )
@@ -880,7 +965,169 @@ class ImportTab(QtWidgets.QWidget):
 
         return widget
 
+    def _build_status_widget(self, row_index, original_trio, row_count, editable):
+        widget = QtWidgets.QWidget(self.import_table)
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+
+        left_button = QtWidgets.QToolButton(widget)
+        left_button.setAutoRaise(True)
+        left_button.setFixedSize(18, 18)
+
+        right_label = QtWidgets.QLabel(str(row_count) if editable else '', widget)
+        right_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+        sync_button = QtWidgets.QToolButton(widget)
+        sync_button.setAutoRaise(True)
+        sync_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
+        sync_button.setIconSize(QtCore.QSize(16, 16))
+        sync_button.setToolTip('Drop all rows for the old trio, then update using the edited values.')
+        sync_button.clicked.connect(lambda _=False, row=row_index: self.run_row_edit_sync(row))
+        sync_button.hide()
+
+        layout.addWidget(left_button)
+        layout.addWidget(right_label)
+        layout.addWidget(sync_button)
+
+        widget.original_trio = tuple(original_trio) if original_trio else None
+        widget.row_count = int(row_count or 0)
+        widget.left_button = left_button
+        widget.right_label = right_label
+        widget.sync_button = sync_button
+        widget.editable = editable
+        widget.dirty = False
+
+        left_button.clicked.connect(lambda _=False, row=row_index: self._handle_status_left_click(row))
+        return widget
+
+    def _status_widget(self, row_index):
+        return self.import_table.cellWidget(row_index, self.STATUS_COLUMN)
+
+    def _current_trio(self, row_index):
+        import_type_input = self._import_type_input(row_index)
+        query_from_input = self._query_from_input(row_index)
+        search_re_input = self._search_re_input(row_index)
+        if query_from_input is None or import_type_input is None or search_re_input is None:
+            return None
+        return (
+            query_from_input.text().strip(),
+            import_type_input.currentText().strip(),
+            search_re_input.text().strip(),
+        )
+
+    def _mark_row_dirty(self, row_index):
+        status_widget = self._status_widget(row_index)
+        if status_widget is None or not getattr(status_widget, 'editable', False):
+            return
+        original_trio = getattr(status_widget, 'original_trio', None)
+        current_trio = self._current_trio(row_index)
+        status_widget.dirty = current_trio != original_trio
+        self._update_status_widget(row_index)
+
+    def _update_status_widget(self, row_index):
+        status_widget = self._status_widget(row_index)
+        if status_widget is None:
+            return
+
+        left_button = status_widget.left_button
+        right_label = status_widget.right_label
+        sync_button = status_widget.sync_button
+
+        if not status_widget.editable:
+            left_button.hide()
+            right_label.setText('')
+            sync_button.hide()
+            return
+
+        left_button.show()
+        if status_widget.dirty:
+            left_button.setText('x')
+            left_button.setToolTip('Exit edit mode and revert this trio to its saved values.')
+            left_button.setStyleSheet('QToolButton { color: #c53030; font-size: 16px; font-weight: bold; }')
+            right_label.hide()
+            sync_button.show()
+        else:
+            left_button.setText('●')
+            left_button.setToolTip('This trio matches the saved values.')
+            left_button.setStyleSheet('QToolButton { color: #1f9d55; font-size: 14px; }')
+            right_label.setText(str(status_widget.row_count))
+            right_label.show()
+            sync_button.hide()
+
+    def _handle_status_left_click(self, row_index):
+        status_widget = self._status_widget(row_index)
+        if status_widget is None or not status_widget.editable or not status_widget.dirty:
+            return
+        self._revert_row_to_original(row_index)
+
+    def _revert_row_to_original(self, row_index):
+        status_widget = self._status_widget(row_index)
+        if status_widget is None or not status_widget.original_trio:
+            return
+
+        query_from, import_type, search_re = status_widget.original_trio
+        import_type_input = self._import_type_input(row_index)
+        query_from_input = self._query_from_input(row_index)
+        search_re_input = self._search_re_input(row_index)
+        if query_from_input is None or import_type_input is None or search_re_input is None:
+            return
+
+        query_from_input.blockSignals(True)
+        import_type_input.blockSignals(True)
+        search_re_input.blockSignals(True)
+        query_from_input.setText(query_from)
+        import_type_input.setCurrentIndex(max(import_type_input.findText(import_type), 0))
+        search_re_input.setText(search_re)
+        query_from_input.blockSignals(False)
+        import_type_input.blockSignals(False)
+        search_re_input.blockSignals(False)
+
+        status_widget.dirty = False
+        self._update_status_widget(row_index)
+
+    def run_row_edit_sync(self, row_index):
+        table_name = self.current_table_name()
+        if not table_name:
+            self._show_message('Choose a table first.', Qgis.Critical)
+            return
+
+        status_widget = self._status_widget(row_index)
+        if status_widget is None or not status_widget.editable or not status_widget.dirty:
+            return
+
+        old_trio = getattr(status_widget, 'original_trio', None)
+        new_trio = self._current_trio(row_index)
+        if not old_trio:
+            self._show_message('No saved trio exists for this row.', Qgis.Critical)
+            return
+        if not new_trio or not all(new_trio):
+            self._show_message('query_from, import_type, and search_re are required.', Qgis.Critical)
+            return
+
+        try:
+            self._run_drop_all(table_name, old_trio[0], old_trio[1], old_trio[2])
+            self._run_import_update(
+                table_name,
+                new_trio[0],
+                new_trio[1],
+                new_trio[2],
+                skip_existing=False,
+            )
+        except ImportCancelledError:
+            self._show_message('Row sync cancelled.', Qgis.Warning)
+            self.refresh_table()
+            return
+        except Exception as exc:  # pragma: no cover
+            self._show_message('Row sync failed: {}'.format(exc), Qgis.Critical)
+            return
+
+        self._show_message('Saved edited trio for "{}".'.format(table_name), Qgis.Info)
+        self.refresh_table()
+
     def _run_import_update(self, table_name, query_from, import_type, search_re, skip_existing=False):
+        self._cancel_import_event.clear()
+        self._set_import_active(True)
         self._reset_progress()
         db = Postgres(self._build_database_url())
         db.engine = create_engine(
@@ -889,14 +1136,18 @@ class ImportTab(QtWidgets.QWidget):
         )
         if skip_existing:
             db.table(table_name)
-        images = SearchLocalToGeoImageFrame(
-            query_from,
-            import_types={import_type: search_re},
-            max_workers=self.thread_count_input.value(),
-            progress_callback=self._update_progress,
-            skip_images_in_postgresql=db if skip_existing else None,
-        )
-        db.upsert_images(images, table_name, conflict='update')
+        try:
+            images = SearchLocalToGeoImageFrame(
+                query_from,
+                import_types={import_type: search_re},
+                max_workers=self.thread_count_input.value(),
+                progress_callback=self._update_progress,
+                skip_images_in_postgresql=db if skip_existing else None,
+                cancel_event=self._cancel_import_event,
+            )
+            db.upsert_images(images, table_name, conflict='update')
+        finally:
+            self._set_import_active(False)
 
     def _run_drop_old(self, table_name, query_from, import_type, search_re):
         db = Postgres(self._build_database_url())
@@ -926,6 +1177,22 @@ class ImportTab(QtWidgets.QWidget):
         self.import_progress_bar.setRange(0, 1)
         self.import_progress_bar.setValue(0)
         self.import_progress_label.setText('0/0')
+
+    def _set_import_active(self, active):
+        self._import_active = bool(active)
+        if self._import_active:
+            self.cancel_import_button.setStyleSheet(
+                'QToolButton { color: #c53030; font-size: 16px; font-weight: bold; }'
+            )
+        else:
+            self.cancel_import_button.setStyleSheet(
+                'QToolButton { color: #a0aec0; font-size: 16px; font-weight: bold; }'
+            )
+
+    def _cancel_active_import(self):
+        if not self._import_active:
+            return
+        self._cancel_import_event.set()
 
     def _update_progress(self, processed, total):
         total = max(int(total or 0), 0)

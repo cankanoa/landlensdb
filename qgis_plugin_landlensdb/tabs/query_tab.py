@@ -523,7 +523,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                     added_layers.append(vector_layer.name())
                     self._add_layer_to_group(group, vector_layer)
 
-            if import_group and import_group[1] == 'GeoTransformImage':
+            if import_group and import_group[1] in ('GeoTransformImage', 'WorldView3Image'):
                 try:
                     with psycopg2.connect(**self._connection_kwargs()) as connection:
                         with connection.cursor() as cursor:
@@ -550,7 +550,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                         )
                         if raster_layer is not None:
                             added_layers.append(raster_layer.name())
-                            self._add_layer_to_group(group, raster_layer)
+                            self._add_layer_to_group(group, raster_layer, insert_at_top=True)
 
         if added_layers:
             self._show_info(
@@ -728,11 +728,6 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 filter_parts.append(sql.SQL('({})').format(sql.SQL(raster_source['where'])))
             filter_parts.append(sql.SQL('{} IS NOT NULL').format(sql.Identifier(raster_column)))
             if has_metadata_column:
-                filter_parts.append(
-                    sql.SQL(
-                        "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = 'GeoTransformImage'"
-                    )
-                )
                 if import_group:
                     filter_parts.append(
                         sql.SQL(
@@ -748,6 +743,12 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                         sql.SQL(
                             "coalesce(metadata::jsonb->'input_params'->>'search_re', '') = {}"
                         ).format(sql.Literal(import_group[2]))
+                    )
+                else:
+                    filter_parts.append(
+                        sql.SQL(
+                            "coalesce(metadata::jsonb->'input_params'->>'import_type', '') IN ('GeoTransformImage', 'WorldView3Image')"
+                        )
                     )
 
             key_filter_exprs = []
@@ -936,7 +937,10 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         group = root.addGroup(query_name)
         return group if isinstance(group, QgsLayerTreeGroup) else root
 
-    def _add_layer_to_group(self, group, layer):
+    def _add_layer_to_group(self, group, layer, insert_at_top=False):
         project = QgsProject.instance()
         project.addMapLayer(layer, False)
-        group.addLayer(layer)
+        if insert_at_top:
+            group.insertLayer(0, layer)
+        else:
+            group.addLayer(layer)
