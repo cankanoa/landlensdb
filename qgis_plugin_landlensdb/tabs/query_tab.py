@@ -845,10 +845,18 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         uri = QgsDataSourceUri()
         kwargs = self._connection_kwargs()
         service = kwargs.get('service', '')
+        user = kwargs.get('user', '')
+        password = kwargs.get('password', '')
         if service:
-            uri.setConnection(service, kwargs['dbname'], '', '')
+            uri.setConnection(service, kwargs['dbname'], user, password)
         else:
-            uri.setConnection(kwargs.get('host', ''), kwargs.get('port', ''), kwargs['dbname'], '', '')
+            uri.setConnection(
+                kwargs.get('host', ''),
+                kwargs.get('port', ''),
+                kwargs['dbname'],
+                user,
+                password,
+            )
         schema_name = self.connection_values.get('schema', '').strip()
         if schema_name and hasattr(uri, 'setParam'):
             uri.setParam('options', '-c search_path={},public'.format(schema_name))
