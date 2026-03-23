@@ -2,6 +2,7 @@ import numbers
 import re
 import warnings
 import hashlib
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -19,8 +20,90 @@ from ..geoclasses.geoimageframe import GeoImageFrame
 
 try:
     from osgeo import gdal
+    from osgeo import osr
 except ImportError:
     gdal = None
+    osr = None
+
+
+WORLDVIEW3_PRODUCT_FIELDS = (
+    "generationTime",
+    "productOrderId",
+    "productCatalogId",
+    "childCatalogId",
+    "imageDescriptor",
+    "productScale",
+    "productAccuracy",
+    "RMSE2D",
+    "bandId",
+    "panSharpenAlgorithm",
+    "numRows",
+    "numColumns",
+    "productLevel",
+    "productType",
+    "numberOfLooks",
+    "radiometricLevel",
+    "radiometricEnhancement",
+    "bitsPerPixel",
+    "compressionType",
+)
+
+WORLDVIEW3_IMAGE_FIELDS = (
+    "satId",
+    "mode",
+    "scanDirection",
+    "CatId",
+    "firstLineTime",
+    "avgLineRate",
+    "exposureDuration",
+    "minCollectedRowGSD",
+    "maxCollectedRowGSD",
+    "meanCollectedRowGSD",
+    "minCollectedColGSD",
+    "maxCollectedColGSD",
+    "meanCollectedColGSD",
+    "meanCollectedGSD",
+    "rowUncertainty",
+    "colUncertainty",
+    "minSunAz",
+    "maxSunAz",
+    "meanSunAz",
+    "minSunEl",
+    "maxSunEl",
+    "meanSunEl",
+    "minSatAz",
+    "maxSatAz",
+    "meanSatAz",
+    "minSatEl",
+    "maxSatEl",
+    "meanSatEl",
+    "minInTrackViewAngle",
+    "maxInTrackViewAngle",
+    "meanInTrackViewAngle",
+    "minCrossTrackViewAngle",
+    "maxCrossTrackViewAngle",
+    "meanCrossTrackViewAngle",
+    "minOffNadirViewAngle",
+    "maxOffNadirViewAngle",
+    "meanOffNadirViewAngle",
+    "PNIIRS",
+    "cloudCover",
+    "resamplingKernel",
+    "positionKnowledgeSrc",
+    "attitudeKnowledgeSrc",
+    "revNumber",
+)
+
+WORLDVIEW3_BOUND_KEYS = (
+    "ULLon",
+    "ULLat",
+    "URLon",
+    "URLat",
+    "LRLon",
+    "LRLat",
+    "LLLon",
+    "LLLat",
+)
 
 
 class SearchLocalToGeoImageFrame:
@@ -37,6 +120,7 @@ class SearchLocalToGeoImageFrame:
         max_workers: int = 1,
         progress_callback: Callable[[int, int], None] | None = None,
         skip_images_in_postgresql: "Postgres | None" = None,
+        cancel_event: threading.Event | None = None,
     ) -> GeoImageFrame:
         """Return a `GeoImageFrame` directly from the import configuration."""
         if cls is SearchLocalToGeoImageFrame:
@@ -62,6 +146,8 @@ class SearchLocalToGeoImageFrame:
             load_tasks = []
 
             for importer_ref, pattern in import_types.items():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ImportCancelledError("Image import cancelled.")
                 importer_cls = cls._resolve_importer_class(importer_ref)
                 if not issubclass(importer_cls, SearchLocalToGeoImageFrame):
                     raise TypeError(
@@ -98,18 +184,24 @@ class SearchLocalToGeoImageFrame:
 
             if max_workers == 1:
                 for task in load_tasks:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ImportCancelledError("Image import cancelled.")
                     record = cls._load_task(task)
                     processed_count += 1
                     cls._report_progress(progress_callback, processed_count, total_tasks)
                     if record is not None:
                         all_records.append(record)
             else:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                executor = ThreadPoolExecutor(max_workers=max_workers)
+                try:
                     futures = {
                         executor.submit(cls._load_task, task): task["image_path"]
                         for task in load_tasks
                     }
                     for future in as_completed(futures):
+                        if cancel_event is not None and cancel_event.is_set():
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise ImportCancelledError("Image import cancelled.")
                         image_path = futures[future]
                         try:
                             record = future.result()
@@ -122,6 +214,8 @@ class SearchLocalToGeoImageFrame:
                         cls._report_progress(progress_callback, processed_count, total_tasks)
                         if record is not None:
                             all_records.append(record)
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
             if not all_records:
                 raise ValueError("No valid images were processed into a GeoImageFrame.")
@@ -328,6 +422,78 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
         )
 
 
+class WorldView3Image(SearchLocalToGeoImageFrame):
+    """Importer for WorldView-3 `.IMD` metadata packages."""
+
+    @classmethod
+    def load(
+        cls,
+        image_path,
+        query_from=None,
+        search_re=None,
+        import_type=None,
+        additional_columns=None,
+        create_thumbnail=True,
+        thumbnail_size=(256, 256),
+        fingerprint=None,
+    ):
+        """Load a WorldView-3 IMD file into a GeoImageFrame-compatible record."""
+        source = _extract_source(image_path)
+        fingerprint_data = _calculate_fingerprint(image_path, fingerprint)
+        worldview3_data = _parse_worldview3_imd(image_path)
+        browse_path = _find_worldview3_browse_path(image_path)
+        geometry = _worldview3_polygon_from_bounds(worldview3_data["bounds"])
+        thumbnail_data = _extract_worldview3_thumbnail(
+            browse_path=browse_path,
+            bounds=worldview3_data["bounds"],
+            create_thumbnail=create_thumbnail,
+        )
+
+        if thumbnail_data is not None:
+            raster = _get_dataset_raster_metadata(thumbnail_data)
+        else:
+            raster = _get_raster_metadata(browse_path)
+
+        metadata = {
+            "input_params": {
+                "query_from": query_from,
+                "import_type": import_type or cls.__name__,
+                "search_re": search_re,
+            },
+            "source": source,
+            "fingerprint": fingerprint_data,
+            "raster": raster,
+            "worldview3": {
+                "product": worldview3_data["product"],
+                "image": worldview3_data["image"],
+                "preview": {
+                    "browse_path": str(browse_path),
+                    "projection": "EPSG:4326",
+                    "bounds": worldview3_data["bounds"],
+                },
+            },
+        }
+
+        image_data = {
+            "name": source["name"],
+            "image_url": source["path"],
+            "geometry": geometry,
+            "metadata": metadata,
+            "thumbnail": thumbnail_data,
+            "fingerprint": fingerprint_data["value"] if fingerprint_data else None,
+        }
+
+        return _apply_additional_columns(
+            image_data=image_data,
+            metadata=metadata,
+            additional_columns=additional_columns,
+        )
+
+
+class ImportCancelledError(Exception):
+    """Raised when a local image import is cancelled by the user."""
+
+
  # ------------ Helpers
 
 
@@ -500,6 +666,109 @@ def _extract_source(image_path):
     }
 
 
+def _parse_worldview3_value(value):
+    """Parse a simple IMD scalar into a Python value."""
+    value = value.strip().rstrip(";")
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+
+    if re.fullmatch(r"[-+]?\d+", value):
+        return int(value)
+
+    if re.fullmatch(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", value):
+        return float(value)
+
+    return value
+
+
+def _parse_worldview3_imd(image_path):
+    """Parse product, image, and first-band bounds from a WorldView-3 IMD file."""
+    product = {}
+    image = {}
+    first_band_bounds = None
+    current_group = None
+    group_values = {}
+
+    with Path(image_path).open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line in {"END", "END;"}:
+                continue
+
+            if line.startswith("BEGIN_GROUP"):
+                current_group = line.split("=", 1)[1].strip().rstrip(";")
+                group_values = {}
+                continue
+
+            if line.startswith("END_GROUP"):
+                if current_group == "IMAGE_1":
+                    image = {
+                        key: group_values[key]
+                        for key in WORLDVIEW3_IMAGE_FIELDS
+                        if key in group_values
+                    }
+                elif current_group and current_group.startswith("BAND_") and first_band_bounds is None:
+                    first_band_bounds = {
+                        key: float(group_values[key])
+                        for key in WORLDVIEW3_BOUND_KEYS
+                        if key in group_values
+                    }
+
+                current_group = None
+                group_values = {}
+                continue
+
+            if "=" not in line:
+                continue
+
+            key, value = [part.strip() for part in line.split("=", 1)]
+            parsed_value = _parse_worldview3_value(value)
+
+            if current_group is None:
+                if key in WORLDVIEW3_PRODUCT_FIELDS:
+                    product[key] = parsed_value
+            else:
+                group_values[key] = parsed_value
+
+    missing_bounds = [key for key in WORLDVIEW3_BOUND_KEYS if first_band_bounds is None or key not in first_band_bounds]
+    if missing_bounds:
+        raise ValueError(
+            f"Missing WorldView-3 bounds in {image_path}: {', '.join(missing_bounds)}"
+        )
+
+    return {
+        "product": product,
+        "image": image,
+        "bounds": first_band_bounds,
+    }
+
+
+def _find_worldview3_browse_path(image_path):
+    """Find the sibling `*BROWSE.JPG` preview image for an IMD file."""
+    image_path = Path(image_path)
+    browse_candidates = sorted(
+        path
+        for path in image_path.parent.iterdir()
+        if path.is_file() and path.name.upper().endswith("BROWSE.JPG")
+    )
+    if not browse_candidates:
+        raise ValueError(f"Unable to find '*BROWSE.JPG' next to {image_path}")
+    return browse_candidates[0]
+
+
+def _worldview3_polygon_from_bounds(bounds):
+    """Build a polygon footprint from IMD corner coordinates."""
+    return Polygon(
+        [
+            (bounds["ULLon"], bounds["ULLat"]),
+            (bounds["URLon"], bounds["URLat"]),
+            (bounds["LRLon"], bounds["LRLat"]),
+            (bounds["LLLon"], bounds["LLLat"]),
+            (bounds["ULLon"], bounds["ULLat"]),
+        ]
+    )
+
+
 def _calculate_fingerprint(image_path, mode, sample_size=65536):
     """Calculate a robust or quick file fingerprint."""
     if mode is None:
@@ -649,6 +918,13 @@ def _extract_thumbnail(image_path, create_thumbnail, thumbnail_size):
     return thumbnail
 
 
+def _extract_worldview3_thumbnail(browse_path, bounds, create_thumbnail):
+    """Return the browse image as a georeferenced thumbnail dataset."""
+    if not create_thumbnail:
+        return None
+    return _create_worldview3_thumbnail_dataset(browse_path, bounds)
+
+
 def _build_metadata(
     source,
     query_from,
@@ -711,6 +987,11 @@ def _get_raster_metadata(image_path):
     if dataset is None:
         raise ValueError(f"Unable to open image with GDAL: {image_path}")
 
+    return _get_dataset_raster_metadata(dataset)
+
+
+def _get_dataset_raster_metadata(dataset):
+    """Read GDAL raster metadata from an already-open dataset."""
     projection = dataset.GetProjectionRef()
     geotransform = dataset.GetGeoTransform(can_return_null=True)
 
@@ -765,5 +1046,57 @@ def _create_thumbnail_dataset(image_path, size=(256, 256)):
 
     if thumbnail is None:
         raise ValueError(f"Failed to create thumbnail dataset for {image_path}")
+
+    return thumbnail
+
+
+def _create_worldview3_thumbnail_dataset(browse_path, bounds):
+    """Georeference the WorldView-3 browse image directly in EPSG:4326."""
+    if gdal is None or osr is None:
+        warnings.warn(
+            "GDAL/OSR is not installed. WorldView-3 thumbnails will be set to None.",
+            stacklevel=2,
+        )
+        return None
+
+    dataset = gdal.Open(str(browse_path))
+    if dataset is None:
+        raise ValueError(f"Unable to open browse image with GDAL: {browse_path}")
+
+    width = dataset.RasterXSize
+    height = dataset.RasterYSize
+
+    spatial_ref = osr.SpatialReference()
+    spatial_ref.ImportFromEPSG(4326)
+
+    gcps = [
+        gdal.GCP(bounds["ULLon"], bounds["ULLat"], 0.0, 0.0, 0.0),
+        gdal.GCP(bounds["URLon"], bounds["URLat"], 0.0, width, 0.0),
+        gdal.GCP(bounds["LRLon"], bounds["LRLat"], 0.0, width, height),
+        gdal.GCP(bounds["LLLon"], bounds["LLLat"], 0.0, 0.0, height),
+    ]
+
+    source_mem = gdal.GetDriverByName("MEM").CreateCopy("", dataset, 0)
+    for band_index in range(1, source_mem.RasterCount + 1):
+        source_mem.GetRasterBand(band_index).SetNoDataValue(0)
+    source_mem.SetGCPs(gcps, spatial_ref.ExportToWkt())
+
+    thumbnail = gdal.Warp(
+        "",
+        source_mem,
+        format="MEM",
+        dstSRS="EPSG:4326",
+        resampleAlg="lanczos",
+        srcNodata=0,
+        dstNodata=0,
+    )
+
+    if thumbnail is None:
+        raise ValueError(
+            f"Failed to georeference WorldView-3 browse image for {browse_path}"
+        )
+
+    for band_index in range(1, thumbnail.RasterCount + 1):
+        thumbnail.GetRasterBand(band_index).SetNoDataValue(0)
 
     return thumbnail
