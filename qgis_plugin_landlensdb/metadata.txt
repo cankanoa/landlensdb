@@ -27,7 +27,7 @@ tags=python
 
 homepage=https://github.com/cankanoa/landlensdb
 category=Plugins
-icon=icon.png
+icon=landlensdb.png
 # experimental flag
 experimental=False
 
@@ -44,4 +44,3 @@ Category of the plugin: Raster, Vector, Database or Web
 
 # If the plugin can run on QGIS Server.
 server=False
-
