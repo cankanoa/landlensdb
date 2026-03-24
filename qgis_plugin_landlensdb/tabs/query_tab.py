@@ -533,7 +533,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             return
 
         query_name = self._last_query_state['query_name']
-        root_group = QgsProject.instance().layerTreeRoot()
+        root_group = self._ensure_query_group(query_name)
         query_rows = self._fetch_query_rows()
         if not query_rows:
             self._show_error('The query returned no rows to add.')
@@ -609,7 +609,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 group_path = tuple(
                     '{}'.format(value)
                     for column_name, value in zip(column_names, row)
-                    if column_name != 'image_url'
+                    if column_name not in ('image_url', self.KEY_COLUMN)
                 )
             else:
                 group_path = tuple()
@@ -1156,6 +1156,11 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             self._show_error('Raster layer could not be created from "{}" filter {}: {}'.format(raster_column, row_filter, error_summary))
             return None
         return layer
+
+    def _ensure_query_group(self, query_name):
+        root = QgsProject.instance().layerTreeRoot()
+        group = root.addGroup(query_name)
+        return group if isinstance(group, QgsLayerTreeGroup) else root
 
     def _add_layer_to_group(self, group, layer, insert_at_top=False):
         project = QgsProject.instance()
