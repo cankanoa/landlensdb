@@ -11,7 +11,7 @@ import re
 from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
-from qgis.PyQt.QtWidgets import QAbstractItemView, QTableWidgetItem
+from qgis.PyQt.QtWidgets import QAbstractItemView
 from qgis.core import (
     Qgis,
     QgsDataSourceUri,
@@ -32,6 +32,7 @@ from ..shared.connection_utils import (
     validate_connection_values,
 )
 from ..shared.import_params import import_parameter_label, normalize_import_parameter_row
+from .query_components import QueryHistoryController, ResultsController, SqlBuilderController
 
 try:
     import psycopg2
@@ -65,6 +66,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     STATIC_ROW_ONE = ['SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'GROUP BY', 'ORDER BY', 'LIMIT']
     STATIC_ROW_TWO = ['*', 'DISTINCT', 'COUNT(*)', 'SUM()', 'AVG()', 'MIN()', 'MAX()', 'AND', 'OR', 'NOT', 'IN ()', 'LIKE', 'IS NULL', 'IS NOT NULL']
     STATIC_ROW_THREE = ['ST_Intersects()', 'ST_Within()', 'ST_Contains()', 'ST_DWithin()', 'ST_Touches()', 'ST_Crosses()', '::geometry', '::geography']
+    QUERY_EXAMPLE = 'SELECT  *  FROM "<schema>"."<table>";'
 
     def __init__(self, iface, parent=None):
         super(QueryTab, self).__init__(parent)
@@ -72,15 +74,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.setupUi(self)
 
         self.connection_values = {}
-        self.query_history = []
-        self.starred_queries = []
-        self.query_names = {}
         self._metadata_loaded = False
-        self._history_menu = QtWidgets.QMenu(self)
-        self._star_menu = QtWidgets.QMenu(self)
         self._last_query_state = None
-        self._preview_start = 0
-        self._preview_end = self.PREVIEW_LIMIT
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
@@ -97,7 +92,38 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.results_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.results_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.add_button.setEnabled(False)
-        self._setup_results_controls()
+
+        self.builder_controller = SqlBuilderController(
+            self,
+            self.sql_input,
+            self.commands_frame,
+            self.commands_toggle_button,
+            self.commands_content_widget,
+        )
+        self.builder_controller.prepare_ui()
+
+        self.history_controller = QueryHistoryController(
+            self,
+            self.sql_input,
+            self.history_menu_button,
+            self.star_menu_button,
+            self.HISTORY_KEY,
+            self.STAR_KEY,
+            self.NAME_KEY,
+            self.HISTORY_LIMIT,
+        )
+        self.results_controller = ResultsController(
+            self,
+            self.results_tab,
+            self.results_tab_layout,
+            self.results_label,
+            self.results_table,
+            self.PREVIEW_LIMIT,
+            self._update_results_preview,
+        )
+        self.results_controller.setup()
+        self._prepare_workbench_ui()
+        self._add_builder_help_button()
 
         self._load_settings()
         self._populate_static_buttons()
@@ -120,21 +146,12 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._refresh_schema_buttons(silent=False)
 
     def _load_settings(self):
-        settings = QtCore.QSettings()
         self.connection_values = load_connection_settings()
-        history = settings.value(self.HISTORY_KEY, [])
-        self.query_history = list(history) if isinstance(history, list) else []
-        stars = settings.value(self.STAR_KEY, [])
-        self.starred_queries = list(stars) if isinstance(stars, list) else []
-        names = settings.value(self.NAME_KEY, {})
-        self.query_names = dict(names) if isinstance(names, dict) else {}
+        self.history_controller.load()
 
     def _save_settings(self):
-        settings = QtCore.QSettings()
         save_connection_settings(self.connection_values)
-        settings.setValue(self.HISTORY_KEY, self.query_history)
-        settings.setValue(self.STAR_KEY, self.starred_queries)
-        settings.setValue(self.NAME_KEY, self.query_names)
+        self.history_controller.save()
 
     def _append_status(self, message):
         timestamp = datetime.now().strftime('%H:%M:%S')
@@ -156,41 +173,80 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         if isinstance(window, QtWidgets.QDialog):
             window.close()
 
+    def _prepare_workbench_ui(self):
+        if hasattr(self, 'headerLayout'):
+            while self.headerLayout.count():
+                item = self.headerLayout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+        if hasattr(self, 'verticalLayout'):
+            self.verticalLayout.setContentsMargins(18, 18, 18, 18)
+            self.verticalLayout.setSpacing(10)
+        if hasattr(self, 'commands_frame'):
+            self.commands_frame.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self.commands_frame.setLineWidth(0)
+        if hasattr(self, 'commands_frame_layout'):
+            self.commands_frame_layout.setContentsMargins(0, 0, 0, 0)
+            self.commands_frame_layout.setSpacing(6)
+        if hasattr(self, 'commandsHeaderLayout'):
+            self.commandsHeaderLayout.setContentsMargins(0, 0, 0, 0)
+            self.commandsHeaderLayout.setSpacing(6)
+        if hasattr(self, 'commandsContentLayout'):
+            self.commandsContentLayout.setContentsMargins(0, 0, 0, 0)
+            self.commandsContentLayout.setSpacing(4)
+        if hasattr(self, 'commands_scroll_layout'):
+            self.commands_scroll_layout.setContentsMargins(0, 0, 0, 0)
+            self.commands_scroll_layout.setSpacing(4)
+        if hasattr(self, 'commands_scroll'):
+            self.commands_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.sql_input.setPlaceholderText(self._sql_placeholder_text())
+        self.commands_toggle_button.setStyleSheet('QToolButton { color: white; }')
+        self.history_menu_button.setStyleSheet('QToolButton { color: white; }')
+        self.star_menu_button.setStyleSheet('QToolButton { color: white; }')
+
+    def _add_builder_help_button(self):
+        if not hasattr(self, 'commandsHeaderLayout'):
+            return
+        self.builder_help_button = QtWidgets.QToolButton(self)
+        self.builder_help_button.setText('?')
+        self.builder_help_button.setAutoRaise(True)
+        self.builder_help_button.setToolTip('How the builder works')
+        self.builder_help_button.clicked.connect(self._show_builder_help)
+        self.commandsHeaderLayout.insertWidget(0, self.builder_help_button)
+
+    def _show_builder_help(self):
+        QtWidgets.QMessageBox.information(self, 'Builder', self._builder_help_text())
+
+    def _sql_placeholder_text(self):
+        return self.QUERY_EXAMPLE
+
+    def _builder_help_text(self):
+        return (
+            "Use the builder buttons to help write SQL, then click Query to preview "
+            "the returned rows and Add to load them into QGIS.\n\n"
+            "Example:\n{}".format(self._sql_placeholder_text())
+        )
+
     def _update_connection_button_text(self):
         label = self.connection_values.get('name') or self.connection_values.get('database') or 'Connection'
         self.connection_button.setText('Connection' if label == 'Connection' else 'Connection: {}'.format(label))
 
     def _toggle_commands(self, checked):
-        self.commands_content_widget.setVisible(checked)
-        self.commands_toggle_button.setArrowType(
-            QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
-        )
+        self.builder_controller.toggle_commands(checked)
 
     def _layout_for_name(self, name):
         return getattr(self, name)
 
     def _clear_layout(self, layout):
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            child_layout = item.layout()
-            if widget is not None:
-                widget.deleteLater()
-            elif child_layout is not None:
-                self._clear_layout(child_layout)
+        self.builder_controller.clear_layout(layout)
 
     def _make_insert_button(self, label, insert_text=None):
-        button = QtWidgets.QPushButton(label)
-        button.setMinimumHeight(30)
-        button.clicked.connect(lambda: self._insert_sql(insert_text or label))
-        return button
+        return self.builder_controller.make_insert_button(label, insert_text)
 
     def _set_row_buttons(self, layout_name, items):
         layout = self._layout_for_name(layout_name)
-        self._clear_layout(layout)
-        for label, insert_text in items:
-            layout.addWidget(self._make_insert_button(label, insert_text))
-        layout.addStretch()
+        self.builder_controller.set_row_buttons(layout, items)
 
     def _populate_static_buttons(self):
         self._set_row_buttons('row_one_layout', [(item, item) for item in self.STATIC_ROW_ONE])
@@ -214,152 +270,49 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             layout.itemAt(0).widget().setEnabled(False)
 
     def _insert_sql(self, token):
-        if not token:
-            return
-        cursor = self.sql_input.textCursor()
-        prefix = '' if cursor.atBlockStart() else ' '
-        suffix = '' if token.endswith(' ') or token.endswith(')') else ' '
-        cursor.insertText(prefix + token + suffix)
-        self.sql_input.setTextCursor(cursor)
-        self.sql_input.setFocus()
+        self.builder_controller.insert_sql(token)
 
     def _build_history_menu(self):
-        menu = QtWidgets.QMenu(self)
-        if not self.query_history:
-            empty_action = menu.addAction('No history yet')
-            empty_action.setEnabled(False)
-        else:
-            clear_action = menu.addAction('Clear All')
-            clear_action.triggered.connect(self.clear_history)
-            menu.addSeparator()
-            for index, query in enumerate(self.query_history):
-                submenu = menu.addMenu(self._query_title(query))
-                use_action = submenu.addAction('Use')
-                use_action.triggered.connect(lambda _=False, sql_text=query: self.sql_input.setPlainText(sql_text))
-                rename_action = submenu.addAction('Rename')
-                rename_action.triggered.connect(lambda _=False, sql_text=query: self._rename_query(sql_text))
-                if query in self.query_names:
-                    unname_action = submenu.addAction('Unname')
-                    unname_action.triggered.connect(lambda _=False, sql_text=query: self._unname_query(sql_text))
-                star_action = submenu.addAction('Star')
-                star_action.triggered.connect(lambda _=False, i=index: self._star_history_item(i))
-                delete_action = submenu.addAction('Trash')
-                delete_action.triggered.connect(lambda _=False, i=index: self._remove_history_item(i))
-        self._history_menu = menu
+        self.history_controller.build_history_menu()
 
     def _show_history_menu(self):
-        self._history_menu.exec_(self.history_menu_button.mapToGlobal(
-            QtCore.QPoint(0, self.history_menu_button.height())
-        ))
+        self.history_controller.show_history_menu()
 
     def _build_star_menu(self):
-        menu = QtWidgets.QMenu(self)
-        if not self.starred_queries:
-            empty_action = menu.addAction('No starred queries yet')
-            empty_action.setEnabled(False)
-        else:
-            clear_action = menu.addAction('Clear All')
-            clear_action.triggered.connect(self.clear_starred)
-            menu.addSeparator()
-            for index, query in enumerate(self.starred_queries):
-                submenu = menu.addMenu(self._query_title(query))
-                use_action = submenu.addAction('Use')
-                use_action.triggered.connect(lambda _=False, sql_text=query: self.sql_input.setPlainText(sql_text))
-                rename_action = submenu.addAction('Rename')
-                rename_action.triggered.connect(lambda _=False, sql_text=query: self._rename_query(sql_text))
-                if query in self.query_names:
-                    unname_action = submenu.addAction('Unname')
-                    unname_action.triggered.connect(lambda _=False, sql_text=query: self._unname_query(sql_text))
-                unstar_action = submenu.addAction('Unstar')
-                unstar_action.triggered.connect(lambda _=False, i=index: self._unstar_item(i))
-                delete_action = submenu.addAction('Trash')
-                delete_action.triggered.connect(lambda _=False, i=index: self._remove_star_item(i))
-        self._star_menu = menu
+        self.history_controller.build_star_menu()
 
     def _show_star_menu(self):
-        self._star_menu.exec_(self.star_menu_button.mapToGlobal(
-            QtCore.QPoint(0, self.star_menu_button.height())
-        ))
+        self.history_controller.show_star_menu()
 
     def _query_title(self, query):
-        return self.query_names.get(query, query.replace('\n', ' ')[:80])
+        return self.history_controller.query_title(query)
 
     def _rename_query(self, query):
-        current_name = self.query_names.get(query, '')
-        new_name, accepted = QtWidgets.QInputDialog.getText(
-            self,
-            'Rename Query',
-            'Name',
-            text=current_name,
-        )
-        if accepted and new_name.strip():
-            self.query_names[query] = new_name.strip()
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.rename_query(query)
 
     def _unname_query(self, query):
-        if query in self.query_names:
-            del self.query_names[query]
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.unname_query(query)
 
     def _add_history_item(self, sql_text):
-        normalized = sql_text.strip()
-        if normalized in self.query_history:
-            self.query_history.remove(normalized)
-        self.query_history.insert(0, normalized)
-        self.query_history = self.query_history[:self.HISTORY_LIMIT]
-        self._save_settings()
-        self._build_history_menu()
-        self._build_star_menu()
+        self.history_controller.add_history_item(sql_text)
 
     def _remove_history_item(self, index):
-        if 0 <= index < len(self.query_history):
-            del self.query_history[index]
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.remove_history_item(index)
 
     def clear_history(self):
-        self.query_history = []
-        self._save_settings()
-        self._build_history_menu()
-        self._build_star_menu()
+        self.history_controller.clear_history()
 
     def _star_history_item(self, index):
-        if 0 <= index < len(self.query_history):
-            query = self.query_history.pop(index)
-            if query in self.starred_queries:
-                self.starred_queries.remove(query)
-            self.starred_queries.insert(0, query)
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.star_history_item(index)
 
     def _unstar_item(self, index):
-        if 0 <= index < len(self.starred_queries):
-            query = self.starred_queries.pop(index)
-            if query in self.query_history:
-                self.query_history.remove(query)
-            self.query_history.insert(0, query)
-            self.query_history = self.query_history[:self.HISTORY_LIMIT]
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.unstar_item(index)
 
     def _remove_star_item(self, index):
-        if 0 <= index < len(self.starred_queries):
-            del self.starred_queries[index]
-            self._save_settings()
-            self._build_star_menu()
+        self.history_controller.remove_star_item(index)
 
     def clear_starred(self):
-        self.starred_queries = []
-        self._save_settings()
-        self._build_star_menu()
-        self._build_history_menu()
+        self.history_controller.clear_starred()
 
     def open_connection_dialog(self):
         dialog = ConnectionDialog(self.connection_values, self._test_connection_values, self)
@@ -489,6 +442,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._last_query_state = {
             'query_name': query_name,
             'live_query': live_query,
+            'column_info': column_info,
+            'column_names': [column['name'] for column in column_info],
             'raster_source': raster_source,
             'vector_column': vector_column,
             'import_groups': import_groups,
@@ -847,88 +802,24 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         return [row[0] for row in cursor.fetchall() if row and row[0]]
 
-    def _setup_results_controls(self):
-        header_layout = self.results_tab_layout
-        results_label_index = header_layout.indexOf(self.results_label)
-        if results_label_index < 0:
-            return
-
-        header_layout.removeWidget(self.results_label)
-        self.results_label.hide()
-
-        self.results_header_widget = QtWidgets.QWidget(self.results_tab)
-        self.results_header_layout = QtWidgets.QHBoxLayout(self.results_header_widget)
-        self.results_header_layout.setContentsMargins(0, 0, 0, 0)
-        self.results_header_layout.setSpacing(6)
-
-        self.results_prefix_label = QtWidgets.QLabel('Results (', self.results_header_widget)
-        self.results_header_layout.addWidget(self.results_prefix_label)
-
-        self.results_start_spin = QtWidgets.QSpinBox(self.results_header_widget)
-        self.results_start_spin.setRange(0, 1000000000)
-        self.results_start_spin.setValue(0)
-        self.results_start_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
-        self.results_start_spin.setMinimumWidth(64)
-        self.results_header_layout.addWidget(self.results_start_spin)
-
-        self.results_dash_label = QtWidgets.QLabel('-', self.results_header_widget)
-        self.results_header_layout.addWidget(self.results_dash_label)
-
-        self.results_end_spin = QtWidgets.QSpinBox(self.results_header_widget)
-        self.results_end_spin.setRange(0, 1000000000)
-        self.results_end_spin.setValue(self.PREVIEW_LIMIT)
-        self.results_end_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
-        self.results_end_spin.setMinimumWidth(64)
-        self.results_header_layout.addWidget(self.results_end_spin)
-
-        self.results_total_label = QtWidgets.QLabel('/ 0)', self.results_header_widget)
-        self.results_header_layout.addWidget(self.results_total_label)
-
-        self.results_update_button = QtWidgets.QPushButton('Update', self.results_header_widget)
-        self.results_update_button.clicked.connect(self._update_results_preview)
-        self.results_header_layout.addWidget(self.results_update_button)
-        self.results_header_layout.addStretch()
-
-        header_layout.insertWidget(results_label_index, self.results_header_widget)
-
     def _preview_start_value(self):
-        return self.results_start_spin.value()
+        return self.results_controller.preview_range()[0]
 
     def _preview_end_value(self):
-        return self.results_end_spin.value()
+        return self.results_controller.preview_range()[1]
 
     def _validated_preview_range(self):
-        start_row = self._preview_start_value()
-        end_row = self._preview_end_value()
-        if end_row < start_row:
-            start_row, end_row = end_row, start_row
-            self.results_start_spin.setValue(start_row)
-            self.results_end_spin.setValue(end_row)
-        return start_row, end_row
+        return self.results_controller.preview_range()
 
     def _update_results_preview(self):
         self._run_query_preview(add_to_history=False)
 
     def _set_results_label(self, preview_count, total_count):
-        start_row, end_row = self._validated_preview_range()
-        actual_start = min(start_row, total_count)
-        actual_end = min(end_row, total_count)
-        if actual_end < actual_start:
-            actual_end = actual_start
-        self.results_total_label.setText('/ {})'.format(total_count))
-        self.results_start_spin.setValue(actual_start)
-        self.results_end_spin.setValue(actual_end if total_count else end_row)
+        _ = preview_count
+        self.results_controller.set_label(total_count)
 
     def _populate_preview(self, column_info, rows, total_count):
-        self.results_table.clear()
-        self.results_table.setColumnCount(len(column_info))
-        self.results_table.setHorizontalHeaderLabels([column['name'] for column in column_info])
-        self.results_table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            for column_index, value in enumerate(row):
-                self.results_table.setItem(row_index, column_index, QTableWidgetItem('' if value is None else str(value)))
-        self.results_table.resizeColumnsToContents()
-        self._set_results_label(len(rows), total_count)
+        self.results_controller.populate_preview(column_info, rows, total_count)
 
     def _create_uri(self):
         uri = QgsDataSourceUri()
