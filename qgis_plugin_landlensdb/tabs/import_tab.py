@@ -93,7 +93,7 @@ class ImportTab(QtWidgets.QWidget):
         self.table_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.table_button.setArrowType(QtCore.Qt.DownArrow)
         self.table_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.table_button.setStyleSheet('QToolButton { color: white; }')
+        self.table_button.setStyleSheet('')
         top_row.addWidget(self.table_button, 1)
         self.refresh_table_button = QtWidgets.QToolButton()
         self.refresh_table_button.setAutoRaise(True)
