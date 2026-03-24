@@ -101,7 +101,9 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
-        self.add_button.clicked.connect(self.add_last_query_to_map)
+        self.add_button.clicked.connect(
+            lambda: self.add_last_query_to_map(add_thumbnail=True, add_geometry=True)
+        )
         self.close_button.clicked.connect(self._close_parent_dialog)
         self.commands_toggle_button.toggled.connect(self._toggle_commands)
         self.history_menu_button.clicked.connect(self._show_history_menu)
@@ -636,8 +638,12 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     def _ensure_child_group(self, parent_group, label):
         for child in parent_group.children():
             if isinstance(child, QgsLayerTreeGroup) and child.name() == label:
+                child.setExpanded(False)
                 return child
-        return parent_group.addGroup(label)
+        child_group = parent_group.addGroup(label)
+        if isinstance(child_group, QgsLayerTreeGroup):
+            child_group.setExpanded(False)
+        return child_group
 
     def _add_group_layers(self, parent_group, image_urls, add_thumbnail=True, add_geometry=True):
         added_layers = []
@@ -1160,6 +1166,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     def _ensure_query_group(self, query_name):
         root = QgsProject.instance().layerTreeRoot()
         group = root.addGroup(query_name)
+        if isinstance(group, QgsLayerTreeGroup):
+            group.setExpanded(False)
         return group if isinstance(group, QgsLayerTreeGroup) else root
 
     def _add_layer_to_group(self, group, layer, insert_at_top=False):
