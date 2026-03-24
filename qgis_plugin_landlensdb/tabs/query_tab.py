@@ -97,6 +97,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.connection_values = {}
         self._metadata_loaded = False
         self._last_query_state = None
+        self._thumbnail_support_cache = {}
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
@@ -113,6 +114,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.results_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.results_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.add_button.setEnabled(False)
+        self._setup_add_menu()
 
         self.builder_controller = SqlBuilderController(
             self,
@@ -193,6 +195,30 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         window = self.window()
         if isinstance(window, QtWidgets.QDialog):
             window.close()
+
+    def _setup_add_menu(self):
+        add_menu = QtWidgets.QMenu(self.add_button)
+        add_thumbnail_action = add_menu.addAction('Add Thumbnail')
+        add_thumbnail_action.triggered.connect(
+            lambda: self.add_last_query_to_map(add_thumbnail=True, add_geometry=False)
+        )
+        add_geometry_action = add_menu.addAction('Add Geometry')
+        add_geometry_action.triggered.connect(
+            lambda: self.add_last_query_to_map(add_thumbnail=False, add_geometry=True)
+        )
+
+        self.add_menu_button = QtWidgets.QToolButton(self)
+        self.add_menu_button.setText('')
+        self.add_menu_button.setArrowType(QtCore.Qt.DownArrow)
+        self.add_menu_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.add_menu_button.setMenu(add_menu)
+        self.add_menu_button.setStyleSheet('QToolButton::menu-indicator { image: none; width: 0px; }')
+        self.add_menu_button.setEnabled(False)
+
+        if hasattr(self, 'buttonLayout'):
+            index = self.buttonLayout.indexOf(self.add_button)
+            if index >= 0:
+                self.buttonLayout.insertWidget(index + 1, self.add_menu_button)
 
     def _prepare_workbench_ui(self):
         if hasattr(self, 'headerLayout'):
@@ -491,19 +517,23 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             'row_count': row_count,
         }
         self.add_button.setEnabled(True)
+        self.add_menu_button.setEnabled(True)
         self.bottom_tabs.setCurrentWidget(self.results_tab)
         self._show_info('Previewed {} row(s). Click Add to load layers into the map.'.format(row_count))
 
-    def add_last_query_to_map(self):
+    def add_last_query_to_map(self, add_thumbnail=True, add_geometry=True):
         if not self._last_query_state:
             self._show_error('Run Query first to preview results before adding to the map.')
             return
         if 'image_url' not in self._last_query_state.get('column_names', []):
             self._show_error('Add requires an "image_url" column in the query results.')
             return
+        if not add_thumbnail and not add_geometry:
+            self._show_error('Select at least one layer type to add.')
+            return
 
         query_name = self._last_query_state['query_name']
-        root_group = self._ensure_query_group(query_name)
+        root_group = QgsProject.instance().layerTreeRoot()
         query_rows = self._fetch_query_rows()
         if not query_rows:
             self._show_error('The query returned no rows to add.')
@@ -517,14 +547,18 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             parent_group = root_group
             for part in group_path:
                 parent_group = self._ensure_child_group(parent_group, part)
-            thumbnail_group = self._ensure_child_group(parent_group, 'thumbnail')
-            geometry_group = self._ensure_child_group(parent_group, 'geometry')
-            added_layers.extend(self._add_thumbnail_layers(thumbnail_group, image_urls))
-            added_layers.extend(self._add_geometry_layers(geometry_group, image_urls))
+            added_layers.extend(
+                self._add_group_layers(
+                    parent_group,
+                    image_urls,
+                    add_thumbnail=add_thumbnail,
+                    add_geometry=add_geometry,
+                )
+            )
 
         if added_layers:
             self._show_info(
-                'Loaded {} layer(s) under "{}".'.format(
+                'Loaded {} layer(s) for "{}".'.format(
                     len(added_layers),
                     query_name,
                 )
@@ -604,6 +638,16 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             if isinstance(child, QgsLayerTreeGroup) and child.name() == label:
                 return child
         return parent_group.addGroup(label)
+
+    def _add_group_layers(self, parent_group, image_urls, add_thumbnail=True, add_geometry=True):
+        added_layers = []
+        if add_thumbnail:
+            thumbnail_group = self._ensure_child_group(parent_group, 'thumbnail')
+            added_layers.extend(self._add_thumbnail_layers(thumbnail_group, image_urls))
+        if add_geometry:
+            geometry_group = self._ensure_child_group(parent_group, 'geometry')
+            added_layers.extend(self._add_geometry_layers(geometry_group, image_urls))
+        return added_layers
 
     def _add_thumbnail_layers(self, group, image_urls):
         added_layers = []
@@ -1112,11 +1156,6 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             self._show_error('Raster layer could not be created from "{}" filter {}: {}'.format(raster_column, row_filter, error_summary))
             return None
         return layer
-
-    def _ensure_query_group(self, query_name):
-        root = QgsProject.instance().layerTreeRoot()
-        group = root.addGroup(query_name)
-        return group if isinstance(group, QgsLayerTreeGroup) else root
 
     def _add_layer_to_group(self, group, layer, insert_at_top=False):
         project = QgsProject.instance()
