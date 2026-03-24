@@ -11,7 +11,7 @@ import re
 from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
-from qgis.PyQt.QtWidgets import QAbstractItemView, QTableWidgetItem
+from qgis.PyQt.QtWidgets import QAbstractItemView
 from qgis.core import (
     Qgis,
     QgsDataSourceUri,
@@ -31,7 +31,13 @@ from ..shared.connection_utils import (
     test_connection_values,
     validate_connection_values,
 )
-from ..shared.import_params import import_parameter_label, normalize_import_parameter_row
+from ..landlensdb.handlers.local import (
+    GeoTaggedImage,
+    GeoTransformImage,
+    SearchLocalToGeoImageFrame,
+    WorldView3Image,
+)
+from .query_components import QueryHistoryController, ResultsController, SqlBuilderController
 
 try:
     import psycopg2
@@ -55,6 +61,10 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     PREVIEW_LIMIT = 10
     HISTORY_LIMIT = 25
     KEY_COLUMN = '__lldb_rowid__'
+    THUMBNAIL_IMPORT_TYPE_NAMES = (
+        'GeoTransformImage',
+        'WorldView3Image',
+    )
     SIMPLE_SELECT_RE = re.compile(
         r'^\s*SELECT\s+\*\s+FROM\s+(?:"(?P<schema_q>[^"]+)"|"?(?P<schema_u>[\w]+)"?)\.(?:"(?P<table_q>[^"]+)"|"?(?P<table_u>[\w]+)"?)'
         r'(?:\s+(?:AS\s+)?(?:"?[\w]+"?))?'
@@ -62,9 +72,22 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         r'\s*$',
         re.IGNORECASE | re.DOTALL,
     )
+    SOURCE_TABLE_RE = re.compile(
+        r'\bFROM\s+(?:"(?P<schema_q>[^"]+)"|"?(?P<schema_u>[\w]+)"?)\.(?:"(?P<table_q>[^"]+)"|"?(?P<table_u>[\w]+)"?)'
+        r'(?:\s+(?:AS\s+)?(?:"?[\w]+"?))?'
+        r'(?P<tail>.*)$',
+        re.IGNORECASE | re.DOTALL,
+    )
     STATIC_ROW_ONE = ['SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'GROUP BY', 'ORDER BY', 'LIMIT']
     STATIC_ROW_TWO = ['*', 'DISTINCT', 'COUNT(*)', 'SUM()', 'AVG()', 'MIN()', 'MAX()', 'AND', 'OR', 'NOT', 'IN ()', 'LIKE', 'IS NULL', 'IS NOT NULL']
     STATIC_ROW_THREE = ['ST_Intersects()', 'ST_Within()', 'ST_Contains()', 'ST_DWithin()', 'ST_Touches()', 'ST_Crosses()', '::geometry', '::geography']
+    QUERY_EXAMPLE = (
+        "image_url is the unique identifier per GeoImage. This sql statement must return the following:\n"
+        'No grouping (image_url column must be one string per row):  SELECT  *  FROM  "<shema>"."<table>"\n'
+        "Grouping (image_url must be a list of strings):\n"
+        "SELECT   metadata::jsonb->'captured_at'->>'year' ,  array_agg(image_url) AS image_url  FROM  "
+        '"<shema>"."<table>"   GROUP BY metadata::jsonb->\'captured_at\'->>\'year\' '
+    )
 
     def __init__(self, iface, parent=None):
         super(QueryTab, self).__init__(parent)
@@ -72,15 +95,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.setupUi(self)
 
         self.connection_values = {}
-        self.query_history = []
-        self.starred_queries = []
-        self.query_names = {}
         self._metadata_loaded = False
-        self._history_menu = QtWidgets.QMenu(self)
-        self._star_menu = QtWidgets.QMenu(self)
         self._last_query_state = None
-        self._preview_start = 0
-        self._preview_end = self.PREVIEW_LIMIT
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
@@ -97,7 +113,38 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.results_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.results_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.add_button.setEnabled(False)
-        self._setup_results_controls()
+
+        self.builder_controller = SqlBuilderController(
+            self,
+            self.sql_input,
+            self.commands_frame,
+            self.commands_toggle_button,
+            self.commands_content_widget,
+        )
+        self.builder_controller.prepare_ui()
+
+        self.history_controller = QueryHistoryController(
+            self,
+            self.sql_input,
+            self.history_menu_button,
+            self.star_menu_button,
+            self.HISTORY_KEY,
+            self.STAR_KEY,
+            self.NAME_KEY,
+            self.HISTORY_LIMIT,
+        )
+        self.results_controller = ResultsController(
+            self,
+            self.results_tab,
+            self.results_tab_layout,
+            self.results_label,
+            self.results_table,
+            self.PREVIEW_LIMIT,
+            self._update_results_preview,
+        )
+        self.results_controller.setup()
+        self._prepare_workbench_ui()
+        self._add_builder_help_button()
 
         self._load_settings()
         self._populate_static_buttons()
@@ -120,21 +167,12 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._refresh_schema_buttons(silent=False)
 
     def _load_settings(self):
-        settings = QtCore.QSettings()
         self.connection_values = load_connection_settings()
-        history = settings.value(self.HISTORY_KEY, [])
-        self.query_history = list(history) if isinstance(history, list) else []
-        stars = settings.value(self.STAR_KEY, [])
-        self.starred_queries = list(stars) if isinstance(stars, list) else []
-        names = settings.value(self.NAME_KEY, {})
-        self.query_names = dict(names) if isinstance(names, dict) else {}
+        self.history_controller.load()
 
     def _save_settings(self):
-        settings = QtCore.QSettings()
         save_connection_settings(self.connection_values)
-        settings.setValue(self.HISTORY_KEY, self.query_history)
-        settings.setValue(self.STAR_KEY, self.starred_queries)
-        settings.setValue(self.NAME_KEY, self.query_names)
+        self.history_controller.save()
 
     def _append_status(self, message):
         timestamp = datetime.now().strftime('%H:%M:%S')
@@ -156,47 +194,88 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         if isinstance(window, QtWidgets.QDialog):
             window.close()
 
+    def _prepare_workbench_ui(self):
+        if hasattr(self, 'headerLayout'):
+            while self.headerLayout.count():
+                item = self.headerLayout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+        if hasattr(self, 'verticalLayout'):
+            self.verticalLayout.setContentsMargins(18, 18, 18, 18)
+            self.verticalLayout.setSpacing(10)
+        if hasattr(self, 'commands_frame'):
+            self.commands_frame.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self.commands_frame.setLineWidth(0)
+        if hasattr(self, 'commands_frame_layout'):
+            self.commands_frame_layout.setContentsMargins(0, 0, 0, 0)
+            self.commands_frame_layout.setSpacing(6)
+        if hasattr(self, 'commandsHeaderLayout'):
+            self.commandsHeaderLayout.setContentsMargins(0, 0, 0, 0)
+            self.commandsHeaderLayout.setSpacing(6)
+        if hasattr(self, 'commandsContentLayout'):
+            self.commandsContentLayout.setContentsMargins(0, 0, 0, 0)
+            self.commandsContentLayout.setSpacing(4)
+        if hasattr(self, 'commands_scroll_layout'):
+            self.commands_scroll_layout.setContentsMargins(0, 0, 0, 0)
+            self.commands_scroll_layout.setSpacing(4)
+        if hasattr(self, 'commands_scroll'):
+            self.commands_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.sql_input.setPlaceholderText(self._sql_placeholder_text())
+        self.commands_toggle_button.setStyleSheet('')
+        self.history_menu_button.setStyleSheet('')
+        self.star_menu_button.setStyleSheet('')
+
+    def _add_builder_help_button(self):
+        if not hasattr(self, 'commandsHeaderLayout'):
+            return
+        self.builder_help_button = QtWidgets.QToolButton(self)
+        self.builder_help_button.setText('?')
+        self.builder_help_button.setAutoRaise(True)
+        self.builder_help_button.setToolTip('How the builder works')
+        self.builder_help_button.clicked.connect(self._show_builder_help)
+        self.commandsHeaderLayout.insertWidget(0, self.builder_help_button)
+
+    def _show_builder_help(self):
+        QtWidgets.QMessageBox.information(self, 'Builder', self._builder_help_text())
+
+    def _sql_placeholder_text(self):
+        return self.QUERY_EXAMPLE
+
+    def _builder_help_text(self):
+        return (
+            "Use the builder buttons to help write SQL, then click Query to preview "
+            "the returned rows. Add requires an image_url column. If image_url is a "
+            "string, each row is added directly. If image_url is a list, each item is "
+            "treated as a grouped GeoImage entry.\n\n"
+            "Example:\n{}".format(self._sql_placeholder_text())
+        )
+
     def _update_connection_button_text(self):
         label = self.connection_values.get('name') or self.connection_values.get('database') or 'Connection'
         self.connection_button.setText('Connection' if label == 'Connection' else 'Connection: {}'.format(label))
 
     def _toggle_commands(self, checked):
-        self.commands_content_widget.setVisible(checked)
-        self.commands_toggle_button.setArrowType(
-            QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
-        )
+        self.builder_controller.toggle_commands(checked)
 
     def _layout_for_name(self, name):
         return getattr(self, name)
 
     def _clear_layout(self, layout):
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            child_layout = item.layout()
-            if widget is not None:
-                widget.deleteLater()
-            elif child_layout is not None:
-                self._clear_layout(child_layout)
+        self.builder_controller.clear_layout(layout)
 
     def _make_insert_button(self, label, insert_text=None):
-        button = QtWidgets.QPushButton(label)
-        button.setMinimumHeight(30)
-        button.clicked.connect(lambda: self._insert_sql(insert_text or label))
-        return button
+        return self.builder_controller.make_insert_button(label, insert_text)
 
     def _set_row_buttons(self, layout_name, items):
         layout = self._layout_for_name(layout_name)
-        self._clear_layout(layout)
-        for label, insert_text in items:
-            layout.addWidget(self._make_insert_button(label, insert_text))
-        layout.addStretch()
+        self.builder_controller.set_row_buttons(layout, items)
 
     def _populate_static_buttons(self):
         self._set_row_buttons('row_one_layout', [(item, item) for item in self.STATIC_ROW_ONE])
         self._set_row_buttons('row_two_layout', [(item, item) for item in self.STATIC_ROW_TWO])
         self._set_row_buttons('row_three_layout', [(item, item) for item in self.STATIC_ROW_THREE])
-        self._set_row_buttons('row_five_layout', [('Spatial Query', None)])
+        self._set_row_buttons('row_five_layout', [('Spatial Query', None), ('Metadata Query', None)])
         spatial_button = self.row_five_layout.itemAt(0).widget()
         if spatial_button is not None:
             try:
@@ -204,6 +283,13 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             except TypeError:
                 pass
             spatial_button.clicked.connect(self._open_spatial_query_dialog)
+        metadata_button = self.row_five_layout.itemAt(1).widget()
+        if metadata_button is not None:
+            try:
+                metadata_button.clicked.disconnect()
+            except TypeError:
+                pass
+            metadata_button.clicked.connect(self._open_metadata_query_menu)
 
     def _render_dynamic_buttons(self, tables, columns):
         table_items = [(table, table) for table in tables] or [('No tables', None)]
@@ -214,152 +300,49 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             layout.itemAt(0).widget().setEnabled(False)
 
     def _insert_sql(self, token):
-        if not token:
-            return
-        cursor = self.sql_input.textCursor()
-        prefix = '' if cursor.atBlockStart() else ' '
-        suffix = '' if token.endswith(' ') or token.endswith(')') else ' '
-        cursor.insertText(prefix + token + suffix)
-        self.sql_input.setTextCursor(cursor)
-        self.sql_input.setFocus()
+        self.builder_controller.insert_sql(token)
 
     def _build_history_menu(self):
-        menu = QtWidgets.QMenu(self)
-        if not self.query_history:
-            empty_action = menu.addAction('No history yet')
-            empty_action.setEnabled(False)
-        else:
-            clear_action = menu.addAction('Clear All')
-            clear_action.triggered.connect(self.clear_history)
-            menu.addSeparator()
-            for index, query in enumerate(self.query_history):
-                submenu = menu.addMenu(self._query_title(query))
-                use_action = submenu.addAction('Use')
-                use_action.triggered.connect(lambda _=False, sql_text=query: self.sql_input.setPlainText(sql_text))
-                rename_action = submenu.addAction('Rename')
-                rename_action.triggered.connect(lambda _=False, sql_text=query: self._rename_query(sql_text))
-                if query in self.query_names:
-                    unname_action = submenu.addAction('Unname')
-                    unname_action.triggered.connect(lambda _=False, sql_text=query: self._unname_query(sql_text))
-                star_action = submenu.addAction('Star')
-                star_action.triggered.connect(lambda _=False, i=index: self._star_history_item(i))
-                delete_action = submenu.addAction('Trash')
-                delete_action.triggered.connect(lambda _=False, i=index: self._remove_history_item(i))
-        self._history_menu = menu
+        self.history_controller.build_history_menu()
 
     def _show_history_menu(self):
-        self._history_menu.exec_(self.history_menu_button.mapToGlobal(
-            QtCore.QPoint(0, self.history_menu_button.height())
-        ))
+        self.history_controller.show_history_menu()
 
     def _build_star_menu(self):
-        menu = QtWidgets.QMenu(self)
-        if not self.starred_queries:
-            empty_action = menu.addAction('No starred queries yet')
-            empty_action.setEnabled(False)
-        else:
-            clear_action = menu.addAction('Clear All')
-            clear_action.triggered.connect(self.clear_starred)
-            menu.addSeparator()
-            for index, query in enumerate(self.starred_queries):
-                submenu = menu.addMenu(self._query_title(query))
-                use_action = submenu.addAction('Use')
-                use_action.triggered.connect(lambda _=False, sql_text=query: self.sql_input.setPlainText(sql_text))
-                rename_action = submenu.addAction('Rename')
-                rename_action.triggered.connect(lambda _=False, sql_text=query: self._rename_query(sql_text))
-                if query in self.query_names:
-                    unname_action = submenu.addAction('Unname')
-                    unname_action.triggered.connect(lambda _=False, sql_text=query: self._unname_query(sql_text))
-                unstar_action = submenu.addAction('Unstar')
-                unstar_action.triggered.connect(lambda _=False, i=index: self._unstar_item(i))
-                delete_action = submenu.addAction('Trash')
-                delete_action.triggered.connect(lambda _=False, i=index: self._remove_star_item(i))
-        self._star_menu = menu
+        self.history_controller.build_star_menu()
 
     def _show_star_menu(self):
-        self._star_menu.exec_(self.star_menu_button.mapToGlobal(
-            QtCore.QPoint(0, self.star_menu_button.height())
-        ))
+        self.history_controller.show_star_menu()
 
     def _query_title(self, query):
-        return self.query_names.get(query, query.replace('\n', ' ')[:80])
+        return self.history_controller.query_title(query)
 
     def _rename_query(self, query):
-        current_name = self.query_names.get(query, '')
-        new_name, accepted = QtWidgets.QInputDialog.getText(
-            self,
-            'Rename Query',
-            'Name',
-            text=current_name,
-        )
-        if accepted and new_name.strip():
-            self.query_names[query] = new_name.strip()
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.rename_query(query)
 
     def _unname_query(self, query):
-        if query in self.query_names:
-            del self.query_names[query]
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.unname_query(query)
 
     def _add_history_item(self, sql_text):
-        normalized = sql_text.strip()
-        if normalized in self.query_history:
-            self.query_history.remove(normalized)
-        self.query_history.insert(0, normalized)
-        self.query_history = self.query_history[:self.HISTORY_LIMIT]
-        self._save_settings()
-        self._build_history_menu()
-        self._build_star_menu()
+        self.history_controller.add_history_item(sql_text)
 
     def _remove_history_item(self, index):
-        if 0 <= index < len(self.query_history):
-            del self.query_history[index]
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.remove_history_item(index)
 
     def clear_history(self):
-        self.query_history = []
-        self._save_settings()
-        self._build_history_menu()
-        self._build_star_menu()
+        self.history_controller.clear_history()
 
     def _star_history_item(self, index):
-        if 0 <= index < len(self.query_history):
-            query = self.query_history.pop(index)
-            if query in self.starred_queries:
-                self.starred_queries.remove(query)
-            self.starred_queries.insert(0, query)
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.star_history_item(index)
 
     def _unstar_item(self, index):
-        if 0 <= index < len(self.starred_queries):
-            query = self.starred_queries.pop(index)
-            if query in self.query_history:
-                self.query_history.remove(query)
-            self.query_history.insert(0, query)
-            self.query_history = self.query_history[:self.HISTORY_LIMIT]
-            self._save_settings()
-            self._build_history_menu()
-            self._build_star_menu()
+        self.history_controller.unstar_item(index)
 
     def _remove_star_item(self, index):
-        if 0 <= index < len(self.starred_queries):
-            del self.starred_queries[index]
-            self._save_settings()
-            self._build_star_menu()
+        self.history_controller.remove_star_item(index)
 
     def clear_starred(self):
-        self.starred_queries = []
-        self._save_settings()
-        self._build_star_menu()
-        self._build_history_menu()
+        self.history_controller.clear_starred()
 
     def open_connection_dialog(self):
         dialog = ConnectionDialog(self.connection_values, self._test_connection_values, self)
@@ -451,6 +434,10 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         query_name = 'Query {}'.format(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         live_query = self._build_live_query(sql_text)
         raster_source = self._parse_simple_raster_source(sql_text)
+        query_source = self._parse_query_source(sql_text)
+        source_column_info = []
+        effective_raster_source = raster_source
+        effective_raster_columns = []
 
         try:
             with psycopg2.connect(**self._connection_kwargs()) as connection:
@@ -466,33 +453,40 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                         start_row,
                         end_row,
                     )
-                    raster_key_columns = self._get_raster_key_columns(cursor, raster_source)
-                    raster_columns = [column['name'] for column in column_info if column['udt_name'] == 'raster']
+                    effective_raster_columns = [
+                        column['name'] for column in column_info if column['udt_name'] == 'raster'
+                    ]
+                    if query_source:
+                        source_query = self._build_source_query_from_source(query_source)
+                        source_column_info = self._get_column_info(cursor, source_query)
+                        if effective_raster_source is None:
+                            effective_raster_source = query_source
+                        if not effective_raster_columns:
+                            effective_raster_columns = [
+                                column['name']
+                                for column in source_column_info
+                                if column['udt_name'] == 'raster'
+                            ]
+                    raster_key_columns = self._get_raster_key_columns(cursor, effective_raster_source)
         except Exception as exc:  # pragma: no cover - depends on external DB
             self._show_error('Query failed: {}'.format(exc))
             return
 
         vector_column = self._find_first_column(column_info, {'geometry', 'geography'})
-        import_groups = []
-        try:
-            with psycopg2.connect(**self._connection_kwargs()) as connection:
-                with connection.cursor() as cursor:
-                    if schema_name:
-                        self._set_search_path(cursor, schema_name)
-                    import_groups = self._get_query_import_groups(cursor, live_query, column_info)
-        except Exception as exc:  # pragma: no cover - depends on external DB
-            self._show_error('Could not inspect import groups: {}'.format(exc))
-            return
+        source_vector_column = self._find_first_column(source_column_info, {'geometry', 'geography'})
         self._populate_preview(column_info, preview_rows, row_count)
         if add_to_history:
             self._add_history_item(sql_text)
         self._last_query_state = {
             'query_name': query_name,
             'live_query': live_query,
-            'raster_source': raster_source,
+            'query_source': query_source,
+            'column_info': column_info,
+            'column_names': [column['name'] for column in column_info],
+            'raster_source': effective_raster_source,
             'vector_column': vector_column,
-            'import_groups': import_groups,
-            'raster_columns': raster_columns,
+            'source_vector_column': source_vector_column,
+            'raster_columns': effective_raster_columns,
             'raster_key_columns': raster_key_columns,
             'row_count': row_count,
         }
@@ -504,82 +498,216 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         if not self._last_query_state:
             self._show_error('Run Query first to preview results before adding to the map.')
             return
+        if 'image_url' not in self._last_query_state.get('column_names', []):
+            self._show_error('Add requires an "image_url" column in the query results.')
+            return
 
         query_name = self._last_query_state['query_name']
         root_group = self._ensure_query_group(query_name)
+        query_rows = self._fetch_query_rows()
+        if not query_rows:
+            self._show_error('The query returned no rows to add.')
+            return
+
         added_layers = []
-        import_groups = self._last_query_state.get('import_groups') or [None]
-        vector_column = self._last_query_state['vector_column']
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
-
-        for import_group in import_groups:
-            group_name = import_parameter_label(import_group) if import_group else query_name
-            group = root_group.addGroup(group_name)
-            filtered_query = self._build_import_group_query(
-                self._last_query_state['live_query'],
-                import_group,
-            )
-
-            geometry_types = []
-            if vector_column:
-                try:
-                    with psycopg2.connect(**self._connection_kwargs()) as connection:
-                        with connection.cursor() as cursor:
-                            if schema_name:
-                                self._set_search_path(cursor, schema_name)
-                            geometry_types = self._get_geometry_types(cursor, filtered_query, vector_column)
-                except Exception as exc:  # pragma: no cover - depends on external DB
-                    self._show_error('Could not inspect geometry types: {}'.format(exc))
-                    continue
-
-                for vector_layer in self._create_geometry_layers(
-                    filtered_query,
-                    vector_column,
-                    group_name,
-                    geometry_types,
-                ):
-                    added_layers.append(vector_layer.name())
-                    self._add_layer_to_group(group, vector_layer)
-
-            if import_group and import_group[1] in ('GeoTransformImage', 'WorldView3Image'):
-                try:
-                    with psycopg2.connect(**self._connection_kwargs()) as connection:
-                        with connection.cursor() as cursor:
-                            if schema_name:
-                                self._set_search_path(cursor, schema_name)
-                            raster_row_map = self._get_raster_row_map(
-                                cursor,
-                                self._last_query_state['raster_source'],
-                                self._last_query_state['raster_key_columns'],
-                                self._last_query_state['raster_columns'],
-                                import_group=import_group,
-                            )
-                except Exception as exc:  # pragma: no cover - depends on external DB
-                    self._show_error('Could not inspect raster rows: {}'.format(exc))
-                    continue
-
-                for raster_column, row_filters in raster_row_map.items():
-                    for row_filter, row_label in row_filters:
-                        raster_layer = self._create_raster_layer(
-                            self._last_query_state['raster_source'],
-                            raster_column,
-                            row_filter,
-                            '{} {} {}'.format(group_name, raster_column, row_label),
-                        )
-                        if raster_layer is not None:
-                            added_layers.append(raster_layer.name())
-                            self._add_layer_to_group(group, raster_layer, insert_at_top=True)
+        grouped_urls = self._build_grouped_image_urls(query_rows)
+        for group_path, image_urls in grouped_urls.items():
+            if not image_urls:
+                continue
+            parent_group = root_group
+            for part in group_path:
+                parent_group = self._ensure_child_group(parent_group, part)
+            thumbnail_group = self._ensure_child_group(parent_group, 'thumbnail')
+            geometry_group = self._ensure_child_group(parent_group, 'geometry')
+            added_layers.extend(self._add_thumbnail_layers(thumbnail_group, image_urls))
+            added_layers.extend(self._add_geometry_layers(geometry_group, image_urls))
 
         if added_layers:
             self._show_info(
-                'Loaded {} rows into {} layer(s) under "{}".'.format(
-                    self._last_query_state['row_count'],
+                'Loaded {} layer(s) under "{}".'.format(
                     len(added_layers),
                     query_name,
                 )
             )
         else:
             self._show_error('Nothing was added to the map from the current preview.')
+
+    def _fetch_query_rows(self):
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        rows = []
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    select_items = sql.SQL(', ').join(
+                        sql.SQL('q.{}').format(sql.Identifier(column_name))
+                        for column_name in self._last_query_state['column_names']
+                    )
+                    cursor.execute(
+                        sql.SQL('SELECT {} FROM ({}) AS q').format(
+                            select_items,
+                            sql.SQL(self._last_query_state['live_query']),
+                        )
+                    )
+                    rows = cursor.fetchall()
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not load query rows: {}'.format(exc))
+        return rows
+
+    def _build_grouped_image_urls(self, query_rows):
+        grouped_urls = {}
+        column_names = self._last_query_state['column_names']
+        image_url_index = column_names.index('image_url')
+
+        for row in query_rows:
+            image_url_value = row[image_url_index]
+            image_urls = self._normalize_image_urls(image_url_value)
+            if not image_urls:
+                continue
+
+            is_grouped_row = isinstance(image_url_value, (list, tuple)) or (
+                isinstance(image_url_value, str)
+                and image_url_value.startswith('{')
+                and image_url_value.endswith('}')
+            )
+            if is_grouped_row:
+                group_path = tuple(
+                    '{}'.format(value)
+                    for column_name, value in zip(column_names, row)
+                    if column_name != 'image_url'
+                )
+            else:
+                group_path = tuple()
+
+            grouped_urls.setdefault(group_path, [])
+            for image_url in image_urls:
+                if image_url not in grouped_urls[group_path]:
+                    grouped_urls[group_path].append(image_url)
+
+        return grouped_urls
+
+    def _normalize_image_urls(self, value):
+        if isinstance(value, (list, tuple)):
+            return [item for item in value if item]
+        if not value:
+            return []
+        if isinstance(value, str) and value.startswith('{') and value.endswith('}'):
+            stripped = value[1:-1].strip()
+            if not stripped:
+                return []
+            return [item.strip().strip('"') for item in stripped.split(',') if item.strip()]
+        return [str(value)]
+
+    def _ensure_child_group(self, parent_group, label):
+        for child in parent_group.children():
+            if isinstance(child, QgsLayerTreeGroup) and child.name() == label:
+                return child
+        return parent_group.addGroup(label)
+
+    def _add_thumbnail_layers(self, group, image_urls):
+        added_layers = []
+        raster_source = self._last_query_state.get('raster_source')
+        raster_columns = self._last_query_state.get('raster_columns') or []
+        if not raster_source or not raster_columns:
+            return added_layers
+
+        supported_image_urls = self._get_thumbnail_image_urls(image_urls)
+        for image_url in supported_image_urls:
+            row_filter = self._build_thumbnail_row_filter(image_url)
+            for raster_column in raster_columns:
+                raster_layer = self._create_raster_layer(
+                    raster_source,
+                    raster_column,
+                    row_filter,
+                    os.path.basename(image_url) or image_url,
+                )
+                if raster_layer is not None:
+                    added_layers.append(raster_layer.name())
+                    self._add_layer_to_group(group, raster_layer, insert_at_top=True)
+        return added_layers
+
+    def _build_thumbnail_row_filter(self, image_url):
+        safe_image_url = image_url.replace('$lldb$', '')
+        return "\"image_url\" = $lldb${}$lldb$".format(safe_image_url)
+
+    def _add_geometry_layers(self, group, image_urls):
+        added_layers = []
+        vector_column = self._last_query_state.get('source_vector_column') or self._last_query_state.get('vector_column')
+        if not vector_column or not image_urls:
+            return added_layers
+
+        filtered_query = self._build_image_url_query(image_urls)
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        geometry_types = []
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    geometry_types = self._get_geometry_types(cursor, filtered_query, vector_column)
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not inspect geometry types: {}'.format(exc))
+            return added_layers
+
+        geometry_families = self._geometry_families(geometry_types)
+        if len(geometry_families) <= 1:
+            layer = self._create_vector_layer(filtered_query, vector_column, 'geometry')
+            if layer is not None:
+                added_layers.append(layer.name())
+                self._add_layer_to_group(group, layer)
+            return added_layers
+
+        for family in geometry_families:
+            family_query = self._build_geometry_family_query(filtered_query, vector_column, family)
+            layer = self._create_vector_layer(family_query, vector_column, family)
+            if layer is not None:
+                added_layers.append(layer.name())
+                self._add_layer_to_group(group, layer)
+        return added_layers
+
+    def _build_image_url_query(self, image_urls):
+        filters = [
+            "q.image_url = $lldb${}$lldb$".format(image_url.replace('$lldb$', ''))
+            for image_url in image_urls
+        ]
+        return "SELECT * FROM ({}) AS q WHERE {}".format(
+            self._build_source_query(),
+            " OR ".join(filters),
+        )
+
+    def _geometry_families(self, geometry_types):
+        families = []
+        for geometry_type in geometry_types:
+            normalized = geometry_type.upper()
+            if 'POINT' in normalized:
+                family = 'points'
+            elif 'POLYGON' in normalized:
+                family = 'polygons'
+            elif 'LINE' in normalized:
+                family = 'lines'
+            else:
+                family = normalized.replace('ST_', '').lower()
+            if family not in families:
+                families.append(family)
+        return families
+
+    def _build_geometry_family_query(self, filtered_query, geometry_column, family):
+        if family == 'points':
+            match = "LIKE 'ST_%Point'"
+        elif family == 'polygons':
+            match = "LIKE 'ST_%Polygon'"
+        elif family == 'lines':
+            match = "LIKE 'ST_%LineString'"
+        else:
+            match = "= '{}'".format(family)
+        return (
+            "SELECT * FROM ({}) AS q WHERE ST_GeometryType(q.{}) {}".format(
+                filtered_query,
+                self._quote_identifier(geometry_column),
+                match,
+            )
+        )
 
     def _build_live_query(self, sql_text):
         return 'SELECT row_number() OVER () AS {key}, src.* FROM ({sql}) AS src'.format(
@@ -596,6 +724,42 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             'table': match.group('table_q') or match.group('table_u'),
             'where': (match.group('where') or '').strip(),
         }
+
+    def _parse_query_source(self, sql_text):
+        match = self.SOURCE_TABLE_RE.search(sql_text.strip())
+        if not match:
+            return None
+
+        tail = match.group('tail') or ''
+        where_clause = ''
+        where_match = re.search(
+            r'\bWHERE\b(?P<where>.*?)(?=\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bOFFSET\b|$)',
+            tail,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if where_match:
+            where_clause = where_match.group('where').strip()
+
+        return {
+            'schema': match.group('schema_q') or match.group('schema_u') or 'public',
+            'table': match.group('table_q') or match.group('table_u'),
+            'where': where_clause,
+        }
+
+    def _build_source_query_from_source(self, query_source):
+        base_query = 'SELECT * FROM "{}"."{}"'.format(
+            query_source['schema'].replace('"', '""'),
+            query_source['table'].replace('"', '""'),
+        )
+        if query_source.get('where'):
+            base_query = '{} WHERE {}'.format(base_query, query_source['where'])
+        return self._build_live_query(base_query)
+
+    def _build_source_query(self):
+        query_source = self._last_query_state.get('query_source')
+        if not query_source:
+            return self._last_query_state['live_query']
+        return self._build_source_query_from_source(query_source)
 
     def _open_spatial_query_dialog(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -643,6 +807,101 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             )
         self._insert_sql(snippet)
         self._show_info('Spatial query text inserted. Adjust it if needed.')
+
+    def _open_metadata_query_menu(self):
+        button = self.row_five_layout.itemAt(1).widget()
+        if button is None:
+            return
+
+        menu = QtWidgets.QMenu(button)
+        metadata_classes = [
+            ('GeoTaggedImage', GeoTaggedImage),
+            ('GeoTransformImage', GeoTransformImage),
+            ('WorldView3Image', WorldView3Image),
+        ]
+        metadata_schemas = {
+            label: importer_cls._get_metadata()
+            for label, importer_cls in metadata_classes
+        }
+        base_schema = self._metadata_schema_intersection(list(metadata_schemas.values()))
+        if base_schema:
+            submenu = menu.addMenu('Base')
+            self._populate_metadata_submenu(submenu, base_schema, [])
+
+        for label, _importer_cls in metadata_classes:
+            unique_schema = self._metadata_schema_difference(
+                metadata_schemas[label],
+                base_schema,
+            )
+            if not unique_schema:
+                continue
+            submenu = menu.addMenu(label)
+            self._populate_metadata_submenu(
+                submenu,
+                unique_schema,
+                [],
+            )
+
+        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _metadata_schema_intersection(self, schemas):
+        if not schemas:
+            return {}
+
+        first_schema = schemas[0]
+        shared = {}
+        for key, value in first_schema.items():
+            if not all(isinstance(schema, dict) and key in schema for schema in schemas[1:]):
+                continue
+            other_values = [schema[key] for schema in schemas[1:]]
+            if isinstance(value, dict) and all(isinstance(other, dict) for other in other_values):
+                nested_shared = self._metadata_schema_intersection(
+                    [value] + other_values
+                )
+                if nested_shared:
+                    shared[key] = nested_shared
+            else:
+                shared[key] = value
+        return shared
+
+    def _metadata_schema_difference(self, schema, base_schema):
+        if not isinstance(schema, dict):
+            return schema
+
+        difference = {}
+        for key, value in schema.items():
+            if key not in base_schema:
+                difference[key] = value
+                continue
+            base_value = base_schema[key]
+            if isinstance(value, dict) and isinstance(base_value, dict):
+                nested_difference = self._metadata_schema_difference(value, base_value)
+                if nested_difference:
+                    difference[key] = nested_difference
+        return difference
+
+    def _populate_metadata_submenu(self, menu, metadata, path_parts):
+        for key, value in metadata.items():
+            current_path = path_parts + [key]
+            if isinstance(value, dict):
+                submenu = menu.addMenu(key)
+                self._populate_metadata_submenu(submenu, value, current_path)
+                continue
+            action = menu.addAction(key)
+            action.triggered.connect(
+                lambda _checked=False, path=current_path: self._insert_sql(
+                    self._metadata_sql_expression(path)
+                )
+            )
+
+    def _metadata_sql_expression(self, path_parts):
+        if not path_parts:
+            return 'metadata'
+        sql_parts = ["metadata::jsonb"]
+        for key in path_parts[:-1]:
+            sql_parts.append("->'{}'".format(key.replace("'", "''")))
+        sql_parts.append("->>'{}'".format(path_parts[-1].replace("'", "''")))
+        return ''.join(sql_parts)
 
     def _set_search_path(self, cursor, schema_name):
         cursor.execute(
@@ -728,109 +987,11 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         return cursor.fetchone() is not None
 
-    def _get_raster_row_map(self, cursor, raster_source, key_columns, raster_columns, import_group=None):
-        raster_row_map = {}
-        if not raster_source or not key_columns:
-            if raster_source and raster_columns:
-                self._show_error(
-                    'Raster loading requires a primary key or image_url on "{}"."{}".'.format(
-                        raster_source['schema'],
-                        raster_source['table'],
-                    )
-                )
-            return raster_row_map
-
-        has_metadata_column = self._table_has_column(cursor, raster_source, 'metadata')
-
-        for raster_column in raster_columns:
-            filter_parts = []
-            if raster_source['where']:
-                filter_parts.append(sql.SQL('({})').format(sql.SQL(raster_source['where'])))
-            filter_parts.append(sql.SQL('{} IS NOT NULL').format(sql.Identifier(raster_column)))
-            if has_metadata_column:
-                if import_group:
-                    filter_parts.append(
-                        sql.SQL(
-                            "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = {}"
-                        ).format(sql.Literal(import_group[0]))
-                    )
-                    filter_parts.append(
-                        sql.SQL(
-                            "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = {}"
-                        ).format(sql.Literal(import_group[1]))
-                    )
-                    filter_parts.append(
-                        sql.SQL(
-                            "coalesce(metadata::jsonb->'input_params'->>'search_re', '') = {}"
-                        ).format(sql.Literal(import_group[2]))
-                    )
-                else:
-                    filter_parts.append(
-                        sql.SQL(
-                            "coalesce(metadata::jsonb->'input_params'->>'import_type', '') IN ('GeoTransformImage', 'WorldView3Image')"
-                        )
-                    )
-
-            key_filter_exprs = []
-            key_label_exprs = []
-            for key_column in key_columns:
-                key_identifier = sql.Identifier(key_column)
-                if key_column == 'image_url':
-                    key_filter_exprs.append(
-                        sql.SQL("""'"{}" = $lldb$' || {}::text || '$lldb$'""").format(
-                            sql.SQL(key_column.replace('"', '""')),
-                            key_identifier,
-                        )
-                    )
-                else:
-                    key_filter_exprs.append(
-                        sql.SQL("""'"{}" = ' || quote_nullable({})""").format(
-                            sql.SQL(key_column.replace('"', '""')),
-                            key_identifier,
-                        )
-                    )
-                key_label_exprs.append(sql.SQL("""coalesce({}::text, 'NULL')""").format(key_identifier))
-
-            cursor.execute(
-                sql.SQL('SELECT {}, {} FROM {}.{} WHERE {}').format(
-                    sql.SQL(" || ' AND ' || ").join(key_filter_exprs),
-                    sql.SQL(" || ',' || ").join(key_label_exprs),
-                    sql.Identifier(raster_source['schema']),
-                    sql.Identifier(raster_source['table']),
-                    sql.SQL(' AND ').join(filter_parts),
-                )
-            )
-            raster_row_map[raster_column] = list(cursor.fetchall())
-        return raster_row_map
-
     def _find_first_column(self, column_info, udt_names):
         for column in column_info:
             if column['udt_name'] in udt_names:
                 return column['name']
         return None
-
-    def _get_query_import_groups(self, cursor, query_text, column_info):
-        column_names = {column['name'] for column in column_info}
-        if 'metadata' not in column_names:
-            return []
-
-        cursor.execute(
-            sql.SQL(
-                """
-                SELECT DISTINCT
-                    q.metadata::jsonb->'input_params'->>'query_from' AS query_from,
-                    q.metadata::jsonb->'input_params'->>'import_type' AS import_type,
-                    q.metadata::jsonb->'input_params'->>'search_re' AS search_re
-                FROM ({}) AS q
-                WHERE q.metadata::jsonb ? 'input_params'
-                ORDER BY 1, 2, 3
-                """
-            ).format(sql.SQL(query_text))
-        )
-        return [
-            normalize_import_parameter_row(row[0], row[1], row[2])
-            for row in cursor.fetchall()
-        ]
 
     def _get_geometry_types(self, cursor, query_text, geometry_column):
         cursor.execute(
@@ -847,88 +1008,56 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         return [row[0] for row in cursor.fetchall() if row and row[0]]
 
-    def _setup_results_controls(self):
-        header_layout = self.results_tab_layout
-        results_label_index = header_layout.indexOf(self.results_label)
-        if results_label_index < 0:
-            return
+    def _get_thumbnail_image_urls(self, image_urls):
+        raster_source = self._last_query_state.get('raster_source')
+        if not raster_source or not image_urls:
+            return []
 
-        header_layout.removeWidget(self.results_label)
-        self.results_label.hide()
-
-        self.results_header_widget = QtWidgets.QWidget(self.results_tab)
-        self.results_header_layout = QtWidgets.QHBoxLayout(self.results_header_widget)
-        self.results_header_layout.setContentsMargins(0, 0, 0, 0)
-        self.results_header_layout.setSpacing(6)
-
-        self.results_prefix_label = QtWidgets.QLabel('Results (', self.results_header_widget)
-        self.results_header_layout.addWidget(self.results_prefix_label)
-
-        self.results_start_spin = QtWidgets.QSpinBox(self.results_header_widget)
-        self.results_start_spin.setRange(0, 1000000000)
-        self.results_start_spin.setValue(0)
-        self.results_start_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
-        self.results_start_spin.setMinimumWidth(64)
-        self.results_header_layout.addWidget(self.results_start_spin)
-
-        self.results_dash_label = QtWidgets.QLabel('-', self.results_header_widget)
-        self.results_header_layout.addWidget(self.results_dash_label)
-
-        self.results_end_spin = QtWidgets.QSpinBox(self.results_header_widget)
-        self.results_end_spin.setRange(0, 1000000000)
-        self.results_end_spin.setValue(self.PREVIEW_LIMIT)
-        self.results_end_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
-        self.results_end_spin.setMinimumWidth(64)
-        self.results_header_layout.addWidget(self.results_end_spin)
-
-        self.results_total_label = QtWidgets.QLabel('/ 0)', self.results_header_widget)
-        self.results_header_layout.addWidget(self.results_total_label)
-
-        self.results_update_button = QtWidgets.QPushButton('Update', self.results_header_widget)
-        self.results_update_button.clicked.connect(self._update_results_preview)
-        self.results_header_layout.addWidget(self.results_update_button)
-        self.results_header_layout.addStretch()
-
-        header_layout.insertWidget(results_label_index, self.results_header_widget)
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    if not self._table_has_column(cursor, raster_source, 'metadata'):
+                        return list(image_urls)
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            SELECT image_url
+                            FROM {}.{}
+                            WHERE image_url = ANY(%s)
+                              AND coalesce(metadata::jsonb->'input_params'->>'import_type', '') = ANY(%s)
+                            """
+                        ).format(
+                            sql.Identifier(raster_source['schema']),
+                            sql.Identifier(raster_source['table']),
+                        ),
+                        (list(image_urls), list(self.THUMBNAIL_IMPORT_TYPE_NAMES)),
+                    )
+                    return [row[0] for row in cursor.fetchall() if row and row[0]]
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not inspect thumbnail rows: {}'.format(exc))
+            return []
 
     def _preview_start_value(self):
-        return self.results_start_spin.value()
+        return self.results_controller.preview_range()[0]
 
     def _preview_end_value(self):
-        return self.results_end_spin.value()
+        return self.results_controller.preview_range()[1]
 
     def _validated_preview_range(self):
-        start_row = self._preview_start_value()
-        end_row = self._preview_end_value()
-        if end_row < start_row:
-            start_row, end_row = end_row, start_row
-            self.results_start_spin.setValue(start_row)
-            self.results_end_spin.setValue(end_row)
-        return start_row, end_row
+        return self.results_controller.preview_range()
 
     def _update_results_preview(self):
         self._run_query_preview(add_to_history=False)
 
     def _set_results_label(self, preview_count, total_count):
-        start_row, end_row = self._validated_preview_range()
-        actual_start = min(start_row, total_count)
-        actual_end = min(end_row, total_count)
-        if actual_end < actual_start:
-            actual_end = actual_start
-        self.results_total_label.setText('/ {})'.format(total_count))
-        self.results_start_spin.setValue(actual_start)
-        self.results_end_spin.setValue(actual_end if total_count else end_row)
+        _ = preview_count
+        self.results_controller.set_label(total_count)
 
     def _populate_preview(self, column_info, rows, total_count):
-        self.results_table.clear()
-        self.results_table.setColumnCount(len(column_info))
-        self.results_table.setHorizontalHeaderLabels([column['name'] for column in column_info])
-        self.results_table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            for column_index, value in enumerate(row):
-                self.results_table.setItem(row_index, column_index, QTableWidgetItem('' if value is None else str(value)))
-        self.results_table.resizeColumnsToContents()
-        self._set_results_label(len(rows), total_count)
+        self.results_controller.populate_preview(column_info, rows, total_count)
 
     def _create_uri(self):
         uri = QgsDataSourceUri()
@@ -973,53 +1102,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         layer = QgsVectorLayer(uri.uri(False), layer_name, 'postgres')
         return layer if layer.isValid() else None
 
-    def _create_geometry_layers(self, query_text, geometry_column, layer_name, geometry_types):
-        if not geometry_types:
-            layer = self._create_vector_layer(query_text, geometry_column, layer_name)
-            return [layer] if layer is not None else []
-
-        if len(geometry_types) == 1:
-            layer = self._create_vector_layer(query_text, geometry_column, layer_name)
-            return [layer] if layer is not None else []
-
-        layers = []
-        for geometry_type in geometry_types:
-            suffix = geometry_type.replace('ST_', '').lower()
-            filtered_query = (
-                "SELECT * FROM ({}) AS q WHERE ST_GeometryType(q.{}) = '{}'".format(
-                    query_text,
-                    self._quote_identifier(geometry_column),
-                    geometry_type.replace("'", "''"),
-                )
-            )
-            layer = self._create_vector_layer(
-                filtered_query,
-                geometry_column,
-                '{} {}'.format(layer_name, suffix),
-            )
-            if layer is not None:
-                layers.append(layer)
-        return layers
-
     def _quote_identifier(self, value):
         return '"{}"'.format(value.replace('"', '""'))
-
-    def _build_import_group_query(self, query_text, import_group):
-        if not import_group:
-            return query_text
-
-        query_from, import_type, search_re = import_group
-        return (
-            "SELECT * FROM ({}) AS q "
-            "WHERE coalesce(q.metadata::jsonb->'input_params'->>'query_from', '') = '{}' "
-            "AND coalesce(q.metadata::jsonb->'input_params'->>'import_type', '') = '{}' "
-            "AND coalesce(q.metadata::jsonb->'input_params'->>'search_re', '') = '{}'"
-        ).format(
-            query_text,
-            query_from.replace("'", "''"),
-            import_type.replace("'", "''"),
-            search_re.replace("'", "''"),
-        )
 
     def _create_raster_layer(self, raster_source, raster_column, row_filter, layer_name):
         layer = QgsRasterLayer(self._build_postgres_raster_uri(raster_source, raster_column, row_filter), layer_name, 'gdal')
