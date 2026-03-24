@@ -10,10 +10,11 @@
 from qgis.PyQt import QtWidgets
 from qgis.PyQt.QtGui import QIcon
 
+import os
+
 from .tabs.import_tab import ImportTab
 from .tabs.query_tab import QueryTab
 from .tabs.setup_tab import SetupTab
-import os
 
 
 class LandlensdbDialog(QtWidgets.QDialog):
@@ -43,3 +44,4 @@ class LandlensdbDialog(QtWidgets.QDialog):
         self.setup_tab.connectionSaved.connect(self.query_tab.reload_connection_settings)
         self.query_tab.connectionSaved.connect(self.setup_tab.set_connection_values)
         self.setup_tab.connectionSaved.connect(self.import_tab.reload_connection_settings)
+        self.query_tab.connectionSaved.connect(self.import_tab.reload_connection_settings)

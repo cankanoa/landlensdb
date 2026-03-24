@@ -61,6 +61,11 @@ class ImportTab(QtWidgets.QWidget):
     HEADERS = ['', 'Actions', 'import_type', 'query_from', 'search_re']
     ADD_TABLE_SENTINEL = '__add_table__'
     IMPORT_TYPES = ['', 'GeoTaggedImage', 'GeoTransformImage', 'WorldView3Image']
+    IMPORT_EXAMPLE = (
+        "query_from: /data/images\n"
+        "import_type: GeoTaggedImage\n"
+        r"search_re: .*\.JPG$"
+    )
 
     def __init__(self, iface, parent=None):
         super(ImportTab, self).__init__(parent)
@@ -75,12 +80,20 @@ class ImportTab(QtWidgets.QWidget):
         layout.setSpacing(10)
 
         top_row = QtWidgets.QHBoxLayout()
-        top_row.addWidget(QtWidgets.QLabel('Table:'))
+        self.table_help_button = QtWidgets.QToolButton(self)
+        self.table_help_button.setText('?')
+        self.table_help_button.setAutoRaise(True)
+        self.table_help_button.setToolTip('How the table section works')
+        self.table_help_button.clicked.connect(self._show_table_help)
+        top_row.addWidget(self.table_help_button)
+        self.table_label = QtWidgets.QLabel('Table:')
+        top_row.addWidget(self.table_label)
         self.table_button = QtWidgets.QToolButton()
         self.table_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.table_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.table_button.setArrowType(QtCore.Qt.DownArrow)
         self.table_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.table_button.setStyleSheet('')
         top_row.addWidget(self.table_button, 1)
         self.refresh_table_button = QtWidgets.QToolButton()
         self.refresh_table_button.setAutoRaise(True)
@@ -165,6 +178,17 @@ class ImportTab(QtWidgets.QWidget):
         self.load_records([])
         self._reset_progress()
         self._set_import_active(False)
+
+    def _show_table_help(self):
+        QtWidgets.QMessageBox.information(
+            self,
+            'Table',
+            (
+                "Choose the table that stores your imported image rows. Each saved trio "
+                "in the table defines what folder to search, which importer to use, and "
+                "what files to match.\n\nExample:\n{}"
+            ).format(self.IMPORT_EXAMPLE),
+        )
 
     def showEvent(self, event):
         super(ImportTab, self).showEvent(event)

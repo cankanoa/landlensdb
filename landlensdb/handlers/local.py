@@ -1,8 +1,8 @@
+import hashlib
 import numbers
 import re
-import warnings
-import hashlib
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -24,86 +24,6 @@ try:
 except ImportError:
     gdal = None
     osr = None
-
-
-WORLDVIEW3_PRODUCT_FIELDS = (
-    "generationTime",
-    "productOrderId",
-    "productCatalogId",
-    "childCatalogId",
-    "imageDescriptor",
-    "productScale",
-    "productAccuracy",
-    "RMSE2D",
-    "bandId",
-    "panSharpenAlgorithm",
-    "numRows",
-    "numColumns",
-    "productLevel",
-    "productType",
-    "numberOfLooks",
-    "radiometricLevel",
-    "radiometricEnhancement",
-    "bitsPerPixel",
-    "compressionType",
-)
-
-WORLDVIEW3_IMAGE_FIELDS = (
-    "satId",
-    "mode",
-    "scanDirection",
-    "CatId",
-    "firstLineTime",
-    "avgLineRate",
-    "exposureDuration",
-    "minCollectedRowGSD",
-    "maxCollectedRowGSD",
-    "meanCollectedRowGSD",
-    "minCollectedColGSD",
-    "maxCollectedColGSD",
-    "meanCollectedColGSD",
-    "meanCollectedGSD",
-    "rowUncertainty",
-    "colUncertainty",
-    "minSunAz",
-    "maxSunAz",
-    "meanSunAz",
-    "minSunEl",
-    "maxSunEl",
-    "meanSunEl",
-    "minSatAz",
-    "maxSatAz",
-    "meanSatAz",
-    "minSatEl",
-    "maxSatEl",
-    "meanSatEl",
-    "minInTrackViewAngle",
-    "maxInTrackViewAngle",
-    "meanInTrackViewAngle",
-    "minCrossTrackViewAngle",
-    "maxCrossTrackViewAngle",
-    "meanCrossTrackViewAngle",
-    "minOffNadirViewAngle",
-    "maxOffNadirViewAngle",
-    "meanOffNadirViewAngle",
-    "PNIIRS",
-    "cloudCover",
-    "resamplingKernel",
-    "positionKnowledgeSrc",
-    "attitudeKnowledgeSrc",
-    "revNumber",
-)
-
-WORLDVIEW3_BOUND_KEYS = (
-    "ULLon",
-    "ULLat",
-    "URLon",
-    "URLat",
-    "LRLon",
-    "LRLat",
-    "LLLon",
-    "LLLat",
-)
 
 
 class SearchLocalToGeoImageFrame:
@@ -281,8 +201,89 @@ class SearchLocalToGeoImageFrame:
             return
         progress_callback(processed, total)
 
+    @classmethod
+    def _get_metadata(
+        cls,
+        query_from=None,
+        import_type=None,
+        search_re=None,
+        source=None,
+        fingerprint=None,
+        raster=None,
+        captured_at=None,
+    ):
+        return {
+            "input_params": {
+                "query_from": query_from,
+                "import_type": import_type or cls.__name__,
+                "search_re": search_re,
+            },
+            "source": source
+            or {
+                "path": None,
+                "name": None,
+                "suffix": None,
+            },
+            "fingerprint": fingerprint
+            or {
+                "mode": None,
+                "algorithm": None,
+                "value": None,
+            },
+            "raster": raster
+            or {
+                "width": None,
+                "height": None,
+                "bands": None,
+                "projection": None,
+                "geotransform": None,
+                "format": None,
+            },
+            "captured_at": captured_at or _empty_captured_at(),
+        }
+
 class GeoTaggedImage(SearchLocalToGeoImageFrame):
     """Importer for EXIF geotagged images."""
+
+    @classmethod
+    def _get_metadata(
+        cls,
+        query_from=None,
+        import_type=None,
+        search_re=None,
+        source=None,
+        fingerprint=None,
+        raster=None,
+        captured_at=None,
+        camera_data=None,
+        sensor_data=None,
+    ):
+        metadata = super()._get_metadata(
+            query_from=query_from,
+            import_type=import_type,
+            search_re=search_re,
+            source=source,
+            fingerprint=fingerprint,
+            raster=raster,
+            captured_at=captured_at,
+        )
+        metadata.update(
+            {
+                "camera": camera_data
+                or {
+                    "focal_length": None,
+                    "camera_type": None,
+                    "camera_parameters": None,
+                },
+                "sensor": sensor_data
+                or {
+                    "altitude": None,
+                    "compass_angle": None,
+                    "exif_orientation": None,
+                },
+            }
+        )
+        return metadata
 
     @classmethod
     def load(
@@ -334,15 +335,13 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
             latitude=geometry_data["latitude"],
             longitude=geometry_data["longitude"],
         )
-        metadata = _build_metadata(
+        metadata = cls._get_metadata(
             source=source,
             query_from=query_from,
             import_type=import_type or cls.__name__,
             search_re=search_re,
             fingerprint=fingerprint_data,
             raster=raster,
-            exif_data=exif_data,
-            geotags=geometry_data["geotags"],
             captured_at=captured_at,
             camera_data=camera_data,
             sensor_data=sensor_data,
@@ -366,6 +365,27 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
 
 class GeoTransformImage(SearchLocalToGeoImageFrame):
     """Importer for raster images that already contain a geotransform."""
+
+    @classmethod
+    def _get_metadata(
+        cls,
+        query_from=None,
+        import_type=None,
+        search_re=None,
+        source=None,
+        fingerprint=None,
+        raster=None,
+        captured_at=None,
+    ):
+        return super()._get_metadata(
+            query_from=query_from,
+            import_type=import_type,
+            search_re=search_re,
+            source=source,
+            fingerprint=fingerprint,
+            raster=raster,
+            captured_at=captured_at,
+        )
 
     @classmethod
     def load(
@@ -395,16 +415,15 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
             create_thumbnail=create_thumbnail,
             thumbnail_size=thumbnail_size,
         )
-        metadata = {
-            "input_params": {
-                "query_from": query_from,
-                "import_type": import_type or cls.__name__,
-                "search_re": search_re,
-            },
-            "source": source,
-            "fingerprint": fingerprint_data,
-            "raster": raster,
-        }
+        metadata = cls._get_metadata(
+            source=source,
+            query_from=query_from,
+            import_type=import_type or cls.__name__,
+            search_re=search_re,
+            fingerprint=fingerprint_data,
+            raster=raster,
+            captured_at=_empty_captured_at(),
+        )
 
         image_data = {
             "name": source["name"],
@@ -424,6 +443,163 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
 
 class WorldView3Image(SearchLocalToGeoImageFrame):
     """Importer for WorldView-3 `.IMD` metadata packages."""
+
+    @classmethod
+    def _worldview3_product_fields(cls):
+        return (
+            "generationTime",
+            "productOrderId",
+            "productCatalogId",
+            "childCatalogId",
+            "imageDescriptor",
+            "productScale",
+            "productAccuracy",
+            "RMSE2D",
+            "bandId",
+            "panSharpenAlgorithm",
+            "numRows",
+            "numColumns",
+            "productLevel",
+            "productType",
+            "numberOfLooks",
+            "radiometricLevel",
+            "radiometricEnhancement",
+            "bitsPerPixel",
+            "compressionType",
+        )
+
+    @classmethod
+    def _worldview3_image_fields(cls):
+        return (
+            "satId",
+            "mode",
+            "scanDirection",
+            "CatId",
+            "firstLineTime",
+            "avgLineRate",
+            "exposureDuration",
+            "meanCollectedRowGSD",
+            "meanCollectedColGSD",
+            "meanCollectedGSD",
+            "rowUncertainty",
+            "colUncertainty",
+            "meanSunAz",
+            "meanSunEl",
+            "meanSatAz",
+            "meanSatEl",
+            "meanInTrackViewAngle",
+            "meanCrossTrackViewAngle",
+            "meanOffNadirViewAngle",
+            "PNIIRS",
+            "cloudCover",
+            "resamplingKernel",
+            "positionKnowledgeSrc",
+            "attitudeKnowledgeSrc",
+            "revNumber",
+        )
+
+    @classmethod
+    def _worldview3_bound_keys(cls):
+        return (
+            "ULLon",
+            "ULLat",
+            "URLon",
+            "URLat",
+            "LRLon",
+            "LRLat",
+            "LLLon",
+            "LLLat",
+        )
+
+    @classmethod
+    def _get_metadata(
+        cls,
+        query_from=None,
+        import_type=None,
+        search_re=None,
+        source=None,
+        fingerprint=None,
+        raster=None,
+        captured_at=None,
+        worldview3_product=None,
+        worldview3_image=None,
+        worldview3_preview=None,
+    ):
+        metadata = super()._get_metadata(
+            query_from=query_from,
+            import_type=import_type,
+            search_re=search_re,
+            source=source,
+            fingerprint=fingerprint,
+            raster=raster,
+            captured_at=captured_at,
+        )
+        metadata.update(
+            {
+                "platform": {
+                    "satellite_id": _metadata_value(worldview3_image, "satId"),
+                    "mode": _metadata_value(worldview3_image, "mode"),
+                    "scan_direction": _metadata_value(worldview3_image, "scanDirection"),
+                    "catalog_id": _metadata_value(worldview3_image, "CatId"),
+                    "revolution_number": _metadata_value(worldview3_image, "revNumber"),
+                },
+                "product": {
+                    "generation_time": _metadata_value(worldview3_product, "generationTime"),
+                    "order_id": _metadata_value(worldview3_product, "productOrderId"),
+                    "product_catalog_id": _metadata_value(worldview3_product, "productCatalogId"),
+                    "child_catalog_id": _metadata_value(worldview3_product, "childCatalogId"),
+                    "descriptor": _metadata_value(worldview3_product, "imageDescriptor"),
+                    "scale": _metadata_value(worldview3_product, "productScale"),
+                    "band_id": _metadata_value(worldview3_product, "bandId"),
+                    "pan_sharpen_algorithm": _metadata_value(worldview3_product, "panSharpenAlgorithm"),
+                    "rows": _metadata_value(worldview3_product, "numRows"),
+                    "columns": _metadata_value(worldview3_product, "numColumns"),
+                    "level": _metadata_value(worldview3_product, "productLevel"),
+                    "type": _metadata_value(worldview3_product, "productType"),
+                    "number_of_looks": _metadata_value(worldview3_product, "numberOfLooks"),
+                    "radiometric_level": _metadata_value(worldview3_product, "radiometricLevel"),
+                    "radiometric_enhancement": _metadata_value(worldview3_product, "radiometricEnhancement"),
+                    "bits_per_pixel": _metadata_value(worldview3_product, "bitsPerPixel"),
+                    "compression_type": _metadata_value(worldview3_product, "compressionType"),
+                    "resampling_kernel": _metadata_value(worldview3_image, "resamplingKernel"),
+                },
+                "acquisition": {
+                    "line_rate": _metadata_value(worldview3_image, "avgLineRate"),
+                    "exposure_duration": _metadata_value(worldview3_image, "exposureDuration"),
+                    "mean_row_gsd": _metadata_value(worldview3_image, "meanCollectedRowGSD"),
+                    "mean_column_gsd": _metadata_value(worldview3_image, "meanCollectedColGSD"),
+                    "mean_gsd": _metadata_value(worldview3_image, "meanCollectedGSD"),
+                },
+                "accuracy": {
+                    "product_accuracy": _metadata_value(worldview3_product, "productAccuracy"),
+                    "rmse_2d": _metadata_value(worldview3_product, "RMSE2D"),
+                    "row_uncertainty": _metadata_value(worldview3_image, "rowUncertainty"),
+                    "column_uncertainty": _metadata_value(worldview3_image, "colUncertainty"),
+                    "pniirs": _metadata_value(worldview3_image, "PNIIRS"),
+                    "cloud_cover": _metadata_value(worldview3_image, "cloudCover"),
+                    "position_knowledge_source": _metadata_value(worldview3_image, "positionKnowledgeSrc"),
+                    "attitude_knowledge_source": _metadata_value(worldview3_image, "attitudeKnowledgeSrc"),
+                },
+                "illumination": {
+                    "sun_azimuth": _metadata_value(worldview3_image, "meanSunAz"),
+                    "sun_elevation": _metadata_value(worldview3_image, "meanSunEl"),
+                },
+                "view_geometry": {
+                    "satellite_azimuth": _metadata_value(worldview3_image, "meanSatAz"),
+                    "satellite_elevation": _metadata_value(worldview3_image, "meanSatEl"),
+                    "in_track_view_angle": _metadata_value(worldview3_image, "meanInTrackViewAngle"),
+                    "cross_track_view_angle": _metadata_value(worldview3_image, "meanCrossTrackViewAngle"),
+                    "off_nadir_view_angle": _metadata_value(worldview3_image, "meanOffNadirViewAngle"),
+                },
+                "preview": worldview3_preview
+                or {
+                    "browse_path": None,
+                    "projection": None,
+                    "bounds": {key: None for key in cls._worldview3_bound_keys()},
+                },
+            }
+        )
+        return metadata
 
     @classmethod
     def load(
@@ -454,25 +630,22 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
         else:
             raster = _get_raster_metadata(browse_path)
 
-        metadata = {
-            "input_params": {
-                "query_from": query_from,
-                "import_type": import_type or cls.__name__,
-                "search_re": search_re,
+        metadata = cls._get_metadata(
+            source=source,
+            query_from=query_from,
+            import_type=import_type or cls.__name__,
+            search_re=search_re,
+            fingerprint=fingerprint_data,
+            raster=raster,
+            captured_at=_extract_worldview3_captured_at(worldview3_data["image"]),
+            worldview3_product=worldview3_data["product"],
+            worldview3_image=worldview3_data["image"],
+            worldview3_preview={
+                "browse_path": str(browse_path),
+                "projection": "EPSG:4326",
+                "bounds": worldview3_data["bounds"],
             },
-            "source": source,
-            "fingerprint": fingerprint_data,
-            "raster": raster,
-            "worldview3": {
-                "product": worldview3_data["product"],
-                "image": worldview3_data["image"],
-                "preview": {
-                    "browse_path": str(browse_path),
-                    "projection": "EPSG:4326",
-                    "bounds": worldview3_data["bounds"],
-                },
-            },
-        }
+        )
 
         image_data = {
             "name": source["name"],
@@ -644,6 +817,50 @@ def _metadata_lookup(metadata, key_path):
     return current
 
 
+def _metadata_value(mapping, key):
+    if not isinstance(mapping, dict):
+        return None
+    return mapping.get(key)
+
+
+def _empty_captured_at():
+    return {
+        "raw": None,
+        "year": None,
+        "month": None,
+        "day": None,
+        "hour": None,
+        "minute": None,
+    }
+
+
+def _build_captured_at(raw_value, parsed_datetime=None):
+    captured_at = _empty_captured_at()
+    captured_at["raw"] = raw_value
+    if parsed_datetime is not None:
+        captured_at.update(
+            {
+                "year": parsed_datetime.year,
+                "month": parsed_datetime.month,
+                "day": parsed_datetime.day,
+                "hour": parsed_datetime.hour,
+                "minute": parsed_datetime.minute,
+            }
+        )
+    return captured_at
+
+
+def _extract_worldview3_captured_at(worldview3_image):
+    raw_value = _metadata_value(worldview3_image, "firstLineTime")
+    if not raw_value:
+        return _empty_captured_at()
+    try:
+        parsed_datetime = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return _build_captured_at(raw_value)
+    return _build_captured_at(raw_value, parsed_datetime)
+
+
 def _apply_additional_columns(image_data, metadata, additional_columns):
     """Apply user-requested derived metadata columns to the record."""
     for column_info in additional_columns or []:
@@ -683,6 +900,9 @@ def _parse_worldview3_value(value):
 
 def _parse_worldview3_imd(image_path):
     """Parse product, image, and first-band bounds from a WorldView-3 IMD file."""
+    product_fields = WorldView3Image._worldview3_product_fields()
+    image_fields = WorldView3Image._worldview3_image_fields()
+    bound_keys = WorldView3Image._worldview3_bound_keys()
     product = {}
     image = {}
     first_band_bounds = None
@@ -704,13 +924,13 @@ def _parse_worldview3_imd(image_path):
                 if current_group == "IMAGE_1":
                     image = {
                         key: group_values[key]
-                        for key in WORLDVIEW3_IMAGE_FIELDS
+                        for key in image_fields
                         if key in group_values
                     }
                 elif current_group and current_group.startswith("BAND_") and first_band_bounds is None:
                     first_band_bounds = {
                         key: float(group_values[key])
-                        for key in WORLDVIEW3_BOUND_KEYS
+                        for key in bound_keys
                         if key in group_values
                     }
 
@@ -725,12 +945,12 @@ def _parse_worldview3_imd(image_path):
             parsed_value = _parse_worldview3_value(value)
 
             if current_group is None:
-                if key in WORLDVIEW3_PRODUCT_FIELDS:
+                if key in product_fields:
                     product[key] = parsed_value
             else:
                 group_values[key] = parsed_value
 
-    missing_bounds = [key for key in WORLDVIEW3_BOUND_KEYS if first_band_bounds is None or key not in first_band_bounds]
+    missing_bounds = [key for key in bound_keys if first_band_bounds is None or key not in first_band_bounds]
     if missing_bounds:
         raise ValueError(
             f"Missing WorldView-3 bounds in {image_path}: {', '.join(missing_bounds)}"
@@ -861,7 +1081,7 @@ def _extract_geometry_from_geotransform(image_path, raster):
 
 
 def _extract_datetime(exif_data, latitude, longitude):
-    """Extract ISO-8601 capture time from EXIF DateTime."""
+    """Extract structured capture time from EXIF DateTime."""
     tf = TimezoneFinder()
     captured_at_str = exif_data.get("DateTime")
     if captured_at_str:
@@ -871,9 +1091,10 @@ def _extract_datetime(exif_data, latitude, longitude):
         tz_name = tf.timezone_at(lat=latitude, lng=longitude)
         if tz_name:
             local_tz = pytz.timezone(tz_name)
-            return local_tz.localize(captured_at_naive).isoformat()
-        return captured_at_naive.isoformat()
-    return None
+            localized = local_tz.localize(captured_at_naive)
+            return _build_captured_at(captured_at_str, localized)
+        return _build_captured_at(captured_at_str, captured_at_naive)
+    return _empty_captured_at()
 
 
 def _extract_camera(exif_data, get_focal_length, infer_camera_type):
@@ -923,37 +1144,6 @@ def _extract_worldview3_thumbnail(browse_path, bounds, create_thumbnail):
     if not create_thumbnail:
         return None
     return _create_worldview3_thumbnail_dataset(browse_path, bounds)
-
-
-def _build_metadata(
-    source,
-    query_from,
-    import_type,
-    search_re,
-    fingerprint,
-    raster,
-    exif_data,
-    geotags,
-    captured_at,
-    camera_data,
-    sensor_data,
-):
-    """Build the metadata dictionary stored on the record."""
-    return {
-        "input_params": {
-            "query_from": query_from,
-            "import_type": import_type,
-            "search_re": search_re,
-        },
-        "source": source,
-        "fingerprint": fingerprint,
-        "raster": raster,
-        "exif": exif_data,
-        "gps": geotags,
-        "captured_at": captured_at,
-        "camera": camera_data,
-        "sensor": sensor_data,
-    }
 
 
 def _get_exif_data(img):
