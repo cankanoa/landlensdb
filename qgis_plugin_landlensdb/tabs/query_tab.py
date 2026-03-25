@@ -101,13 +101,11 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
-        self.add_button.clicked.connect(
-            lambda: self.add_last_query_to_map(add_thumbnail=True, add_geometry=True)
-        )
         self.close_button.clicked.connect(self._close_parent_dialog)
         self.commands_toggle_button.toggled.connect(self._toggle_commands)
         self.history_menu_button.clicked.connect(self._show_history_menu)
         self.star_menu_button.clicked.connect(self._show_star_menu)
+        self.sql_input.textChanged.connect(self._update_add_buttons_state)
 
         self.results_table.setColumnCount(0)
         self.results_table.setRowCount(0)
@@ -157,6 +155,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._render_dynamic_buttons([], [])
         self._update_connection_button_text()
         self._set_results_label(0, 0)
+        self._update_add_buttons_state()
 
     def showEvent(self, event):
         super(QueryTab, self).showEvent(event)
@@ -198,8 +197,16 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         if isinstance(window, QtWidgets.QDialog):
             window.close()
 
+    def _update_add_buttons_state(self):
+        has_sql = bool(self.sql_input.toPlainText().strip())
+        self.add_menu_button.setEnabled(has_sql)
+
     def _setup_add_menu(self):
         add_menu = QtWidgets.QMenu(self.add_button)
+        add_both_action = add_menu.addAction('Add Both')
+        add_both_action.triggered.connect(
+            lambda: self.add_last_query_to_map(add_thumbnail=True, add_geometry=True)
+        )
         add_thumbnail_action = add_menu.addAction('Add Thumbnail')
         add_thumbnail_action.triggered.connect(
             lambda: self.add_last_query_to_map(add_thumbnail=True, add_geometry=False)
@@ -209,18 +216,17 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             lambda: self.add_last_query_to_map(add_thumbnail=False, add_geometry=True)
         )
 
-        self.add_menu_button = QtWidgets.QToolButton(self)
-        self.add_menu_button.setText('')
-        self.add_menu_button.setArrowType(QtCore.Qt.DownArrow)
-        self.add_menu_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.add_menu_button = QtWidgets.QPushButton('Add', self)
+        self.add_menu_button.setText('Add')
         self.add_menu_button.setMenu(add_menu)
-        self.add_menu_button.setStyleSheet('QToolButton::menu-indicator { image: none; width: 0px; }')
         self.add_menu_button.setEnabled(False)
 
         if hasattr(self, 'buttonLayout'):
             index = self.buttonLayout.indexOf(self.add_button)
             if index >= 0:
-                self.buttonLayout.insertWidget(index + 1, self.add_menu_button)
+                self.buttonLayout.insertWidget(index, self.add_menu_button)
+                self.buttonLayout.removeWidget(self.add_button)
+                self.add_button.hide()
 
     def _prepare_workbench_ui(self):
         if hasattr(self, 'headerLayout'):
@@ -421,7 +427,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                         """,
                         (schema_name,),
                     )
-                    tables = ['"{}"."{}"'.format(schema_name, row[0]) for row in cursor.fetchall()]
+                    tables = ['"{}"'.format(row[0]) for row in cursor.fetchall()]
                     cursor.execute(
                         """
                         SELECT column_name
@@ -507,6 +513,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             self._add_history_item(sql_text)
         self._last_query_state = {
             'query_name': query_name,
+            'sql_text': sql_text,
             'live_query': live_query,
             'query_source': query_source,
             'column_info': column_info,
@@ -518,14 +525,21 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             'raster_key_columns': raster_key_columns,
             'row_count': row_count,
         }
-        self.add_button.setEnabled(True)
-        self.add_menu_button.setEnabled(True)
+        self._update_add_buttons_state()
         self.bottom_tabs.setCurrentWidget(self.results_tab)
         self._show_info('Previewed {} row(s). Click Add to load layers into the map.'.format(row_count))
 
     def add_last_query_to_map(self, add_thumbnail=True, add_geometry=True):
+        sql_text = self.sql_input.toPlainText().strip().rstrip(';')
+        if not sql_text:
+            self._show_error('Missing required fields: SQL')
+            return
+        if (
+            not self._last_query_state
+            or self._last_query_state.get('sql_text') != sql_text
+        ):
+            self._run_query_preview(add_to_history=False)
         if not self._last_query_state:
-            self._show_error('Run Query first to preview results before adding to the map.')
             return
         if 'image_url' not in self._last_query_state.get('column_names', []):
             self._show_error('Add requires an "image_url" column in the query results.')
