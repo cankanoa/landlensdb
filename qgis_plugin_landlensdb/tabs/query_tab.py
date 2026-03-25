@@ -8,6 +8,9 @@
 """
 import os
 import re
+import csv
+import io
+import json
 from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
@@ -98,6 +101,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._metadata_loaded = False
         self._last_query_state = None
         self._thumbnail_support_cache = {}
+        self._staged_metadata_items = []
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
@@ -115,6 +119,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.results_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.add_button.setEnabled(False)
         self._setup_add_menu()
+        self._setup_copy_menu()
 
         self.builder_controller = SqlBuilderController(
             self,
@@ -227,6 +232,106 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 self.buttonLayout.insertWidget(index, self.add_menu_button)
                 self.buttonLayout.removeWidget(self.add_button)
                 self.add_button.hide()
+
+    def _setup_copy_menu(self):
+        self.copy_menu = QtWidgets.QMenu(self)
+        self.copy_menu.aboutToShow.connect(self._populate_copy_menu)
+
+        self.copy_menu_button = QtWidgets.QPushButton('Copy', self)
+        self.copy_menu_button.setMenu(self.copy_menu)
+
+        if hasattr(self, 'buttonLayout'):
+            index = self.buttonLayout.indexOf(self.add_menu_button)
+            if index >= 0:
+                self.buttonLayout.insertWidget(index + 1, self.copy_menu_button)
+
+    def _populate_copy_menu(self):
+        self.copy_menu.clear()
+
+        select_menu = self.copy_menu.addMenu('Select')
+        self._populate_metadata_sections(select_menu, self._stage_metadata_item)
+
+        staged_menu = self.copy_menu.addMenu('Staged')
+        if not self._staged_metadata_items:
+            empty_action = staged_menu.addAction('No staged items')
+            empty_action.setEnabled(False)
+        else:
+            for staged_item in self._staged_metadata_items:
+                action = staged_menu.addAction(staged_item['label'])
+                action.triggered.connect(
+                    lambda _checked=False, item=staged_item['label']: self._unstage_metadata_item(item)
+                )
+
+        self.copy_menu.addSeparator()
+        copy_action = self.copy_menu.addAction('Copy')
+        copy_action.setEnabled(bool(self._staged_metadata_items))
+        copy_action.triggered.connect(self.copy_last_query_to_csv)
+
+    def _stage_metadata_item(self, section_label, path_parts):
+        label = self._metadata_stage_label(section_label, path_parts)
+        for item in self._staged_metadata_items:
+            if item['label'] == label:
+                return
+        self._staged_metadata_items.append(
+            {
+                'label': label,
+                'section': section_label,
+                'path': tuple(path_parts),
+            }
+        )
+
+    def _unstage_metadata_item(self, label):
+        self._staged_metadata_items = [
+            item for item in self._staged_metadata_items if item['label'] != label
+        ]
+
+    def _metadata_stage_label(self, section_label, path_parts):
+        return '{}.{}'.format(section_label, '.'.join(path_parts))
+
+    def copy_last_query_to_csv(self):
+        sql_text = self.sql_input.toPlainText().strip().rstrip(';')
+        if not sql_text:
+            self._show_error('Missing required fields: SQL')
+            return
+        if not self._staged_metadata_items:
+            self._show_error('Select at least one metadata item to copy.')
+            return
+        if (
+            not self._last_query_state
+            or self._last_query_state.get('sql_text') != sql_text
+        ):
+            self._run_query_preview(add_to_history=False)
+        if not self._last_query_state:
+            return
+        if 'image_url' not in self._last_query_state.get('column_names', []):
+            self._show_error('Copy requires an "image_url" column in the query results.')
+            return
+
+        query_rows = self._fetch_query_rows()
+        if not query_rows:
+            self._show_error('The query returned no rows to copy.')
+            return
+
+        formatted_query_rows = self._fetch_query_rows(formatted=True)
+        entries = self._build_grouped_entries(query_rows, display_rows=formatted_query_rows)
+        metadata_by_image_url = self._fetch_metadata_by_image_url(
+            [
+                image_url
+                for entry in entries
+                for image_url in entry['image_urls']
+            ]
+        )
+        csv_text = self._build_copy_output(entries, metadata_by_image_url)
+        if not csv_text.strip():
+            self._show_error('Nothing was available to copy from the current query.')
+            return
+
+        QtWidgets.QApplication.clipboard().setText(csv_text)
+        self._show_info(
+            'Copied {} staged metadata item(s) to the clipboard.'.format(
+                len(self._staged_metadata_items)
+            )
+        )
 
     def _prepare_workbench_ui(self):
         if hasattr(self, 'headerLayout'):
@@ -556,17 +661,17 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             return
 
         added_layers = []
-        grouped_urls = self._build_grouped_image_urls(query_rows)
-        for group_path, image_urls in grouped_urls.items():
-            if not image_urls:
+        entries = self._build_grouped_entries(query_rows)
+        for entry in entries:
+            if not entry['image_urls']:
                 continue
             parent_group = root_group
-            for part in group_path:
+            for part in entry['group_values']:
                 parent_group = self._ensure_child_group(parent_group, part)
             added_layers.extend(
                 self._add_group_layers(
                     parent_group,
-                    image_urls,
+                    entry['image_urls'],
                     add_thumbnail=add_thumbnail,
                     add_geometry=add_geometry,
                 )
@@ -582,7 +687,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         else:
             self._show_error('Nothing was added to the map from the current preview.')
 
-    def _fetch_query_rows(self):
+    def _fetch_query_rows(self, formatted=False):
         schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
         rows = []
         try:
@@ -590,10 +695,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 with connection.cursor() as cursor:
                     if schema_name:
                         self._set_search_path(cursor, schema_name)
-                    select_items = sql.SQL(', ').join(
-                        sql.SQL('q.{}').format(sql.Identifier(column_name))
-                        for column_name in self._last_query_state['column_names']
-                    )
+                    select_items = self._build_query_select_items(formatted=formatted)
                     cursor.execute(
                         sql.SQL('SELECT {} FROM ({}) AS q').format(
                             select_items,
@@ -605,12 +707,14 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             self._show_error('Could not load query rows: {}'.format(exc))
         return rows
 
-    def _build_grouped_image_urls(self, query_rows):
-        grouped_urls = {}
+    def _build_grouped_entries(self, query_rows, display_rows=None):
+        grouped_entries = {}
         column_names = self._last_query_state['column_names']
         image_url_index = column_names.index('image_url')
+        if display_rows is None:
+            display_rows = query_rows
 
-        for row in query_rows:
+        for row, display_row in zip(query_rows, display_rows):
             image_url_value = row[image_url_index]
             image_urls = self._normalize_image_urls(image_url_value)
             if not image_urls:
@@ -622,20 +726,45 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 and image_url_value.endswith('}')
             )
             if is_grouped_row:
-                group_path = tuple(
+                group_columns = tuple(
+                    column_name
+                    for column_name in column_names
+                    if column_name not in ('image_url', self.KEY_COLUMN)
+                )
+                group_values = tuple(
                     '{}'.format(value)
                     for column_name, value in zip(column_names, row)
                     if column_name not in ('image_url', self.KEY_COLUMN)
                 )
             else:
-                group_path = tuple()
+                group_columns = tuple()
+                group_values = tuple()
 
-            grouped_urls.setdefault(group_path, [])
+            field_values = {
+                column_name: value
+                for column_name, value in zip(column_names, display_row)
+                if column_name not in ('image_url', self.KEY_COLUMN)
+            }
+            entry = grouped_entries.setdefault(
+                group_values,
+                {
+                    'group_columns': group_columns,
+                    'group_values': group_values,
+                    'image_urls': [],
+                    'rows': [],
+                },
+            )
+            entry['rows'].append(
+                {
+                    'field_values': field_values,
+                    'image_urls': image_urls,
+                }
+            )
             for image_url in image_urls:
-                if image_url not in grouped_urls[group_path]:
-                    grouped_urls[group_path].append(image_url)
+                if image_url not in entry['image_urls']:
+                    entry['image_urls'].append(image_url)
 
-        return grouped_urls
+        return list(grouped_entries.values())
 
     def _normalize_image_urls(self, value):
         if isinstance(value, (list, tuple)):
@@ -878,6 +1007,13 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             return
 
         menu = QtWidgets.QMenu(button)
+        self._populate_metadata_sections(
+            menu,
+            lambda _section, path: self._insert_sql(self._metadata_sql_expression(path)),
+        )
+        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _populate_metadata_sections(self, menu, leaf_callback):
         metadata_classes = [
             ('GeoTaggedImage', GeoTaggedImage),
             ('GeoTransformImage', GeoTransformImage),
@@ -890,7 +1026,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         base_schema = self._metadata_schema_intersection(list(metadata_schemas.values()))
         if base_schema:
             submenu = menu.addMenu('Base')
-            self._populate_metadata_submenu(submenu, base_schema, [])
+            self._populate_metadata_submenu(submenu, base_schema, [], 'Base', leaf_callback)
 
         for label, _importer_cls in metadata_classes:
             unique_schema = self._metadata_schema_difference(
@@ -904,9 +1040,9 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 submenu,
                 unique_schema,
                 [],
+                label,
+                leaf_callback,
             )
-
-        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
 
     def _metadata_schema_intersection(self, schemas):
         if not schemas:
@@ -944,17 +1080,24 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                     difference[key] = nested_difference
         return difference
 
-    def _populate_metadata_submenu(self, menu, metadata, path_parts):
+    def _populate_metadata_submenu(self, menu, metadata, path_parts, section_label, leaf_callback):
         for key, value in metadata.items():
             current_path = path_parts + [key]
             if isinstance(value, dict):
                 submenu = menu.addMenu(key)
-                self._populate_metadata_submenu(submenu, value, current_path)
+                self._populate_metadata_submenu(
+                    submenu,
+                    value,
+                    current_path,
+                    section_label,
+                    leaf_callback,
+                )
                 continue
             action = menu.addAction(key)
             action.triggered.connect(
-                lambda _checked=False, path=current_path: self._insert_sql(
-                    self._metadata_sql_expression(path)
+                lambda _checked=False, path=current_path, section=section_label: leaf_callback(
+                    section,
+                    path,
                 )
             )
 
@@ -966,6 +1109,115 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             sql_parts.append("->'{}'".format(key.replace("'", "''")))
         sql_parts.append("->>'{}'".format(path_parts[-1].replace("'", "''")))
         return ''.join(sql_parts)
+
+    def _fetch_metadata_by_image_url(self, image_urls):
+        if not image_urls:
+            return {}
+
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        metadata_by_image_url = {}
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    cursor.execute(
+                        sql.SQL(
+                            'SELECT q.image_url, q.metadata FROM ({}) AS q WHERE q.image_url = ANY(%s)'
+                        ).format(sql.SQL(self._build_source_query())),
+                        (list(image_urls),),
+                    )
+                    for image_url, metadata in cursor.fetchall():
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except Exception:
+                                metadata = {}
+                        metadata_by_image_url[image_url] = metadata or {}
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not load metadata rows: {}'.format(exc))
+        return metadata_by_image_url
+
+    def _build_copy_output(self, entries, metadata_by_image_url):
+        query_headers = []
+        if entries:
+            query_headers = list(entries[0]['group_columns'])
+        metadata_headers = self._metadata_copy_headers(query_headers)
+        entry_blocks = []
+        for entry in entries:
+            rows = []
+            for row_info in entry['rows']:
+                for image_url in row_info['image_urls']:
+                    row_values = [
+                        row_info['field_values'].get(column_name)
+                        for column_name in query_headers
+                    ]
+                    metadata = metadata_by_image_url.get(image_url, {})
+                    for item in self._staged_metadata_items:
+                        row_values.append(
+                            self._extract_metadata_value(metadata, item['path'])
+                        )
+                    rows.append(row_values)
+            if rows:
+                entry_blocks.append((entry, rows))
+
+        if not entry_blocks:
+            return ''
+
+        header_row = query_headers + metadata_headers
+        if not any(entry['group_columns'] for entry, _rows in entry_blocks):
+            return self._csv_block(
+                header_row,
+                [row for _entry, rows in entry_blocks for row in rows],
+            )
+
+        blocks = []
+        for entry, rows in entry_blocks:
+            heading = self._group_heading(entry)
+            csv_block = self._csv_block(header_row, rows)
+            blocks.append('{}\n{}'.format(heading, csv_block) if heading else csv_block)
+        return '\n\n'.join(blocks)
+
+    def _metadata_copy_headers(self, query_headers):
+        headers = []
+        used = set(header.lower() for header in query_headers)
+        for item in self._staged_metadata_items:
+            header = self._pretty_metadata_header(item['path'])
+            if header.lower() in used:
+                header = item['label'].split('.', 1)[-1]
+            headers.append(header)
+            used.add(header.lower())
+        return headers
+
+    def _pretty_metadata_header(self, path_parts):
+        if not path_parts:
+            return 'Metadata'
+        return path_parts[-1].replace('_', ' ').title()
+
+    def _extract_metadata_value(self, metadata, path_parts):
+        value = metadata or {}
+        for path_part in path_parts:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(path_part)
+        return value
+
+    def _group_heading(self, entry):
+        return '.'.join(
+            '{}={}'.format(
+                column_name.replace('_', ' ').title(),
+                value,
+            )
+            for column_name, value in zip(entry['group_columns'], entry['group_values'])
+        )
+
+    def _csv_block(self, headers, rows):
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(['' if value is None else value for value in row])
+        return stream.getvalue().strip()
 
     def _set_search_path(self, cursor, schema_name):
         cursor.execute(
@@ -981,6 +1233,26 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             cursor.execute('SELECT oid, typname FROM pg_type WHERE oid = ANY(%s)', (type_oids,))
             type_names = {oid: name for oid, name in cursor.fetchall()}
         return [{'name': description.name, 'udt_name': type_names.get(description.type_code, '')} for description in descriptions]
+
+    def _build_query_select_items(self, formatted=False):
+        if not formatted:
+            return sql.SQL(', ').join(
+                sql.SQL('q.{}').format(sql.Identifier(column_name))
+                for column_name in self._last_query_state['column_names']
+            )
+
+        select_items = []
+        for column in self._last_query_state['column_info']:
+            column_name = sql.Identifier(column['name'])
+            if column['udt_name'] in ('geometry', 'geography'):
+                select_items.append(
+                    sql.SQL('ST_AsText(q.{}) AS {}').format(column_name, column_name)
+                )
+            elif column['udt_name'] == 'raster':
+                select_items.append(sql.SQL("'[raster]' AS {}").format(column_name))
+            else:
+                select_items.append(sql.SQL('q.{}').format(column_name))
+        return sql.SQL(', ').join(select_items)
 
     def _get_preview_rows(self, cursor, query_text, column_info, start_row, end_row):
         select_items = []
