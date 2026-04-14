@@ -59,6 +59,7 @@ class SearchLocalToGeoImageFrame:
             all_records = []
             matched_file_count = 0
             load_tasks = []
+            task_failures = []
 
             for importer_ref, pattern in import_types.items():
                 if cancel_event is not None and cancel_event.is_set():
@@ -108,11 +109,13 @@ class SearchLocalToGeoImageFrame:
                 for task in load_tasks:
                     if cancel_event is not None and cancel_event.is_set():
                         raise ImportCancelledError("Image import cancelled.")
-                    record = cls._load_task(task)
+                    result = cls._load_task(task)
                     processed_count += 1
                     cls._report_progress(progress_callback, processed_count, total_tasks)
-                    if record is not None:
-                        all_records.append(record)
+                    if result["record"] is not None:
+                        all_records.append(result["record"])
+                    elif result["error"] is not None:
+                        task_failures.append(result)
             else:
                 executor = ThreadPoolExecutor(max_workers=max_workers)
                 try:
@@ -126,7 +129,7 @@ class SearchLocalToGeoImageFrame:
                             raise ImportCancelledError("Image import cancelled.")
                         image_path = futures[future]
                         try:
-                            record = future.result()
+                            result = future.result()
                         except Exception as exc:
                             warnings.warn(f"Error processing {image_path}: {exc}. Skipped.")
                             processed_count += 1
@@ -134,13 +137,20 @@ class SearchLocalToGeoImageFrame:
                             continue
                         processed_count += 1
                         cls._report_progress(progress_callback, processed_count, total_tasks)
-                        if record is not None:
-                            all_records.append(record)
+                        if result["record"] is not None:
+                            all_records.append(result["record"])
+                        elif result["error"] is not None:
+                            task_failures.append(result)
                 finally:
                     executor.shutdown(wait=False, cancel_futures=True)
 
             if not all_records:
-                raise ValueError("No valid images were processed into a GeoImageFrame.")
+                raise ValueError(
+                    cls._format_import_failure_message(
+                        matched_file_count,
+                        task_failures,
+                    )
+                )
 
             frame = GeoImageFrame(all_records, geometry="geometry")
             frame.set_crs(epsg=4326, inplace=True)
@@ -209,7 +219,7 @@ class SearchLocalToGeoImageFrame:
     @staticmethod
     def _load_task(task):
         try:
-            return task["importer_cls"].load(
+            record = task["importer_cls"].load(
                 image_path=task["image_path"],
                 query_from=task["query_from"],
                 search_glob=task["search_glob"],
@@ -222,9 +232,51 @@ class SearchLocalToGeoImageFrame:
                 thumbnail_size=task["thumbnail_size"],
                 fingerprint=task["fingerprint"],
             )
+            return {
+                "record": record,
+                "error": None,
+                "image_path": str(task["image_path"]),
+                "import_type": task["import_type"],
+            }
         except Exception as exc:
-            warnings.warn(f"Error processing {task['image_path']}: {exc}. Skipped.")
-            return None
+            message = (
+                f"Skipped {Path(task['image_path']).name} "
+                f"({task['import_type']}): {exc}"
+            )
+            warnings.warn(message)
+            return {
+                "record": None,
+                "error": str(exc),
+                "image_path": str(task["image_path"]),
+                "import_type": task["import_type"],
+            }
+
+    @staticmethod
+    def _format_import_failure_message(matched_file_count, task_failures, max_failures=5):
+        if not task_failures:
+            return (
+                "Matched {} file(s), but none could be imported into a GeoImageFrame."
+            ).format(matched_file_count)
+
+        summary_lines = [
+            "Matched {} file(s), but none could be imported.".format(
+                matched_file_count
+            ),
+            "First {} error(s):".format(min(len(task_failures), max_failures)),
+        ]
+        for failure in task_failures[:max_failures]:
+            summary_lines.append(
+                "- {} ({}): {}".format(
+                    Path(failure["image_path"]).name,
+                    failure["import_type"],
+                    failure["error"],
+                )
+            )
+        if len(task_failures) > max_failures:
+            summary_lines.append(
+                "- ... and {} more".format(len(task_failures) - max_failures)
+            )
+        return "\n".join(summary_lines)
 
     @staticmethod
     def _report_progress(progress_callback, processed, total):
@@ -1043,12 +1095,15 @@ def _parse_worldview3_value(value):
     value = value.strip().rstrip(";")
     if value.startswith('"') and value.endswith('"'):
         return value[1:-1]
-
-    if re.fullmatch(r"[-+]?\d+", value):
+    try:
         return int(value)
+    except (TypeError, ValueError):
+        pass
 
-    if re.fullmatch(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", value):
+    try:
         return float(value)
+    except (TypeError, ValueError):
+        pass
 
     return value
 
