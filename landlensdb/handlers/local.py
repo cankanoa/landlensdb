@@ -1,15 +1,18 @@
 import hashlib
+import glob
 import numbers
-import re
+import os
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
-
+import yaml
 import numpy as np
 import pytz
+from osgeo import gdal
+from osgeo import osr
 
 from PIL import Image
 from PIL.ExifTags import GPSTAGS, TAGS
@@ -18,21 +21,13 @@ from timezonefinder import TimezoneFinder
 
 from ..geoclasses.geoimageframe import GeoImageFrame
 
-try:
-    from osgeo import gdal
-    from osgeo import osr
-except ImportError:
-    gdal = None
-    osr = None
-
-
 class SearchLocalToGeoImageFrame:
     """Orchestrate file discovery and dispatch to importer classes."""
 
     def __new__(
         cls,
         directory: str,
-        import_types: dict[str | type, str] | None = {"GeoTaggedImage": r".*\.JPG$"},
+        import_types: dict[str | type, str] | None = {"GeoTaggedImage": "**/*.JPG"},
         additional_columns: list[str | tuple[str, str]] | None = None,
         create_thumbnail: bool = True,
         thumbnail_size: tuple[int, int] = (256, 256),
@@ -45,11 +40,11 @@ class SearchLocalToGeoImageFrame:
         """Return a `GeoImageFrame` directly from the import configuration."""
         if cls is SearchLocalToGeoImageFrame:
             if import_types is None:
-                import_types = {"GeoTaggedImage": r".*"}
+                import_types = {"GeoTaggedImage": "**/*"}
 
             if not isinstance(import_types, dict):
                 raise TypeError(
-                    "`import_types` must be a dict like {GeoTaggedImage: r'.*\\.JPG$'}."
+                    "`import_types` must be a dict like {GeoTaggedImage: '**/*.JPG'}."
                 )
 
             if not import_types:
@@ -74,7 +69,11 @@ class SearchLocalToGeoImageFrame:
                         "Importer keys must be subclasses of ImportImages."
                     )
 
-                image_paths = cls._discover_paths(directory, pattern)
+                pattern_config = cls._normalize_import_pattern_config(pattern)
+                image_paths = cls._discover_paths(
+                    directory,
+                    pattern_config["search_glob"],
+                )
                 if skip_images_in_postgresql is not None:
                     image_paths = skip_images_in_postgresql.filter_existing_rows(image_paths)
                 matched_file_count += len(image_paths)
@@ -84,8 +83,11 @@ class SearchLocalToGeoImageFrame:
                             "importer_cls": importer_cls,
                             "image_path": image_path,
                             "query_from": directory,
-                            "search_re": pattern,
+                            "search_glob": pattern_config["search_glob"],
                             "import_type": importer_cls.__name__,
+                            "additional_files_and_metadata_glob": pattern_config[
+                                "additional_files_and_metadata_glob"
+                            ],
                             "additional_columns": additional_columns,
                             "create_thumbnail": create_thumbnail,
                             "thumbnail_size": thumbnail_size,
@@ -159,23 +161,49 @@ class SearchLocalToGeoImageFrame:
 
         return importer
 
+    @staticmethod
+    def _normalize_import_pattern_config(pattern):
+        if isinstance(pattern, str):
+            return {
+                "search_glob": pattern,
+                "additional_files_and_metadata_glob": None,
+            }
+
+        if isinstance(pattern, dict):
+            search_glob = pattern.get("search_glob")
+            if not isinstance(search_glob, str):
+                raise TypeError(
+                    "Each `import_types` value dict must include a string `search_glob`."
+                )
+            additional_glob = pattern.get("additional_files_and_metadata_glob")
+            if additional_glob is not None and not isinstance(additional_glob, str):
+                raise TypeError(
+                    "`additional_files_and_metadata_glob` must be a string when provided."
+                )
+            return {
+                "search_glob": search_glob,
+                "additional_files_and_metadata_glob": additional_glob,
+            }
+
+        raise TypeError(
+            "Each `import_types` value must be a glob string or a dict with `search_glob`."
+        )
+
     @classmethod
     def _discover_paths(cls, directory, pattern):
-        """Resolve a single regex pattern against `directory`."""
-        base_path = Path(directory)
+        """Resolve a single glob pattern against `directory`."""
         if not isinstance(pattern, str):
-            raise TypeError("Each `import_types` value must be a single regex string.")
+            raise TypeError("Each `import_types` value must be a single glob string.")
+        if os.path.isabs(pattern):
+            search_pattern = pattern
+        else:
+            search_pattern = os.path.join(directory, pattern)
 
-        compiled_pattern = re.compile(pattern)
-        matched_paths = []
-        for path in base_path.rglob("*"):
-            if not path.is_file():
-                continue
-
-            relative_path = path.relative_to(base_path).as_posix()
-            file_name = path.name
-            if compiled_pattern.search(relative_path) or compiled_pattern.search(file_name):
-                matched_paths.append(path)
+        matched_paths = [
+            Path(path)
+            for path in glob.glob(search_pattern, recursive=True)
+            if os.path.isfile(path)
+        ]
         return sorted(set(matched_paths))
 
     @staticmethod
@@ -184,8 +212,11 @@ class SearchLocalToGeoImageFrame:
             return task["importer_cls"].load(
                 image_path=task["image_path"],
                 query_from=task["query_from"],
-                search_re=task["search_re"],
+                search_glob=task["search_glob"],
                 import_type=task["import_type"],
+                additional_files_and_metadata_glob=task[
+                    "additional_files_and_metadata_glob"
+                ],
                 additional_columns=task["additional_columns"],
                 create_thumbnail=task["create_thumbnail"],
                 thumbnail_size=task["thumbnail_size"],
@@ -201,22 +232,32 @@ class SearchLocalToGeoImageFrame:
             return
         progress_callback(processed, total)
 
+    @staticmethod
+    def _resolve_additional_files_and_metadata(image_path, additional_files_and_metadata_glob):
+        return _resolve_additional_files_and_metadata(
+            image_path,
+            additional_files_and_metadata_glob,
+        )
+
     @classmethod
     def _get_metadata(
         cls,
         query_from=None,
         import_type=None,
-        search_re=None,
+        search_glob=None,
         source=None,
         fingerprint=None,
         raster=None,
         captured_at=None,
+        additional_files_and_metadata_glob=None,
+        additional_files_and_metadata=None,
     ):
         return {
             "input_params": {
                 "query_from": query_from,
                 "import_type": import_type or cls.__name__,
-                "search_re": search_re,
+                "search_glob": search_glob,
+                "additional_files_and_metadata_glob": additional_files_and_metadata_glob,
             },
             "source": source
             or {
@@ -240,6 +281,12 @@ class SearchLocalToGeoImageFrame:
                 "format": None,
             },
             "captured_at": captured_at or _empty_captured_at(),
+            "additional_files_and_metadata": additional_files_and_metadata
+            or {
+                "additional_files_and_metadata_glob": additional_files_and_metadata_glob,
+                "files": [],
+                "metadata": {},
+            },
         }
 
 class GeoTaggedImage(SearchLocalToGeoImageFrame):
@@ -250,22 +297,26 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
         cls,
         query_from=None,
         import_type=None,
-        search_re=None,
+        search_glob=None,
         source=None,
         fingerprint=None,
         raster=None,
         captured_at=None,
         camera_data=None,
         sensor_data=None,
+        additional_files_and_metadata_glob=None,
+        additional_files_and_metadata=None,
     ):
         metadata = super()._get_metadata(
             query_from=query_from,
             import_type=import_type,
-            search_re=search_re,
+            search_glob=search_glob,
             source=source,
             fingerprint=fingerprint,
             raster=raster,
             captured_at=captured_at,
+            additional_files_and_metadata_glob=additional_files_and_metadata_glob,
+            additional_files_and_metadata=additional_files_and_metadata,
         )
         metadata.update(
             {
@@ -290,8 +341,9 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
         cls,
         image_path,
         query_from=None,
-        search_re=None,
+        search_glob=None,
         import_type=None,
+        additional_files_and_metadata_glob=None,
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
@@ -339,12 +391,17 @@ class GeoTaggedImage(SearchLocalToGeoImageFrame):
             source=source,
             query_from=query_from,
             import_type=import_type or cls.__name__,
-            search_re=search_re,
+            search_glob=search_glob,
             fingerprint=fingerprint_data,
             raster=raster,
             captured_at=captured_at,
             camera_data=camera_data,
             sensor_data=sensor_data,
+            additional_files_and_metadata_glob=additional_files_and_metadata_glob,
+            additional_files_and_metadata=_resolve_additional_files_and_metadata(
+                image_path,
+                additional_files_and_metadata_glob,
+            ),
         )
 
         image_data = {
@@ -371,20 +428,24 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
         cls,
         query_from=None,
         import_type=None,
-        search_re=None,
+        search_glob=None,
         source=None,
         fingerprint=None,
         raster=None,
         captured_at=None,
+        additional_files_and_metadata_glob=None,
+        additional_files_and_metadata=None,
     ):
         return super()._get_metadata(
             query_from=query_from,
             import_type=import_type,
-            search_re=search_re,
+            search_glob=search_glob,
             source=source,
             fingerprint=fingerprint,
             raster=raster,
             captured_at=captured_at,
+            additional_files_and_metadata_glob=additional_files_and_metadata_glob,
+            additional_files_and_metadata=additional_files_and_metadata,
         )
 
     @classmethod
@@ -392,8 +453,9 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
         cls,
         image_path,
         query_from=None,
-        search_re=None,
+        search_glob=None,
         import_type=None,
+        additional_files_and_metadata_glob=None,
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
@@ -419,10 +481,15 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
             source=source,
             query_from=query_from,
             import_type=import_type or cls.__name__,
-            search_re=search_re,
+            search_glob=search_glob,
             fingerprint=fingerprint_data,
             raster=raster,
             captured_at=_empty_captured_at(),
+            additional_files_and_metadata_glob=additional_files_and_metadata_glob,
+            additional_files_and_metadata=_resolve_additional_files_and_metadata(
+                image_path,
+                additional_files_and_metadata_glob,
+            ),
         )
 
         image_data = {
@@ -516,7 +583,7 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
         cls,
         query_from=None,
         import_type=None,
-        search_re=None,
+        search_glob=None,
         source=None,
         fingerprint=None,
         raster=None,
@@ -524,15 +591,19 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
         worldview3_product=None,
         worldview3_image=None,
         worldview3_preview=None,
+        additional_files_and_metadata_glob=None,
+        additional_files_and_metadata=None,
     ):
         metadata = super()._get_metadata(
             query_from=query_from,
             import_type=import_type,
-            search_re=search_re,
+            search_glob=search_glob,
             source=source,
             fingerprint=fingerprint,
             raster=raster,
             captured_at=captured_at,
+            additional_files_and_metadata_glob=additional_files_and_metadata_glob,
+            additional_files_and_metadata=additional_files_and_metadata,
         )
         metadata.update(
             {
@@ -606,8 +677,9 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
         cls,
         image_path,
         query_from=None,
-        search_re=None,
+        search_glob=None,
         import_type=None,
+        additional_files_and_metadata_glob=None,
         additional_columns=None,
         create_thumbnail=True,
         thumbnail_size=(256, 256),
@@ -634,7 +706,7 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
             source=source,
             query_from=query_from,
             import_type=import_type or cls.__name__,
-            search_re=search_re,
+            search_glob=search_glob,
             fingerprint=fingerprint_data,
             raster=raster,
             captured_at=_extract_worldview3_captured_at(worldview3_data["image"]),
@@ -645,6 +717,11 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
                 "projection": "EPSG:4326",
                 "bounds": worldview3_data["bounds"],
             },
+            additional_files_and_metadata_glob=additional_files_and_metadata_glob,
+            additional_files_and_metadata=_resolve_additional_files_and_metadata(
+                image_path,
+                additional_files_and_metadata_glob,
+            ),
         )
 
         image_data = {
@@ -871,6 +948,84 @@ def _apply_additional_columns(image_data, metadata, additional_columns):
             image_data[col_name] = _metadata_lookup(metadata, key_path)
 
     return image_data
+
+
+def _resolve_additional_files_and_metadata(image_path, additional_files_and_metadata_glob):
+    if not additional_files_and_metadata_glob:
+        return {
+            "additional_files_and_metadata_glob": additional_files_and_metadata_glob,
+            "files": [],
+            "metadata": {},
+        }
+
+    matched_files = _resolve_glob_matches(
+        image_path,
+        additional_files_and_metadata_glob,
+    )
+    metadata = {}
+    for matched_file in matched_files:
+        matched_file_str = str(matched_file)
+        if not (matched_file_str.endswith(".yml") or matched_file_str.endswith(".yaml")):
+            continue
+        parsed = _load_yaml_metadata(matched_file)
+        if isinstance(parsed, dict):
+            metadata = _deep_merge_dicts(metadata, parsed)
+        elif parsed is not None:
+            metadata[matched_file.stem] = parsed
+
+    return {
+        "additional_files_and_metadata_glob": additional_files_and_metadata_glob,
+        "files": [str(path) for path in matched_files],
+        "metadata": metadata,
+    }
+
+
+def _resolve_glob_matches(image_path, pattern):
+    image_path = Path(image_path)
+    substituted_pattern = pattern.replace("{base}", image_path.stem)
+    if os.path.isabs(substituted_pattern):
+        matches = glob.glob(substituted_pattern, recursive=True)
+        return sorted(Path(match).resolve() for match in matches if Path(match).is_file())
+
+    matches = glob.glob(
+        substituted_pattern,
+        root_dir=str(image_path.parent),
+        recursive=True,
+    )
+    resolved_matches = []
+    for match in matches:
+        resolved_path = (image_path.parent / match).resolve()
+        if resolved_path.is_file():
+            resolved_matches.append(resolved_path)
+    return sorted(set(resolved_matches))
+
+
+def _load_yaml_metadata(path):
+    if yaml is None:
+        warnings.warn(
+            "PyYAML is not installed; skipping YAML metadata parsing.",
+            stacklevel=2,
+        )
+        return None
+    with Path(path).open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    if loaded is None:
+        return {}
+    return _normalize_metadata_value(loaded)
+
+
+def _deep_merge_dicts(base, update):
+    merged = dict(base or {})
+    for key, value in (update or {}).items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _extract_source(image_path):
