@@ -1,8 +1,14 @@
-def normalize_import_parameter_row(query_from='', import_type='', search_re=''):
+def normalize_import_parameter_row(
+    query_from='',
+    import_type='',
+    search_glob='',
+    additional_files_and_metadata_glob='',
+):
     return (
         str(query_from or ''),
         str(import_type or ''),
-        str(search_re or ''),
+        str(search_glob or ''),
+        str(additional_files_and_metadata_glob or ''),
     )
 
 
@@ -16,7 +22,8 @@ def unique_import_parameter_rows(records):
         row = normalize_import_parameter_row(
             input_params.get('query_from', ''),
             input_params.get('import_type', ''),
-            input_params.get('search_re', ''),
+            input_params.get('search_glob', ''),
+            input_params.get('additional_files_and_metadata_glob', ''),
         )
         if row in seen or not any(row):
             continue
@@ -27,5 +34,12 @@ def unique_import_parameter_rows(records):
 
 
 def import_parameter_label(row):
-    query_from, import_type, search_re = normalize_import_parameter_row(*row)
-    return ' | '.join([import_type or '(blank)', query_from or '(blank)', search_re or '(blank)'])
+    query_from, import_type, search_glob, additional_glob = normalize_import_parameter_row(*row)
+    return ' | '.join(
+        [
+            import_type or '(blank)',
+            query_from or '(blank)',
+            search_glob or '(blank)',
+            additional_glob or '(blank)',
+        ]
+    )

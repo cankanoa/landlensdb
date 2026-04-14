@@ -102,6 +102,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._last_query_state = None
         self._thumbnail_support_cache = {}
         self._staged_metadata_items = []
+        self._additional_metadata_schema = {}
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
@@ -262,6 +263,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                     lambda _checked=False, item=staged_item['label']: self._unstage_metadata_item(item)
                 )
 
+        update_metadata_action = self.copy_menu.addAction('Update Metadata')
+        update_metadata_action.triggered.connect(self.refresh_additional_metadata_schema)
         self.copy_menu.addSeparator()
         copy_action = self.copy_menu.addAction('Copy')
         copy_action.setEnabled(bool(self._staged_metadata_items))
@@ -286,7 +289,73 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         ]
 
     def _metadata_stage_label(self, section_label, path_parts):
-        return '{}.{}'.format(section_label, '.'.join(path_parts))
+        display_parts = list(path_parts)
+        if (
+            section_label == 'AdditionalMetadata'
+            and display_parts
+            and display_parts[0] == 'additional_files_and_metadata'
+        ):
+            display_parts = display_parts[1:]
+        return '{}.{}'.format(section_label, '.'.join(display_parts))
+
+    def refresh_additional_metadata_schema(self):
+        sql_text = self.sql_input.toPlainText().strip().rstrip(';')
+        if not sql_text:
+            self._show_error('Missing required fields: SQL')
+            return
+
+        valid, message = self._validate_connection_values(self.connection_values)
+        if not valid:
+            self._show_error(message)
+            return
+
+        query_source = self._parse_query_source(sql_text)
+        query_text = (
+            self._build_source_query_from_source(query_source)
+            if query_source
+            else self._build_live_query(sql_text)
+        )
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        aggregated_schema = {}
+        files_present = False
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            SELECT q.metadata
+                            FROM ({}) AS q
+                            WHERE q.metadata IS NOT NULL
+                            """
+                        ).format(sql.SQL(query_text))
+                    )
+                    for (metadata,) in cursor.fetchall():
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except Exception:
+                                continue
+                        additional_data = (metadata or {}).get('additional_files_and_metadata') or {}
+                        if additional_data.get('files'):
+                            files_present = True
+                        aggregated_schema = self._merge_schema_values(
+                            aggregated_schema,
+                            {
+                                'metadata': additional_data.get('metadata') or {},
+                                'files': additional_data.get('files') or [],
+                            },
+                        )
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not refresh additional metadata: {}'.format(exc))
+            return
+
+        if not files_present:
+            aggregated_schema.pop('files', None)
+        self._additional_metadata_schema = aggregated_schema
+        self._show_info('Additional metadata refreshed from the current query source.')
 
     def copy_last_query_to_csv(self):
         sql_text = self.sql_input.toPlainText().strip().rstrip(';')
@@ -422,13 +491,36 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             except TypeError:
                 pass
             spatial_button.clicked.connect(self._open_spatial_query_dialog)
-        metadata_button = self.row_five_layout.itemAt(1).widget()
+        metadata_item = self.row_five_layout.takeAt(1)
+        metadata_button = metadata_item.widget() if metadata_item is not None else None
         if metadata_button is not None:
             try:
                 metadata_button.clicked.disconnect()
             except TypeError:
                 pass
             metadata_button.clicked.connect(self._open_metadata_query_menu)
+            self.metadata_query_button = metadata_button
+            metadata_group = QtWidgets.QWidget(self)
+            metadata_group_layout = QtWidgets.QHBoxLayout(metadata_group)
+            metadata_group_layout.setContentsMargins(0, 0, 0, 0)
+            metadata_group_layout.setSpacing(4)
+            metadata_group_layout.addWidget(metadata_button)
+
+            if not hasattr(self, 'additional_metadata_refresh_button'):
+                self.additional_metadata_refresh_button = QtWidgets.QToolButton(self)
+                self.additional_metadata_refresh_button.setAutoRaise(True)
+                self.additional_metadata_refresh_button.setIcon(
+                    self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
+                )
+                self.additional_metadata_refresh_button.setToolTip(
+                    'Refresh additional metadata from the current query source.'
+                )
+                self.additional_metadata_refresh_button.clicked.connect(
+                    self.refresh_additional_metadata_schema
+                )
+
+            metadata_group_layout.addWidget(self.additional_metadata_refresh_button)
+            self.row_five_layout.insertWidget(1, metadata_group)
 
     def _render_dynamic_buttons(self, tables, columns):
         table_items = [(table, table) for table in tables] or [('No tables', None)]
@@ -1002,7 +1094,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._show_info('Spatial query text inserted. Adjust it if needed.')
 
     def _open_metadata_query_menu(self):
-        button = self.row_five_layout.itemAt(1).widget()
+        button = getattr(self, 'metadata_query_button', None)
         if button is None:
             return
 
@@ -1020,7 +1112,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             ('WorldView3Image', WorldView3Image),
         ]
         metadata_schemas = {
-            label: importer_cls._get_metadata()
+            label: self._strip_additional_metadata_section(importer_cls._get_metadata())
             for label, importer_cls in metadata_classes
         }
         base_schema = self._metadata_schema_intersection(list(metadata_schemas.values()))
@@ -1043,6 +1135,25 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 label,
                 leaf_callback,
             )
+
+        if self._additional_metadata_schema:
+            submenu = menu.addMenu('AdditionalMetadata')
+            self._populate_metadata_submenu(
+                submenu,
+                self._additional_metadata_schema,
+                ['additional_files_and_metadata'],
+                'AdditionalMetadata',
+                leaf_callback,
+            )
+
+    def _strip_additional_metadata_section(self, metadata):
+        if not isinstance(metadata, dict):
+            return metadata
+        return {
+            key: value
+            for key, value in metadata.items()
+            if key != 'additional_files_and_metadata'
+        }
 
     def _metadata_schema_intersection(self, schemas):
         if not schemas:
@@ -1079,6 +1190,16 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 if nested_difference:
                     difference[key] = nested_difference
         return difference
+
+    def _merge_schema_values(self, current, value):
+        if isinstance(value, dict):
+            merged = dict(current or {})
+            for key, item in value.items():
+                merged[key] = self._merge_schema_values(merged.get(key), item)
+            return merged
+        if isinstance(value, list):
+            return None
+        return None
 
     def _populate_metadata_submenu(self, menu, metadata, path_parts, section_label, leaf_callback):
         for key, value in metadata.items():

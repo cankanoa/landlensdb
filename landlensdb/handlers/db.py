@@ -278,12 +278,12 @@ class Postgres:
     def remove_unmatched(
         self,
         directory: str,
-        import_types: dict[str | type, str] | None = {"GeoTaggedImage": r".*\.JPG$"},
+        import_types: dict[str | type, str] | None = {"GeoTaggedImage": "**/*.JPG"},
     ):
         if self.selected_table is None:
             raise ValueError("Select a table first with `table(table_name)`.")
         if import_types is None:
-            import_types = {"GeoTaggedImage": r".*"}
+            import_types = {"GeoTaggedImage": "**/*"}
         if not isinstance(import_types, dict) or not import_types:
             raise ValueError("`import_types` must be a non-empty dict.")
 
@@ -293,9 +293,13 @@ class Postgres:
         with self.engine.begin() as conn:
             for importer_ref, pattern in import_types.items():
                 importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(importer_ref)
+                pattern_config = SearchLocalToGeoImageFrame._normalize_import_pattern_config(pattern)
                 matched_paths = [
                     str(path)
-                    for path in SearchLocalToGeoImageFrame._discover_paths(directory, pattern)
+                    for path in SearchLocalToGeoImageFrame._discover_paths(
+                        directory,
+                        pattern_config["search_glob"],
+                    )
                 ]
 
                 delete_filters = [
@@ -306,13 +310,20 @@ class Postgres:
                         "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
                     ),
                     text(
-                        "coalesce(metadata::jsonb->'input_params'->>'search_re', '') = :search_re"
+                        "coalesce(metadata::jsonb->'input_params'->>'search_glob', '') = :search_glob"
+                    ),
+                    text(
+                        "coalesce(metadata::jsonb->'input_params'->>'additional_files_and_metadata_glob', '') = :additional_files_and_metadata_glob"
                     ),
                 ]
                 params = {
                     "query_from": directory,
                     "import_type": importer_cls.__name__,
-                    "search_re": pattern,
+                    "search_glob": pattern_config["search_glob"],
+                    "additional_files_and_metadata_glob": pattern_config[
+                        "additional_files_and_metadata_glob"
+                    ]
+                    or "",
                 }
 
                 if matched_paths:
@@ -327,12 +338,12 @@ class Postgres:
     def remove_all(
         self,
         directory: str,
-        import_types: dict[str | type, str] | None = {"GeoTaggedImage": r".*\.JPG$"},
+        import_types: dict[str | type, str] | None = {"GeoTaggedImage": "**/*.JPG"},
     ):
         if self.selected_table is None:
             raise ValueError("Select a table first with `table(table_name)`.")
         if import_types is None:
-            import_types = {"GeoTaggedImage": r".*"}
+            import_types = {"GeoTaggedImage": "**/*"}
         if not isinstance(import_types, dict) or not import_types:
             raise ValueError("`import_types` must be a non-empty dict.")
 
@@ -342,6 +353,7 @@ class Postgres:
         with self.engine.begin() as conn:
             for importer_ref, pattern in import_types.items():
                 importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(importer_ref)
+                pattern_config = SearchLocalToGeoImageFrame._normalize_import_pattern_config(pattern)
                 delete_stmt = self.selected_table.delete().where(
                     and_(
                         text(
@@ -351,7 +363,10 @@ class Postgres:
                             "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
                         ),
                         text(
-                            "coalesce(metadata::jsonb->'input_params'->>'search_re', '') = :search_re"
+                            "coalesce(metadata::jsonb->'input_params'->>'search_glob', '') = :search_glob"
+                        ),
+                        text(
+                            "coalesce(metadata::jsonb->'input_params'->>'additional_files_and_metadata_glob', '') = :additional_files_and_metadata_glob"
                         ),
                     )
                 )
@@ -360,12 +375,81 @@ class Postgres:
                     {
                         "query_from": directory,
                         "import_type": importer_cls.__name__,
-                        "search_re": pattern,
+                        "search_glob": pattern_config["search_glob"],
+                        "additional_files_and_metadata_glob": pattern_config[
+                            "additional_files_and_metadata_glob"
+                        ]
+                        or "",
                     },
                 )
                 deleted_rows += result.rowcount or 0
 
         return deleted_rows
+
+    def update_additional_files_and_metadata(
+        self,
+        directory: str,
+        import_types: dict[str | type, str] | None, # e.g.  {"GeoTaggedImage": "**/*.JPG"}
+    ):
+        if self.selected_table is None:
+            raise ValueError("Select a table first with `table(table_name)`.")
+        if import_types is None:
+            import_types = {"GeoTaggedImage": "**/*"}
+        if not isinstance(import_types, dict) or not import_types:
+            raise ValueError("`import_types` must be a non-empty dict.")
+
+        from .local import SearchLocalToGeoImageFrame
+
+        updated_rows = 0
+        with self.engine.begin() as conn:
+            for importer_ref, pattern in import_types.items():
+                importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(importer_ref)
+                pattern_config = SearchLocalToGeoImageFrame._normalize_import_pattern_config(pattern)
+                rows = conn.execute(
+                    select(self.selected_table.c.image_url, self.selected_table.c.metadata).where(
+                        and_(
+                            text(
+                                "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = :query_from"
+                            ),
+                            text(
+                                "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
+                            ),
+                            text(
+                                "coalesce(metadata::jsonb->'input_params'->>'search_glob', '') = :search_glob"
+                            ),
+                            text(
+                                "coalesce(metadata::jsonb->'input_params'->>'additional_files_and_metadata_glob', '') = :additional_files_and_metadata_glob"
+                            ),
+                        )
+                    ),
+                    {
+                        "query_from": directory,
+                        "import_type": importer_cls.__name__,
+                        "search_glob": pattern_config["search_glob"],
+                        "additional_files_and_metadata_glob": pattern_config[
+                            "additional_files_and_metadata_glob"
+                        ]
+                        or "",
+                    },
+                ).fetchall()
+
+                for image_url, metadata in rows:
+                    metadata = dict(metadata or {})
+                    metadata["additional_files_and_metadata"] = (
+                        SearchLocalToGeoImageFrame._resolve_additional_files_and_metadata(
+                            image_url,
+                            pattern_config["additional_files_and_metadata_glob"],
+                        )
+                    )
+                    metadata = self._convert_dicts_to_json(metadata)
+                    result = conn.execute(
+                        self.selected_table.update()
+                        .where(self.selected_table.c.image_url == image_url)
+                        .values(metadata=metadata)
+                    )
+                    updated_rows += result.rowcount or 0
+
+        return updated_rows
 
     @staticmethod
     def _qualified_table_name(table):

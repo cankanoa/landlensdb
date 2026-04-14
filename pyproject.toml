@@ -47,7 +47,8 @@ dependencies = [
     "pytz>=2025.1",
     "timezonefinder>=6.5.8",
     "Pillow>=11.0.0",
-    "tqdm>=4.67.1"
+    "tqdm>=4.67.1",
+    "PyYAML>=6.0.2"
 ]
 
 [project.optional-dependencies]

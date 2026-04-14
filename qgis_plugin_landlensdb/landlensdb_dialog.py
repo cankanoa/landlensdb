@@ -13,6 +13,7 @@ from qgis.PyQt.QtGui import QIcon
 import os
 
 from .tabs.import_tab import ImportTab
+from .tabs.overview_tab import OverviewTab
 from .tabs.query_tab import QueryTab
 from .tabs.setup_tab import SetupTab
 
@@ -33,10 +34,12 @@ class LandlensdbDialog(QtWidgets.QDialog):
         self.tab_widget = QtWidgets.QTabWidget(self)
         layout.addWidget(self.tab_widget)
 
+        self.overview_tab = OverviewTab(self)
         self.setup_tab = SetupTab(iface, self)
         self.import_tab = ImportTab(iface, self)
         self.query_tab = QueryTab(iface, self)
 
+        self.tab_widget.addTab(self.overview_tab, 'Overview')
         self.tab_widget.addTab(self.setup_tab, 'Setup')
         self.tab_widget.addTab(self.import_tab, 'Import')
         self.tab_widget.addTab(self.query_tab, 'Query')
