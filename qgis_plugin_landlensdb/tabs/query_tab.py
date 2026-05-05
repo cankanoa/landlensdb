@@ -747,23 +747,19 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
         query_name = self._last_query_state['query_name']
         root_group = self._ensure_query_group(query_name)
-        query_rows = self._fetch_query_rows()
-        if not query_rows:
-            self._show_error('The query returned no rows to add.')
-            return
-
         added_layers = []
-        entries = self._build_grouped_entries(query_rows)
-        for entry in entries:
-            if not entry['image_urls']:
-                continue
-            parent_group = root_group
-            for part in entry['group_values']:
-                parent_group = self._ensure_child_group(parent_group, part)
+        if self._is_grouped_add_query():
             added_layers.extend(
-                self._add_group_layers(
-                    parent_group,
-                    entry['image_urls'],
+                self._add_grouped_query_layers(
+                    root_group,
+                    add_thumbnail=add_thumbnail,
+                    add_geometry=add_geometry,
+                )
+            )
+        else:
+            added_layers.extend(
+                self._add_non_grouped_query_layers(
+                    root_group,
                     add_thumbnail=add_thumbnail,
                     add_geometry=add_geometry,
                 )
@@ -778,6 +774,126 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             )
         else:
             self._show_error('Nothing was added to the map from the current preview.')
+
+    def _is_grouped_add_query(self):
+        for column in self._last_query_state.get('column_info', []):
+            if column['name'] == 'image_url':
+                return column.get('udt_name', '').startswith('_')
+        return False
+
+    def _group_column_names(self):
+        return [
+            column_name
+            for column_name in self._last_query_state.get('column_names', [])
+            if column_name not in ('image_url', self.KEY_COLUMN)
+        ]
+
+    def _add_non_grouped_query_layers(self, root_group, add_thumbnail=True, add_geometry=True):
+        added_layers = []
+        if add_thumbnail:
+            thumbnail_group = self._ensure_child_group(root_group, 'thumbnail')
+            image_urls = self._fetch_add_image_urls()
+            added_layers.extend(self._add_thumbnail_layers_for_image_urls(thumbnail_group, image_urls))
+        if add_geometry:
+            vector_column = self._last_query_state.get('vector_column')
+            if vector_column:
+                geometry_group = self._ensure_child_group(root_group, 'geometry')
+                added_layers.extend(
+                    self._add_geometry_layers_for_query(
+                        geometry_group,
+                        self._last_query_state['live_query'],
+                        vector_column,
+                    )
+                )
+        return added_layers
+
+    def _add_grouped_query_layers(self, root_group, add_thumbnail=True, add_geometry=True):
+        group_columns = self._group_column_names()
+        group_rows = self._fetch_group_rows(include_image_urls=add_thumbnail)
+        if not group_rows:
+            return []
+
+        added_layers = []
+        for group_row in group_rows:
+            raw_group_values = tuple(group_row.get(column_name) for column_name in group_columns)
+            group_labels = tuple('{}'.format(value) for value in raw_group_values)
+            parent_group = root_group
+            for part in group_labels:
+                parent_group = self._ensure_child_group(parent_group, part)
+            if add_thumbnail:
+                thumbnail_group = self._ensure_child_group(parent_group, 'thumbnail')
+                image_urls = self._normalize_image_urls(group_row.get('image_url'))
+                added_layers.extend(
+                    self._add_thumbnail_layers_for_image_urls(thumbnail_group, image_urls)
+                )
+            if add_geometry:
+                geometry_group = self._ensure_child_group(parent_group, 'geometry')
+                geometry_query, geometry_column = self._build_group_geometry_query(
+                    group_columns,
+                    raw_group_values,
+                )
+                if geometry_query and geometry_column:
+                    added_layers.extend(
+                        self._add_geometry_layers_for_query(
+                            geometry_group,
+                            geometry_query,
+                            geometry_column,
+                        )
+                    )
+        return added_layers
+
+    def _fetch_add_image_urls(self):
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        image_urls = []
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    cursor.execute(
+                        sql.SQL('SELECT q.image_url FROM ({}) AS q WHERE q.image_url IS NOT NULL').format(
+                            sql.SQL(self._last_query_state['live_query'])
+                        )
+                    )
+                    image_urls = [row[0] for row in cursor.fetchall() if row and row[0]]
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not load image URLs: {}'.format(exc))
+        return image_urls
+
+    def _fetch_group_rows(self, include_image_urls):
+        group_columns = self._group_column_names()
+        if not group_columns and not include_image_urls:
+            return []
+
+        select_items = [
+            sql.SQL('q.{}').format(sql.Identifier(column_name))
+            for column_name in group_columns
+        ]
+        if include_image_urls:
+            select_items.append(sql.SQL('q.image_url'))
+
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        rows = []
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    cursor.execute(
+                        sql.SQL('SELECT {} FROM ({}) AS q').format(
+                            sql.SQL(', ').join(select_items),
+                            sql.SQL(self._last_query_state['live_query']),
+                        )
+                    )
+                    rows = cursor.fetchall()
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not load grouped query rows: {}'.format(exc))
+            return []
+
+        column_names = list(group_columns)
+        if include_image_urls:
+            column_names.append('image_url')
+        return [dict(zip(column_names, row)) for row in rows]
 
     def _fetch_query_rows(self, formatted=False):
         schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
@@ -880,17 +996,20 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             child_group.setExpanded(False)
         return child_group
 
-    def _add_group_layers(self, parent_group, image_urls, add_thumbnail=True, add_geometry=True):
+    def _add_group_layers(self, parent_group, entry, add_thumbnail=True, add_geometry=True):
         added_layers = []
         if add_thumbnail:
             thumbnail_group = self._ensure_child_group(parent_group, 'thumbnail')
-            added_layers.extend(self._add_thumbnail_layers(thumbnail_group, image_urls))
+            added_layers.extend(self._add_thumbnail_layers(thumbnail_group, entry))
         if add_geometry:
             geometry_group = self._ensure_child_group(parent_group, 'geometry')
-            added_layers.extend(self._add_geometry_layers(geometry_group, image_urls))
+            added_layers.extend(self._add_geometry_layers(geometry_group, entry))
         return added_layers
 
-    def _add_thumbnail_layers(self, group, image_urls):
+    def _add_thumbnail_layers(self, group, entry):
+        return self._add_thumbnail_layers_for_image_urls(group, entry['image_urls'])
+
+    def _add_thumbnail_layers_for_image_urls(self, group, image_urls):
         added_layers = []
         raster_source = self._last_query_state.get('raster_source')
         raster_columns = self._last_query_state.get('raster_columns') or []
@@ -916,13 +1035,16 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         safe_image_url = image_url.replace('$lldb$', '')
         return "\"image_url\" = $lldb${}$lldb$".format(safe_image_url)
 
-    def _add_geometry_layers(self, group, image_urls):
-        added_layers = []
+    def _add_geometry_layers(self, group, entry):
+        filtered_query = self._build_entry_layer_query(entry)
         vector_column = self._last_query_state.get('source_vector_column') or self._last_query_state.get('vector_column')
-        if not vector_column or not image_urls:
+        return self._add_geometry_layers_for_query(group, filtered_query, vector_column)
+
+    def _add_geometry_layers_for_query(self, group, filtered_query, vector_column):
+        added_layers = []
+        if not filtered_query or not vector_column:
             return added_layers
 
-        filtered_query = self._build_image_url_query(image_urls)
         schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
         geometry_types = []
         try:
@@ -950,6 +1072,60 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                 added_layers.append(layer.name())
                 self._add_layer_to_group(group, layer)
         return added_layers
+
+    def _build_group_geometry_query(self, group_columns, group_values):
+        source_vector_column = self._last_query_state.get('source_vector_column')
+        if source_vector_column:
+            group_query = self._build_group_filter_query(group_columns, group_values)
+            return (
+                "SELECT src.* FROM ({}) AS src "
+                "JOIN ({}) AS grp ON src.image_url = ANY(grp.image_url)"
+            ).format(
+                self._build_source_query(),
+                group_query,
+            ), source_vector_column
+
+        vector_column = self._last_query_state.get('vector_column')
+        return self._build_group_filter_query(group_columns, group_values), vector_column
+
+    def _build_entry_layer_query(self, entry):
+        if not entry['group_columns']:
+            query_source = self._last_query_state.get('query_source')
+            if query_source and self._last_query_state.get('source_vector_column'):
+                return self._build_image_url_query(entry['image_urls'])
+            return self._last_query_state['live_query']
+
+        group_query = self._build_group_entry_query(entry)
+        return (
+            "SELECT src.* FROM ({}) AS src "
+            "JOIN ({}) AS grp ON src.image_url = ANY(grp.image_url)"
+        ).format(
+            self._build_source_query(),
+            group_query,
+        )
+
+    def _build_group_entry_query(self, entry):
+        return self._build_group_filter_query(entry['group_columns'], entry['group_values'])
+
+    def _build_group_filter_query(self, group_columns, group_values):
+        filters = []
+        for column_name, value in zip(group_columns, group_values):
+            column_sql = 'grp.{}'.format(self._quote_identifier(column_name))
+            if value is None:
+                filters.append('{} IS NULL'.format(column_sql))
+            else:
+                filters.append(
+                    "{} = {}".format(
+                        column_sql,
+                        self._sql_literal(value),
+                    )
+                )
+        base_query = "SELECT * FROM ({}) AS grp".format(
+            self._last_query_state['live_query']
+        )
+        if not filters:
+            return base_query
+        return "{} WHERE {}".format(base_query, " AND ".join(filters))
 
     def _build_image_url_query(self, image_urls):
         filters = [
@@ -1561,6 +1737,15 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
     def _quote_identifier(self, value):
         return '"{}"'.format(value.replace('"', '""'))
+
+    def _sql_literal(self, value):
+        if value is None:
+            return 'NULL'
+        if isinstance(value, bool):
+            return 'TRUE' if value else 'FALSE'
+        if isinstance(value, (int, float)):
+            return str(value)
+        return "'{}'".format(str(value).replace("'", "''"))
 
     def _create_raster_layer(self, raster_source, raster_column, row_filter, layer_name):
         layer = QgsRasterLayer(self._build_postgres_raster_uri(raster_source, raster_column, row_filter), layer_name, 'gdal')
