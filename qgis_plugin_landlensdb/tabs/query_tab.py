@@ -29,6 +29,7 @@ from qgis.core import (
 from ..shared.connection_dialog import ConnectionDialog
 from ..shared.connection_utils import (
     connection_kwargs,
+    fetch_base_tables,
     load_connection_settings,
     save_connection_settings,
     test_connection_values,
@@ -64,6 +65,9 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     PREVIEW_LIMIT = 10
     HISTORY_LIMIT = 25
     KEY_COLUMN = '__lldb_rowid__'
+    SHARED_COMMENT_KEY = 'landlensdb'
+    SHARED_QUERY_KEY = 'shared_queries'
+    SHARED_TABLE_KEY = 'Landlensdb/shared_query_table'
     THUMBNAIL_IMPORT_TYPE_NAMES = (
         'GeoTransformImage',
         'WorldView3Image',
@@ -103,6 +107,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._thumbnail_support_cache = {}
         self._staged_metadata_items = []
         self._additional_metadata_schema = {}
+        self._shared_table_name = QtCore.QSettings().value(self.SHARED_TABLE_KEY, '', type=str) or ''
 
         self.connection_button.clicked.connect(self.open_connection_dialog)
         self.query_button.clicked.connect(self.run_query)
@@ -152,6 +157,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         self.results_controller.setup()
         self._prepare_workbench_ui()
+        self._add_shared_menu_button()
         self._add_builder_help_button()
 
         self._load_settings()
@@ -433,6 +439,18 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.commands_toggle_button.setStyleSheet('')
         self.history_menu_button.setStyleSheet('')
         self.star_menu_button.setStyleSheet('')
+        if hasattr(self, 'shared_menu_button'):
+            self.shared_menu_button.setStyleSheet('')
+
+    def _add_shared_menu_button(self):
+        if not hasattr(self, 'commandsHeaderLayout'):
+            return
+        self.shared_menu_button = QtWidgets.QToolButton(self)
+        self.shared_menu_button.setText('Shared')
+        self.shared_menu_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.shared_menu_button.setArrowType(QtCore.Qt.DownArrow)
+        self.shared_menu_button.clicked.connect(self._show_shared_menu)
+        self.commandsHeaderLayout.insertWidget(4, self.shared_menu_button)
 
     def _add_builder_help_button(self):
         if not hasattr(self, 'commandsHeaderLayout'):
@@ -534,46 +552,460 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.builder_controller.insert_sql(token)
 
     def _build_history_menu(self):
-        self.history_controller.build_history_menu()
+        menu = QtWidgets.QMenu(self)
+        history = self.history_controller.query_history
+        if not history:
+            empty_action = menu.addAction('No history yet')
+            empty_action.setEnabled(False)
+        else:
+            clear_action = menu.addAction('Clear All')
+            clear_action.triggered.connect(self.clear_history)
+            menu.addSeparator()
+            for index, query in enumerate(history):
+                submenu = menu.addMenu(self._query_title(query))
+                self._populate_local_query_submenu(
+                    submenu,
+                    query,
+                    history_index=index,
+                    include_star=True,
+                )
+        self.history_menu = menu
 
     def _show_history_menu(self):
-        self.history_controller.show_history_menu()
+        self._build_history_menu()
+        self.history_menu.exec_(
+            self.history_menu_button.mapToGlobal(QtCore.QPoint(0, self.history_menu_button.height()))
+        )
 
     def _build_star_menu(self):
-        self.history_controller.build_star_menu()
+        menu = QtWidgets.QMenu(self)
+        starred = self.history_controller.starred_queries
+        if not starred:
+            empty_action = menu.addAction('No starred queries yet')
+            empty_action.setEnabled(False)
+        else:
+            clear_action = menu.addAction('Clear All')
+            clear_action.triggered.connect(self.clear_starred)
+            menu.addSeparator()
+            for index, query in enumerate(starred):
+                submenu = menu.addMenu(self._query_title(query))
+                self._populate_local_query_submenu(
+                    submenu,
+                    query,
+                    starred_index=index,
+                    include_unstar=True,
+                )
+        self.star_menu = menu
 
     def _show_star_menu(self):
-        self.history_controller.show_star_menu()
+        self._build_star_menu()
+        self.star_menu.exec_(
+            self.star_menu_button.mapToGlobal(QtCore.QPoint(0, self.star_menu_button.height()))
+        )
+
+    def _build_shared_menu(self):
+        menu = QtWidgets.QMenu(self)
+        self._populate_shared_table_menu(menu)
+        menu.addSeparator()
+        shared_queries = self._load_shared_queries()
+        if not shared_queries:
+            empty_action = menu.addAction('No shared queries yet')
+            empty_action.setEnabled(False)
+        else:
+            clear_action = menu.addAction('Clear All')
+            clear_action.triggered.connect(self.clear_shared_queries)
+            menu.addSeparator()
+            for index, entry in enumerate(shared_queries):
+                query = entry.get('sql', '')
+                submenu = menu.addMenu(self._shared_query_title(entry))
+                use_action = submenu.addAction('Use')
+                use_action.triggered.connect(
+                    lambda _=False, sql_text=query: self.sql_input.setPlainText(sql_text)
+                )
+                rename_action = submenu.addAction('Rename')
+                rename_action.triggered.connect(
+                    lambda _=False, i=index: self._rename_shared_query(i)
+                )
+                if entry.get('name'):
+                    unname_action = submenu.addAction('Unname')
+                    unname_action.triggered.connect(
+                        lambda _=False, i=index: self._unname_shared_query(i)
+                    )
+                move_to_star_action = submenu.addAction('Move to Star')
+                move_to_star_action.triggered.connect(
+                    lambda _=False, i=index: self._move_shared_to_star(i)
+                )
+                delete_action = submenu.addAction('Delete')
+                delete_action.triggered.connect(
+                    lambda _=False, i=index: self._unshare_query(i)
+                )
+        self.shared_menu = menu
+
+    def _show_shared_menu(self):
+        self._build_shared_menu()
+        self.shared_menu.exec_(
+            self.shared_menu_button.mapToGlobal(QtCore.QPoint(0, self.shared_menu_button.height()))
+        )
+
+    def _populate_local_query_submenu(
+        self,
+        submenu,
+        query,
+        history_index=None,
+        starred_index=None,
+        include_star=False,
+        include_unstar=False,
+    ):
+        has_shared_table = bool(self._shared_table_name)
+        use_action = submenu.addAction('Use')
+        use_action.triggered.connect(
+            lambda _=False, sql_text=query: self.sql_input.setPlainText(sql_text)
+        )
+        rename_action = submenu.addAction('Rename')
+        rename_action.triggered.connect(
+            lambda _=False, sql_text=query: self._rename_query(sql_text)
+        )
+        if query in self.history_controller.query_names:
+            unname_action = submenu.addAction('Unname')
+            unname_action.triggered.connect(
+                lambda _=False, sql_text=query: self._unname_query(sql_text)
+            )
+        if history_index is not None:
+            shared_action = submenu.addAction('Move to Shared')
+            shared_action.setEnabled(has_shared_table)
+            shared_action.triggered.connect(
+                lambda _=False, i=history_index: self._move_history_to_shared(i)
+            )
+        if include_star and history_index is not None:
+            star_action = submenu.addAction('Move to Star')
+            star_action.triggered.connect(
+                lambda _=False, i=history_index: self._move_history_to_star(i)
+            )
+        if include_unstar and starred_index is not None:
+            shared_from_star_action = submenu.addAction('Move to Shared')
+            shared_from_star_action.setEnabled(has_shared_table)
+            shared_from_star_action.triggered.connect(
+                lambda _=False, i=starred_index: self._move_star_to_shared(i)
+            )
+        delete_action = submenu.addAction('Delete')
+        if history_index is not None:
+            delete_action.triggered.connect(
+                lambda _=False, i=history_index: self._remove_history_item(i)
+            )
+        elif starred_index is not None:
+            delete_action.triggered.connect(
+                lambda _=False, i=starred_index: self._remove_star_item(i)
+            )
 
     def _query_title(self, query):
         return self.history_controller.query_title(query)
 
+    def _shared_query_title(self, entry):
+        shared_name = (entry.get('name') or '').strip()
+        if shared_name:
+            return shared_name
+        query = (entry.get('sql') or '').replace('\n', ' ').strip()
+        return query[:80]
+
+    def _refresh_saved_query_menus(self):
+        self._build_history_menu()
+        self._build_star_menu()
+        self._build_shared_menu()
+
+    def _local_queries(self, category):
+        if category == 'history':
+            return self.history_controller.query_history
+        if category == 'star':
+            return self.history_controller.starred_queries
+        return []
+
+    def _add_local_query(self, category, query):
+        queries = self._local_queries(category)
+        normalized = query.strip()
+        if normalized in queries:
+            queries.remove(normalized)
+        queries.insert(0, normalized)
+        if category == 'history':
+            del queries[self.HISTORY_LIMIT:]
+        self.history_controller.save()
+
+    def _remove_local_query(self, category, index):
+        queries = self._local_queries(category)
+        if 0 <= index < len(queries):
+            del queries[index]
+            self.history_controller.save()
+            return True
+        return False
+
+    def _move_local_query(self, index, source_category, target_category):
+        queries = self._local_queries(source_category)
+        if 0 <= index < len(queries):
+            query = queries[index]
+            self._add_local_query(target_category, query)
+            self._remove_local_query(source_category, index)
+            self._refresh_saved_query_menus()
+            return True
+        return False
+
     def _rename_query(self, query):
         self.history_controller.rename_query(query)
+        self._refresh_saved_query_menus()
 
     def _unname_query(self, query):
         self.history_controller.unname_query(query)
+        self._refresh_saved_query_menus()
 
     def _add_history_item(self, sql_text):
         self.history_controller.add_history_item(sql_text)
+        self._refresh_saved_query_menus()
 
     def _remove_history_item(self, index):
         self.history_controller.remove_history_item(index)
+        self._refresh_saved_query_menus()
 
     def clear_history(self):
         self.history_controller.clear_history()
+        self._refresh_saved_query_menus()
 
     def _star_history_item(self, index):
-        self.history_controller.star_history_item(index)
+        if 0 <= index < len(self.history_controller.query_history):
+            self._add_local_query('star', self.history_controller.query_history[index])
+            self._refresh_saved_query_menus()
+
+    def _move_history_to_star(self, index):
+        self._move_local_query(index, 'history', 'star')
+
+    def _move_history_to_shared(self, index):
+        if 0 <= index < len(self.history_controller.query_history):
+            query = self.history_controller.query_history[index]
+            if self._share_query(query, silent=True):
+                self.history_controller.remove_history_item(index)
+                self._build_history_menu()
+                self._build_star_menu()
+
+    def _move_star_to_shared(self, index):
+        if 0 <= index < len(self.history_controller.starred_queries):
+            query = self.history_controller.starred_queries[index]
+            if self._share_query(query, silent=True):
+                self.history_controller.remove_star_item(index)
+                self._build_history_menu()
+                self._build_star_menu()
+
+    def _move_shared_to_star(self, index):
+        shared_queries = self._load_shared_queries()
+        if 0 <= index < len(shared_queries):
+            query = shared_queries[index].get('sql', '')
+            self._add_local_query('star', query)
+            self._unshare_query(index, silent=True)
+            self._refresh_saved_query_menus()
 
     def _unstar_item(self, index):
-        self.history_controller.unstar_item(index)
+        self._remove_local_query('star', index)
+        self._refresh_saved_query_menus()
 
     def _remove_star_item(self, index):
-        self.history_controller.remove_star_item(index)
+        self._remove_local_query('star', index)
+        self._refresh_saved_query_menus()
 
     def clear_starred(self):
         self.history_controller.clear_starred()
+        self._refresh_saved_query_menus()
+
+    def _populate_shared_table_menu(self, menu):
+        current_table = self._shared_table_name
+        label = 'Select Table' if not current_table else 'Change table from: {}'.format(current_table)
+        table_menu = menu.addMenu(label)
+        tables = self._fetch_schema_table_names()
+        if not tables:
+            empty_action = table_menu.addAction('No tables found')
+            empty_action.setEnabled(False)
+            return
+        for table_name in tables:
+            table_menu.addAction(
+                table_name,
+                lambda _checked=False, name=table_name: self._set_shared_table(name),
+            )
+
+    def _set_shared_table(self, table_name):
+        self._shared_table_name = table_name or ''
+        settings = QtCore.QSettings()
+        settings.setValue(self.SHARED_TABLE_KEY, self._shared_table_name)
+
+    def _fetch_schema_table_names(self):
+        return fetch_base_tables(self.connection_values)
+
+    def _current_shared_query_source(self):
+        if not self._shared_table_name:
+            return None
+        return {
+            'schema': self.connection_values.get('schema', 'public').strip() or 'public',
+            'table': self._shared_table_name,
+        }
+
+    def _load_shared_queries(self):
+        query_source = self._current_shared_query_source()
+        if not query_source:
+            return []
+        payload = self._read_table_comment_payload(query_source)
+        return list(payload.get(self.SHARED_QUERY_KEY, []))
+
+    def _read_table_comment_payload(self, query_source):
+        valid, message = self._validate_connection_values(self.connection_values)
+        if not valid:
+            self._show_error(message)
+            return {}
+
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        comment_text = ''
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    cursor.execute(
+                        """
+                        SELECT pg_catalog.obj_description(
+                            %s::regclass,
+                            'pg_class'
+                        )
+                        """,
+                        ('"{}"."{}"'.format(query_source['schema'], query_source['table']),),
+                    )
+                    result = cursor.fetchone()
+                    comment_text = result[0] if result else ''
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not load shared queries: {}'.format(exc))
+            return {}
+
+        if not comment_text:
+            return {}
+        try:
+            payload = json.loads(comment_text)
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        container = payload.get(self.SHARED_COMMENT_KEY, {})
+        return container if isinstance(container, dict) else {}
+
+    def _write_table_comment_payload(self, query_source, payload):
+        valid, message = self._validate_connection_values(self.connection_values)
+        if not valid:
+            self._show_error(message)
+            return False
+
+        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        comment_text = json.dumps(
+            {self.SHARED_COMMENT_KEY: payload},
+            indent=2,
+            sort_keys=True,
+        )
+        try:
+            with psycopg2.connect(**self._connection_kwargs()) as connection:
+                with connection.cursor() as cursor:
+                    if schema_name:
+                        self._set_search_path(cursor, schema_name)
+                    cursor.execute(
+                        sql.SQL('COMMENT ON TABLE {}.{} IS {}').format(
+                            sql.Identifier(query_source['schema']),
+                            sql.Identifier(query_source['table']),
+                            sql.Literal(comment_text),
+                        )
+                    )
+                connection.commit()
+        except Exception as exc:  # pragma: no cover - depends on external DB
+            self._show_error('Could not save shared queries: {}'.format(exc))
+            return False
+        return True
+
+    def _share_query(self, query, silent=False):
+        query_source = self._current_shared_query_source()
+        if not query_source:
+            if not silent:
+                self._show_error('Shared queries require a selected shared table.')
+            return False
+        payload = self._read_table_comment_payload(query_source)
+        shared_queries = list(payload.get(self.SHARED_QUERY_KEY, []))
+        shared_name = self.history_controller.query_names.get(query, '')
+        shared_entry = {'sql': query}
+        if shared_name:
+            shared_entry['name'] = shared_name
+        shared_queries = [entry for entry in shared_queries if entry.get('sql') != query]
+        shared_queries.insert(0, shared_entry)
+        payload[self.SHARED_QUERY_KEY] = shared_queries
+        if not self._write_table_comment_payload(query_source, payload):
+            return False
+        self._refresh_saved_query_menus()
+        if not silent:
+            self._show_info('Query shared to "{}"."{}".'.format(query_source['schema'], query_source['table']))
+        return True
+
+    def _update_shared_query(self, index, entry):
+        query_source = self._current_shared_query_source()
+        if not query_source:
+            self._show_error('Shared queries require a selected shared table.')
+            return False
+        payload = self._read_table_comment_payload(query_source)
+        shared_queries = list(payload.get(self.SHARED_QUERY_KEY, []))
+        if not (0 <= index < len(shared_queries)):
+            return False
+        shared_queries[index] = entry
+        payload[self.SHARED_QUERY_KEY] = shared_queries
+        return self._write_table_comment_payload(query_source, payload)
+
+    def _rename_shared_query(self, index):
+        shared_queries = self._load_shared_queries()
+        if not (0 <= index < len(shared_queries)):
+            return
+        current_name = shared_queries[index].get('name', '')
+        new_name, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            'Rename Shared Query',
+            'Name',
+            text=current_name,
+        )
+        if accepted and new_name.strip():
+            shared_queries[index]['name'] = new_name.strip()
+            if self._update_shared_query(index, shared_queries[index]):
+                self._build_shared_menu()
+                self._show_info('Shared query renamed.')
+
+    def _unname_shared_query(self, index):
+        shared_queries = self._load_shared_queries()
+        if not (0 <= index < len(shared_queries)):
+            return
+        shared_queries[index].pop('name', None)
+        if self._update_shared_query(index, shared_queries[index]):
+            self._build_shared_menu()
+            self._show_info('Shared query name removed.')
+
+    def _unshare_query(self, index, silent=False):
+        query_source = self._current_shared_query_source()
+        if not query_source:
+            if not silent:
+                self._show_error('Shared queries require a selected shared table.')
+            return
+        payload = self._read_table_comment_payload(query_source)
+        shared_queries = list(payload.get(self.SHARED_QUERY_KEY, []))
+        if not (0 <= index < len(shared_queries)):
+            return
+        del shared_queries[index]
+        payload[self.SHARED_QUERY_KEY] = shared_queries
+        if self._write_table_comment_payload(query_source, payload):
+            if not silent:
+                self._show_info('Shared query removed.')
+            self._build_shared_menu()
+
+    def clear_shared_queries(self):
+        query_source = self._current_shared_query_source()
+        if not query_source:
+            self._show_error('Shared queries require a selected shared table.')
+            return
+        payload = self._read_table_comment_payload(query_source)
+        payload[self.SHARED_QUERY_KEY] = []
+        if self._write_table_comment_payload(query_source, payload):
+            self._show_info('Cleared shared queries.')
+            self._build_shared_menu()
 
     def open_connection_dialog(self):
         dialog = ConnectionDialog(self.connection_values, self._test_connection_values, self)
