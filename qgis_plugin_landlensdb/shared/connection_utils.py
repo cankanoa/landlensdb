@@ -80,3 +80,26 @@ def test_connection_values(values):
         return False, 'Connection failed: {}'.format(exc)
 
     return True, 'Connection successful'
+
+
+def fetch_base_tables(values):
+    valid, _message = validate_connection_values(values)
+    if not valid:
+        return []
+
+    schema_name = values.get('schema', 'public').strip() or 'public'
+    try:
+        with psycopg2.connect(**connection_kwargs(values)) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_type = 'BASE TABLE'
+                    ORDER BY table_name
+                    """,
+                    (schema_name,),
+                )
+                return [row[0] for row in cursor.fetchall() if row[0] != 'spatial_ref_sys']
+    except Exception:  # pragma: no cover
+        return []

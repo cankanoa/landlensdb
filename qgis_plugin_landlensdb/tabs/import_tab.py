@@ -10,6 +10,7 @@ from qgis.core import Qgis
 from ..shared.connection_dialog import ConnectionDialog
 from ..shared.connection_utils import (
     connection_kwargs,
+    fetch_base_tables,
     load_connection_settings,
     save_connection_settings,
     test_connection_values,
@@ -174,7 +175,7 @@ class ImportTab(QtWidgets.QWidget):
         self.thread_count_input = QtWidgets.QSpinBox(self)
         self.thread_count_input.setMinimum(1)
         self.thread_count_input.setMaximum(256)
-        self.thread_count_input.setValue(1)
+        self.thread_count_input.setValue(25)
         self.thread_count_input.setFixedWidth(72)
         button_row.addWidget(self.thread_count_input)
         self.import_progress_bar = QtWidgets.QProgressBar(self)
@@ -1019,26 +1020,7 @@ class ImportTab(QtWidgets.QWidget):
         )
 
     def _fetch_tables(self):
-        valid, _ = validate_connection_values(self.connection_values)
-        if not valid:
-            return []
-
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
-        try:
-            with psycopg2.connect(**connection_kwargs(self.connection_values)) as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT table_name
-                        FROM information_schema.tables
-                        WHERE table_schema = %s AND table_type = 'BASE TABLE'
-                        ORDER BY table_name
-                        """,
-                        (schema_name,),
-                    )
-                    return [row[0] for row in cursor.fetchall() if row[0] != 'spatial_ref_sys']
-        except Exception:  # pragma: no cover
-            return []
+        return fetch_base_tables(self.connection_values)
 
     def _build_database_url(self):
         values = self.connection_values
