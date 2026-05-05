@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import threading
+from datetime import datetime
 from urllib.parse import quote_plus
 
 from qgis.PyQt import QtCore, QtWidgets
@@ -70,10 +71,15 @@ class ImportTab(QtWidgets.QWidget):
     ADD_TABLE_SENTINEL = '__add_table__'
     IMPORT_TYPES = ['', 'GeoTaggedImage', 'GeoTransformImage', 'WorldView3Image']
     IMPORT_EXAMPLE = (
-        "query_from: /data/images\n"
-        "import_type: GeoTaggedImage\n"
-        "search_glob: **/*.JPG\n"
-        "additional_files_and_metadata_glob: ./{base}.yml"
+        "Example geotagged images:\n"
+        " - query_from: /folder/with/images\n"
+        " - import_type: GeoTaggedImage\n"
+
+        "Example Worldview-3 images:\n"
+        " - query_from: /folder/with/images\n"
+        " - import_type: WorldView3Image\n"
+        " - search_glob: **/*.TIL\n"
+        " - additional_files_and_metadata_glob: ./{base}.yml"
     )
 
     def __init__(self, iface, parent=None):
@@ -83,6 +89,7 @@ class ImportTab(QtWidgets.QWidget):
         self._selected_table = None
         self._cancel_import_event = threading.Event()
         self._import_active = False
+        self._last_refreshed_at = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -109,6 +116,7 @@ class ImportTab(QtWidgets.QWidget):
         self.refresh_table_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
         )
+        self.refresh_table_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.refresh_table_button.setToolTip('Refresh input parameter rows from the selected table.')
         self.refresh_table_button.clicked.connect(self.refresh_table)
         top_row.addWidget(self.refresh_table_button)
@@ -196,6 +204,7 @@ class ImportTab(QtWidgets.QWidget):
         self._update_connection_button_text()
         self._refresh_table_choices()
         self.load_records([])
+        self._set_last_updated(None)
         self._reset_progress()
         self._set_import_active(False)
 
@@ -206,15 +215,13 @@ class ImportTab(QtWidgets.QWidget):
             (
                 "Choose the table that stores your imported image rows. Each saved input parameters "
                 "in the table defines what folder to search, which importer to use, and "
-                "what files to match.\n\nExample:\n{}"
+                "what files to match.\n\nExamples:\n{}"
             ).format(self.IMPORT_EXAMPLE),
         )
 
     def showEvent(self, event):
         super(ImportTab, self).showEvent(event)
         self._refresh_table_choices()
-        if self.current_table_name():
-            self._select_table(self.current_table_name())
 
     def reload_connection_settings(self, values=None):
         self.connection_values = dict(values or load_connection_settings())
@@ -277,7 +284,8 @@ class ImportTab(QtWidgets.QWidget):
     def _select_table(self, table_name):
         self._selected_table = table_name
         self.table_button.setText(table_name)
-        self.refresh_table()
+        self.load_records([])
+        self._set_last_updated(None)
 
     def add_table(self):
         valid, message = validate_connection_values(self.connection_values)
@@ -342,7 +350,10 @@ class ImportTab(QtWidgets.QWidget):
             return
 
         self._refresh_table_choices(selected_table=table_name)
-        self._select_table(table_name)
+        self._selected_table = table_name
+        self.table_button.setText(table_name)
+        self.load_records([])
+        self._set_last_updated(None)
         self._show_message('Created table "{}".'.format(table_name), Qgis.Info)
 
     def drop_selected_table(self, table_name=None):
@@ -375,6 +386,7 @@ class ImportTab(QtWidgets.QWidget):
 
         self._refresh_table_choices()
         self.load_records([])
+        self._set_last_updated(None)
         self._show_message('Dropped table "{}".'.format(table_name), Qgis.Info)
 
     def refresh_table(self):
@@ -438,7 +450,17 @@ class ImportTab(QtWidgets.QWidget):
             return
 
         self.load_records(records)
+        self._set_last_updated(datetime.now())
         self._show_message('Loaded {} input parameter set(s).'.format(len(records)), Qgis.Info)
+
+    def _set_last_updated(self, timestamp):
+        self._last_refreshed_at = timestamp
+        if timestamp is None:
+            self.refresh_table_button.setText('Last updated: never')
+            return
+        self.refresh_table_button.setText(
+            'Last updated: {}'.format(timestamp.strftime('%Y-%m-%d %H:%M:%S'))
+        )
 
     def load_records(self, records):
         unique_rows = unique_import_parameter_rows(records)

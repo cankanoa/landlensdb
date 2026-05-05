@@ -561,7 +561,7 @@ class GeoTransformImage(SearchLocalToGeoImageFrame):
 
 
 class WorldView3Image(SearchLocalToGeoImageFrame):
-    """Importer for WorldView-3 `.IMD` metadata packages."""
+    """Importer for WorldView-3 `.TIL` packages with sibling IMD metadata."""
 
     @classmethod
     def _worldview3_product_fields(cls):
@@ -737,10 +737,11 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
         thumbnail_size=(256, 256),
         fingerprint=None,
     ):
-        """Load a WorldView-3 IMD file into a GeoImageFrame-compatible record."""
+        """Load a WorldView-3 TIL file into a GeoImageFrame-compatible record."""
         source = _extract_source(image_path)
         fingerprint_data = _calculate_fingerprint(image_path, fingerprint)
-        worldview3_data = _parse_worldview3_imd(image_path)
+        imd_path = _find_worldview3_imd_path(image_path)
+        worldview3_data = _parse_worldview3_imd(imd_path)
         browse_path = _find_worldview3_browse_path(image_path)
         geometry = _worldview3_polygon_from_bounds(worldview3_data["bounds"])
         thumbnail_data = _extract_worldview3_thumbnail(
@@ -749,10 +750,7 @@ class WorldView3Image(SearchLocalToGeoImageFrame):
             create_thumbnail=create_thumbnail,
         )
 
-        if thumbnail_data is not None:
-            raster = _get_dataset_raster_metadata(thumbnail_data)
-        else:
-            raster = _get_raster_metadata(browse_path)
+        raster = _get_raster_metadata(image_path)
 
         metadata = cls._get_metadata(
             source=source,
@@ -1173,8 +1171,30 @@ def _parse_worldview3_imd(image_path):
     }
 
 
+def _find_worldview3_imd_path(image_path):
+    """Find the sibling `.IMD` metadata file for a WorldView-3 TIL file."""
+    image_path = Path(image_path)
+    direct_candidate = image_path.with_suffix(".IMD")
+    if direct_candidate.is_file():
+        return direct_candidate
+
+    sibling_imds = sorted(
+        path
+        for path in image_path.parent.iterdir()
+        if path.is_file() and path.suffix.upper() == ".IMD"
+    )
+    if len(sibling_imds) == 1:
+        return sibling_imds[0]
+    if not sibling_imds:
+        raise ValueError(f"Unable to find sibling '.IMD' next to {image_path}")
+    raise ValueError(
+        f"Found multiple sibling '.IMD' files next to {image_path}; "
+        "expected exactly one matching metadata file."
+    )
+
+
 def _find_worldview3_browse_path(image_path):
-    """Find the sibling `*BROWSE.JPG` preview image for an IMD file."""
+    """Find the sibling `*BROWSE.JPG` preview image for a WorldView-3 package."""
     image_path = Path(image_path)
     browse_candidates = sorted(
         path
