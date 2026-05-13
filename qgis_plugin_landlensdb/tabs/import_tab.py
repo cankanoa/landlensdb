@@ -178,6 +178,13 @@ class ImportTab(QtWidgets.QWidget):
         self.thread_count_input.setValue(25)
         self.thread_count_input.setFixedWidth(72)
         button_row.addWidget(self.thread_count_input)
+        button_row.addWidget(QtWidgets.QLabel('Batch Size:'))
+        self.batch_size_input = QtWidgets.QSpinBox(self)
+        self.batch_size_input.setMinimum(1)
+        self.batch_size_input.setMaximum(10000)
+        self.batch_size_input.setValue(100)
+        self.batch_size_input.setFixedWidth(84)
+        button_row.addWidget(self.batch_size_input)
         self.import_progress_bar = QtWidgets.QProgressBar(self)
         self.import_progress_bar.setTextVisible(False)
         self.import_progress_bar.setRange(0, 0)
@@ -1322,20 +1329,23 @@ class ImportTab(QtWidgets.QWidget):
         if skip_existing:
             db.table(table_name)
         try:
-            images = SearchLocalToGeoImageFrame(
+            wrote_batches = False
+            for images in SearchLocalToGeoImageFrame(
                 query_from,
-                import_types={
-                    import_type: {
-                        'search_glob': search_glob,
-                        'additional_files_and_metadata_glob': additional_glob,
-                    }
-                },
+                import_type=import_type,
+                search_glob=search_glob,
+                additional_files_and_metadata_glob=additional_glob,
                 max_workers=self.thread_count_input.value(),
+                batch_size=self.batch_size_input.value(),
+                return_as_yield=True,
                 progress_callback=self._update_progress,
                 skip_images_in_postgresql=db if skip_existing else None,
                 cancel_event=self._cancel_import_event,
-            )
-            db.upsert_images(images, table_name, conflict='update')
+            ):
+                db.upsert_images(images, table_name, conflict='update')
+                wrote_batches = True
+            if not wrote_batches:
+                raise ValueError('No valid images were processed into a GeoImageFrame.')
         finally:
             self._set_import_active(False)
 
@@ -1348,12 +1358,9 @@ class ImportTab(QtWidgets.QWidget):
         db.table(table_name)
         return db.remove_unmatched(
             query_from,
-            import_types={
-                import_type: {
-                    'search_glob': search_glob,
-                    'additional_files_and_metadata_glob': additional_glob,
-                }
-            },
+            import_type=import_type,
+            search_glob=search_glob,
+            additional_files_and_metadata_glob=additional_glob,
         )
 
     def _run_drop_all(self, table_name, query_from, import_type, search_glob, additional_glob):
@@ -1365,12 +1372,9 @@ class ImportTab(QtWidgets.QWidget):
         db.table(table_name)
         return db.remove_all(
             query_from,
-            import_types={
-                import_type: {
-                    'search_glob': search_glob,
-                    'additional_files_and_metadata_glob': additional_glob,
-                }
-            },
+            import_type=import_type,
+            search_glob=search_glob,
+            additional_files_and_metadata_glob=additional_glob,
         )
 
     def _run_get_additional_metadata(
@@ -1389,12 +1393,9 @@ class ImportTab(QtWidgets.QWidget):
         db.table(table_name)
         return db.update_additional_files_and_metadata(
             query_from,
-            import_types={
-                import_type: {
-                    'search_glob': search_glob,
-                    'additional_files_and_metadata_glob': additional_glob,
-                }
-            },
+            import_type=import_type,
+            search_glob=search_glob,
+            additional_files_and_metadata_glob=additional_glob,
         )
 
     def _reset_progress(self):

@@ -52,7 +52,8 @@ def test_geoimageframe_accepts_metadata_column():
 def test_geotagged_image_loads_metadata_and_thumbnail_columns():
     images = SearchLocalToGeoImageFrame(
         "test_data/local",
-        import_types={GeoTaggedImage: r".*\.JPG$"},
+        import_type=GeoTaggedImage,
+        search_glob=r".*\.JPG$",
         create_thumbnail=False,
     )
 
@@ -65,7 +66,8 @@ def test_geotagged_image_loads_metadata_and_thumbnail_columns():
 def test_import_images_routes_to_importer_class():
     images = SearchLocalToGeoImageFrame(
         "test_data/local",
-        import_types={GeoTaggedImage: r".*\.JPG$"},
+        import_type=GeoTaggedImage,
+        search_glob=r".*\.JPG$",
         additional_columns=[("camera_model", "exif.Model")],
         create_thumbnail=False,
     )

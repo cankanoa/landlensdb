@@ -152,7 +152,8 @@ def test_local_images():
     print("\nTesting local image loading...")
     local_images = SearchLocalToGeoImageFrame(
         "test_data/local",
-        import_types={GeoTaggedImage: r".*\.JPG$"},
+        import_type=GeoTaggedImage,
+        search_glob=r".*\.JPG$",
         create_thumbnail=False,
     )
     print(f"Loaded {len(local_images)} local images")
