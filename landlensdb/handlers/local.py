@@ -27,134 +27,88 @@ class SearchLocalToGeoImageFrame:
     def __new__(
         cls,
         directory: str,
-        import_types: dict[str | type, str] | None = {"GeoTaggedImage": "**/*.JPG"},
+        import_type: str | type = "GeoTaggedImage",
+        search_glob: str = "**/*.JPG",
+        additional_files_and_metadata_glob: str | None = None,
         additional_columns: list[str | tuple[str, str]] | None = None,
         create_thumbnail: bool = True,
         thumbnail_size: tuple[int, int] = (256, 256),
         fingerprint: Literal["robust", "quick"] | None = None,
         max_workers: int = 1,
+        batch_size: int = 100,
+        return_as_yield: bool = False,
         progress_callback: Callable[[int, int], None] | None = None,
         skip_images_in_postgresql: "Postgres | None" = None,
         cancel_event: threading.Event | None = None,
     ) -> GeoImageFrame:
-        """Return a `GeoImageFrame` directly from the import configuration."""
+        """Return a `GeoImageFrame` directly from the import configuration or yield each worker as they go."""
         if cls is SearchLocalToGeoImageFrame:
-            if import_types is None:
-                import_types = {"GeoTaggedImage": "**/*"}
-
-            if not isinstance(import_types, dict):
-                raise TypeError(
-                    "`import_types` must be a dict like {GeoTaggedImage: '**/*.JPG'}."
-                )
-
-            if not import_types:
-                raise ValueError("`import_types` must contain at least one importer class.")
             if fingerprint not in (None, "robust", "quick"):
                 raise ValueError("`fingerprint` must be one of None, 'robust', or 'quick'.")
             if max_workers is None:
                 max_workers = 1
             if not isinstance(max_workers, int) or max_workers < 1:
                 raise ValueError("`max_workers` must be an integer greater than or equal to 1.")
+            if batch_size is None:
+                batch_size = 100
+            if not isinstance(batch_size, int) or batch_size < 1:
+                raise ValueError("`batch_size` must be an integer greater than or equal to 1.")
+            load_tasks = cls._build_load_tasks(
+                directory=directory,
+                import_type=import_type,
+                search_glob=search_glob,
+                additional_files_and_metadata_glob=additional_files_and_metadata_glob,
+                additional_columns=additional_columns,
+                create_thumbnail=create_thumbnail,
+                thumbnail_size=thumbnail_size,
+                fingerprint=fingerprint,
+                skip_images_in_postgresql=skip_images_in_postgresql,
+                cancel_event=cancel_event,
+            )
 
-            all_records = []
-            matched_file_count = 0
-            load_tasks = []
-            task_failures = []
-
-            for importer_ref, pattern in import_types.items():
-                if cancel_event is not None and cancel_event.is_set():
-                    raise ImportCancelledError("Image import cancelled.")
-                importer_cls = cls._resolve_importer_class(importer_ref)
-                if not issubclass(importer_cls, SearchLocalToGeoImageFrame):
-                    raise TypeError(
-                        "Importer keys must be subclasses of ImportImages."
-                    )
-
-                pattern_config = cls._normalize_import_pattern_config(pattern)
-                image_paths = cls._discover_paths(
-                    directory,
-                    pattern_config["search_glob"],
-                )
-                if skip_images_in_postgresql is not None:
-                    image_paths = skip_images_in_postgresql.filter_existing_rows(image_paths)
-                matched_file_count += len(image_paths)
-                for image_path in image_paths:
-                    load_tasks.append(
-                        {
-                            "importer_cls": importer_cls,
-                            "image_path": image_path,
-                            "query_from": directory,
-                            "search_glob": pattern_config["search_glob"],
-                            "import_type": importer_cls.__name__,
-                            "additional_files_and_metadata_glob": pattern_config[
-                                "additional_files_and_metadata_glob"
-                            ],
-                            "additional_columns": additional_columns,
-                            "create_thumbnail": create_thumbnail,
-                            "thumbnail_size": thumbnail_size,
-                            "fingerprint": fingerprint,
-                        }
-                    )
-
-            if matched_file_count == 0:
+            if not load_tasks:
                 raise ValueError(
-                    "The directory does not contain any new images matching `import_types`."
+                    "The directory does not contain any new images matching `search_glob`."
                 )
 
-            total_tasks = len(load_tasks)
-            processed_count = 0
-            cls._report_progress(progress_callback, processed_count, total_tasks)
-
-            if max_workers == 1:
-                for task in load_tasks:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise ImportCancelledError("Image import cancelled.")
-                    result = cls._load_task(task)
-                    processed_count += 1
-                    cls._report_progress(progress_callback, processed_count, total_tasks)
-                    if result["record"] is not None:
-                        all_records.append(result["record"])
-                    elif result["error"] is not None:
-                        task_failures.append(result)
+            if return_as_yield:
+                return cls._yield_geoimageframes(
+                    load_tasks=load_tasks,
+                    max_workers=max_workers,
+                    batch_size=batch_size,
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                )
             else:
-                executor = ThreadPoolExecutor(max_workers=max_workers)
-                try:
-                    futures = {
-                        executor.submit(cls._load_task, task): task["image_path"]
-                        for task in load_tasks
-                    }
-                    for future in as_completed(futures):
-                        if cancel_event is not None and cancel_event.is_set():
-                            executor.shutdown(wait=False, cancel_futures=True)
-                            raise ImportCancelledError("Image import cancelled.")
-                        image_path = futures[future]
-                        try:
-                            result = future.result()
-                        except Exception as exc:
-                            warnings.warn(f"Error processing {image_path}: {exc}. Skipped.")
-                            processed_count += 1
-                            cls._report_progress(progress_callback, processed_count, total_tasks)
-                            continue
-                        processed_count += 1
-                        cls._report_progress(progress_callback, processed_count, total_tasks)
+                all_records = []
+                task_failures = []
+                total_tasks = len(load_tasks)
+                processed_count = 0
+                for results, task_batch in cls._iter_task_batch_results(
+                    load_tasks=load_tasks,
+                    max_workers=max_workers,
+                    batch_size=batch_size,
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                ):
+                    processed_count += len(task_batch)
+                    for result in results:
                         if result["record"] is not None:
                             all_records.append(result["record"])
                         elif result["error"] is not None:
                             task_failures.append(result)
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
 
-            if not all_records:
-                raise ValueError(
-                    cls._format_import_failure_message(
-                        matched_file_count,
-                        task_failures,
+                if not all_records:
+                    raise ValueError(
+                        cls._format_import_failure_message(
+                            len(load_tasks),
+                            task_failures,
+                        )
                     )
-                )
 
-            frame = GeoImageFrame(all_records, geometry="geometry")
-            frame.set_crs(epsg=4326, inplace=True)
-            return frame
+                frame = GeoImageFrame(all_records, geometry="geometry")
+                frame.set_crs(epsg=4326, inplace=True)
+                return frame
 
         return super().__new__(cls)
 
@@ -165,45 +119,17 @@ class SearchLocalToGeoImageFrame:
             importer_cls = globals().get(importer)
             if not isinstance(importer_cls, type):
                 raise TypeError(
-                    f"`import_types` key '{importer}' does not resolve to an importer class."
+                    f"`import_type` value '{importer}' does not resolve to an importer class."
                 )
             return importer_cls
 
         return importer
 
-    @staticmethod
-    def _normalize_import_pattern_config(pattern):
-        if isinstance(pattern, str):
-            return {
-                "search_glob": pattern,
-                "additional_files_and_metadata_glob": None,
-            }
-
-        if isinstance(pattern, dict):
-            search_glob = pattern.get("search_glob")
-            if not isinstance(search_glob, str):
-                raise TypeError(
-                    "Each `import_types` value dict must include a string `search_glob`."
-                )
-            additional_glob = pattern.get("additional_files_and_metadata_glob")
-            if additional_glob is not None and not isinstance(additional_glob, str):
-                raise TypeError(
-                    "`additional_files_and_metadata_glob` must be a string when provided."
-                )
-            return {
-                "search_glob": search_glob,
-                "additional_files_and_metadata_glob": additional_glob,
-            }
-
-        raise TypeError(
-            "Each `import_types` value must be a glob string or a dict with `search_glob`."
-        )
-
     @classmethod
     def _discover_paths(cls, directory, pattern):
         """Resolve a single glob pattern against `directory`."""
         if not isinstance(pattern, str):
-            raise TypeError("Each `import_types` value must be a single glob string.")
+            raise TypeError("`search_glob` must be a single glob string.")
         if os.path.isabs(pattern):
             search_pattern = pattern
         else:
@@ -215,6 +141,111 @@ class SearchLocalToGeoImageFrame:
             if os.path.isfile(path)
         ]
         return sorted(set(matched_paths))
+
+    @classmethod
+    def _build_load_tasks(
+        cls,
+        directory,
+        import_type,
+        search_glob,
+        additional_files_and_metadata_glob,
+        additional_columns,
+        create_thumbnail,
+        thumbnail_size,
+        fingerprint,
+        skip_images_in_postgresql,
+        cancel_event,
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ImportCancelledError("Image import cancelled.")
+        importer_cls = cls._resolve_importer_class(import_type)
+        if not issubclass(importer_cls, SearchLocalToGeoImageFrame):
+            raise TypeError(
+                "`import_type` must resolve to a subclass of ImportImages."
+            )
+        image_paths = cls._discover_paths(
+            directory,
+            search_glob,
+        )
+        if skip_images_in_postgresql is not None:
+            image_paths = skip_images_in_postgresql.filter_existing_rows(image_paths)
+        load_tasks = []
+        for image_path in image_paths:
+            load_tasks.append(
+                {
+                    "importer_cls": importer_cls,
+                    "image_path": image_path,
+                    "query_from": directory,
+                    "search_glob": search_glob,
+                    "import_type": importer_cls.__name__,
+                    "additional_files_and_metadata_glob": additional_files_and_metadata_glob,
+                    "additional_columns": additional_columns,
+                    "create_thumbnail": create_thumbnail,
+                    "thumbnail_size": thumbnail_size,
+                    "fingerprint": fingerprint,
+                }
+            )
+        return load_tasks
+
+    @classmethod
+    def _iter_task_batch_results(
+        cls,
+        load_tasks,
+        max_workers,
+        batch_size,
+        progress_callback,
+        cancel_event,
+    ):
+        total_tasks = len(load_tasks)
+        processed_count = 0
+        cls._report_progress(progress_callback, processed_count, total_tasks)
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            futures = {
+                executor.submit(cls._load_task_batch, task_batch): task_batch
+                for task_batch in cls._chunked(load_tasks, batch_size)
+            }
+            for future in as_completed(futures):
+                if cancel_event is not None and cancel_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise ImportCancelledError("Image import cancelled.")
+                task_batch = futures[future]
+                try:
+                    results = future.result()
+                except Exception as exc:
+                    warnings.warn(f"Error processing batch: {exc}. Skipped.")
+                    results = []
+                processed_count += len(task_batch)
+                cls._report_progress(progress_callback, processed_count, total_tasks)
+                yield results, task_batch
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    @classmethod
+    def _yield_geoimageframes(
+        cls,
+        load_tasks,
+        max_workers,
+        batch_size,
+        progress_callback,
+        cancel_event,
+    ):
+        for results, _task_batch in cls._iter_task_batch_results(
+            load_tasks=load_tasks,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        ):
+            batch_records = [
+                result["record"]
+                for result in results
+                if result["record"] is not None
+            ]
+            if batch_records:
+                frame = GeoImageFrame(batch_records, geometry="geometry")
+                frame.set_crs(epsg=4326, inplace=True)
+                yield frame
 
     @staticmethod
     def _load_task(task):
@@ -250,6 +281,15 @@ class SearchLocalToGeoImageFrame:
                 "image_path": str(task["image_path"]),
                 "import_type": task["import_type"],
             }
+
+    @classmethod
+    def _load_task_batch(cls, task_batch):
+        return [cls._load_task(task) for task in task_batch]
+
+    @staticmethod
+    def _chunked(items, size):
+        for start in range(0, len(items), size):
+            yield items[start:start + size]
 
     @staticmethod
     def _format_import_failure_message(matched_file_count, task_failures, max_failures=5):

@@ -17,6 +17,7 @@ from qgis.PyQt import QtCore, QtWidgets, uic
 from qgis.PyQt.QtWidgets import QAbstractItemView
 from qgis.core import (
     Qgis,
+    QgsAction,
     QgsDataSourceUri,
     QgsFeatureRequest,
     QgsLayerTreeGroup,
@@ -2165,7 +2166,26 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         uri = self._create_uri()
         uri.setDataSource('', '({})'.format(query_text), geometry_column, '', self.KEY_COLUMN)
         layer = QgsVectorLayer(uri.uri(False), layer_name, 'postgres')
+        if layer.isValid():
+            self._add_open_image_action(layer)
         return layer if layer.isValid() else None
+
+    def _add_open_image_action(self, layer):
+        field_names = [field.name() for field in layer.fields()]
+        if 'image_url' not in field_names:
+            return
+        actions = layer.actions()
+        for action in actions.actions():
+            if action.name() == 'Open Image':
+                return
+        actions.addAction(
+            QgsAction(
+                Qgis.AttributeActionType.OpenUrl,
+                'Open Image',
+                '[% "image_url" %]',
+                False,
+            )
+        )
 
     def _quote_identifier(self, value):
         return '"{}"'.format(value.replace('"', '""'))
