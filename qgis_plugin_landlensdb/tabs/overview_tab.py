@@ -41,7 +41,7 @@ class OverviewTab(QtWidgets.QWidget):
             <p>The SQL must return <code>image_url</code>. If <code>image_url</code> is a string, each row is added directly. If it is a list of strings, the other columns define the QGIS group hierarchy from left to right.</p>
 
             <h3>View And Copy</h3>
-            <p>Query results can be viewed in QGIS as geometry and, where available, thumbnails. Staged metadata fields can also be copied from the current query into CSV output for the matching rows. If the query is grouped, each group is separated by a heading line before its CSV block, using a format like <code>Year=2024.Month=05</code> based on the grouping columns and values.</p>
+            <p>Query results can be viewed in QGIS as geometry and, where available, thumbnails. The <b>View</b> tab can display multiple selected Landlensdb images in a zoomable grid, switch between preview and path sources, navigate through the selected layer by an organized metadata field, and optionally rotate images to north-up. Staged metadata fields can also be copied from the current query into CSV output for the matching rows. If the query is grouped, each group is separated by a heading line before its CSV block, using a format like <code>Year=2024.Month=05</code> based on the grouping columns and values.</p>
             """
         )
         layout.addWidget(content, 1)
