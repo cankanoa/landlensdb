@@ -2164,9 +2164,11 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
     def _create_vector_layer(self, query_text, geometry_column, layer_name):
         uri = self._create_uri()
-        uri.setDataSource('', '({})'.format(query_text), geometry_column, '', self.KEY_COLUMN)
+        uri.setDataSource('', '({})'.format(query_text), geometry_column, '', 'image_url')
         layer = QgsVectorLayer(uri.uri(False), layer_name, 'postgres')
         if layer.isValid():
+            layer.setCustomProperty('landlensdb/query_text', query_text)
+            layer.setCustomProperty('landlensdb/geometry_column', geometry_column)
             self._add_open_image_action(layer)
         return layer if layer.isValid() else None
 
