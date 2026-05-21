@@ -589,16 +589,7 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        update_rows = []
-        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
-            row_params = self._row_parameters(row_index)
-            if row_params is None:
-                continue
-            query_from, import_type, search_glob, additional_glob = row_params
-            if not query_from or not import_type or not search_glob:
-                continue
-            update_rows.append((query_from, import_type, search_glob, additional_glob))
-
+        update_rows = self._saved_input_parameter_rows()
         if not update_rows:
             self._show_message('No saved input parameter rows to update.', Qgis.Critical)
             return
@@ -636,16 +627,7 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        update_rows = []
-        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
-            row_params = self._row_parameters(row_index)
-            if row_params is None:
-                continue
-            query_from, import_type, search_glob, additional_glob = row_params
-            if not query_from or not import_type or not search_glob:
-                continue
-            update_rows.append((query_from, import_type, search_glob, additional_glob))
-
+        update_rows = self._saved_input_parameter_rows()
         if not update_rows:
             self._show_message('No saved input parameter rows to prune.', Qgis.Critical)
             return
@@ -676,16 +658,7 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        update_rows = []
-        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
-            row_params = self._row_parameters(row_index)
-            if row_params is None:
-                continue
-            query_from, import_type, search_glob, additional_glob = row_params
-            if not query_from or not import_type or not search_glob:
-                continue
-            update_rows.append((query_from, import_type, search_glob, additional_glob))
-
+        update_rows = self._saved_input_parameter_rows()
         if not update_rows:
             self._show_message('No saved input parameter rows to drop.', Qgis.Critical)
             return
@@ -716,16 +689,7 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        update_rows = []
-        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
-            row_params = self._row_parameters(row_index)
-            if row_params is None:
-                continue
-            query_from, import_type, search_glob, additional_glob = row_params
-            if not query_from or not import_type or not search_glob:
-                continue
-            update_rows.append((query_from, import_type, search_glob, additional_glob))
-
+        update_rows = self._saved_input_parameter_rows()
         if not update_rows:
             self._show_message('No saved input parameter rows to sync.', Qgis.Critical)
             return
@@ -766,9 +730,9 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        row_params = self._row_parameters(row_index)
+        row_params = self._saved_input_params(row_index)
         if row_params is None:
-            self._show_message('Import row is incomplete.', Qgis.Critical)
+            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
             return
 
         query_from, import_type, search_glob, additional_glob = row_params
@@ -800,9 +764,9 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        row_params = self._row_parameters(row_index)
+        row_params = self._saved_input_params(row_index)
         if row_params is None:
-            self._show_message('Import row is incomplete.', Qgis.Critical)
+            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
             return
 
         query_from, import_type, search_glob, additional_glob = row_params
@@ -834,9 +798,9 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        row_params = self._row_parameters(row_index)
+        row_params = self._saved_input_params(row_index)
         if row_params is None:
-            self._show_message('Import row is incomplete.', Qgis.Critical)
+            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
             return
 
         query_from, import_type, search_glob, additional_glob = row_params
@@ -871,9 +835,9 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        row_params = self._row_parameters(row_index)
+        row_params = self._saved_input_params(row_index)
         if row_params is None:
-            self._show_message('Import row is incomplete.', Qgis.Critical)
+            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
             return
 
         query_from, import_type, search_glob, additional_glob = row_params
@@ -905,16 +869,7 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message('Choose a table first.', Qgis.Critical)
             return
 
-        update_rows = []
-        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
-            row_params = self._row_parameters(row_index)
-            if row_params is None:
-                continue
-            query_from, import_type, search_glob, additional_glob = row_params
-            if not query_from or not import_type or not search_glob:
-                continue
-            update_rows.append((query_from, import_type, search_glob, additional_glob))
-
+        update_rows = self._saved_input_parameter_rows()
         if not update_rows:
             self._show_message('No saved input parameter rows to update.', Qgis.Critical)
             return
@@ -1025,6 +980,24 @@ class ImportTab(QtWidgets.QWidget):
             search_glob_input.text().strip(),
             additional_glob_input.text().strip(),
         )
+
+    def _saved_input_params(self, row_index):
+        status_widget = self._status_widget(row_index)
+        if status_widget is None:
+            return None
+        return getattr(status_widget, 'original_input_params', None)
+
+    def _saved_input_parameter_rows(self):
+        rows = []
+        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
+            row_params = self._saved_input_params(row_index)
+            if row_params is None:
+                continue
+            query_from, import_type, search_glob, additional_glob = row_params
+            if not query_from or not import_type or not search_glob:
+                continue
+            rows.append(row_params)
+        return rows
 
     def _fetch_tables(self):
         return fetch_base_tables(self.connection_values)
