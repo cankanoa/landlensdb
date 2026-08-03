@@ -294,7 +294,15 @@ class SetupTab(QtWidgets.QWidget):
 
     def _conda_server_command(self):
         return (
-            "conda create -n landlensdb_pg -c conda-forge \"postgresql>=14\" \"postgis>=3.5\" && "
-            "export POSTGIS_GDAL_ENABLED_DRIVERS=ENABLE_ALL && "
-            "psql -d landlens_test -c \"ALTER DATABASE landlens_test SET postgis.gdal_enabled_drivers = 'ENABLE_ALL';\""
+            "conda run -n landlensdb_pg true >/dev/null 2>&1 ||\n"
+            "  conda create -y -n landlensdb_pg -c conda-forge \"postgresql>=14\" \"postgis>=3.5\"\n\n"
+            "conda activate landlensdb_pg\n"
+            "export PGDATA=\"$CONDA_PREFIX/var/lib/postgresql\" POSTGIS_GDAL_ENABLED_DRIVERS=ENABLE_ALL\n\n"
+            "[ -f \"$PGDATA/PG_VERSION\" ] || { mkdir -p \"$PGDATA\"; initdb -D \"$PGDATA\"; }\n"
+            "pg_ctl -D \"$PGDATA\" status >/dev/null 2>&1 ||\n"
+            "  pg_ctl -D \"$PGDATA\" -l /tmp/landlensdb-postgres.log start\n\n"
+            "createdb -h localhost landlensdb 2>/dev/null || :\n"
+            "psql -h localhost -d landlensdb -c \\\n"
+            "  \"CREATE EXTENSION IF NOT EXISTS postgis; CREATE EXTENSION IF NOT EXISTS postgis_raster; ALTER DATABASE landlensdb SET postgis.gdal_enabled_drivers='ENABLE_ALL';\" &&\n"
+            "printf '\\nHost: localhost\\nPort: 5432\\nDatabase: landlensdb\\nSchema: public\\nUser: %s\\nPassword: (none)\\n' \"$(id -un)\""
         )

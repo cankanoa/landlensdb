@@ -316,6 +316,8 @@ class ImportTab(QtWidgets.QWidget):
         try:
             with psycopg2.connect(**connection_kwargs(self.connection_values)) as connection:
                 with connection.cursor() as cursor:
+                    cursor.execute('CREATE EXTENSION IF NOT EXISTS postgis')
+                    cursor.execute('CREATE EXTENSION IF NOT EXISTS postgis_raster')
                     cursor.execute(
                         sql.SQL(
                             """
@@ -1114,7 +1116,9 @@ class ImportTab(QtWidgets.QWidget):
         for action_label, action_tooltip, callback in actions:
             action = menu.addAction(action_label)
             action.setToolTip(action_tooltip)
-            action.triggered.connect(callback)
+            action.triggered.connect(
+                lambda _checked=False, action_callback=callback: action_callback()
+            )
         button.setMenu(menu)
         return button
 
