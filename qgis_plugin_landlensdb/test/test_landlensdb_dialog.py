@@ -6,6 +6,7 @@ __date__ = '2026-03-13'
 __copyright__ = 'Copyright 2026, Kanoa Lindiwe LLC'
 
 import unittest
+from unittest import mock
 
 from landlensdb_dialog import LandlensdbDialog
 
@@ -41,6 +42,47 @@ class LandlensdbDialogTest(unittest.TestCase):
         self.assertEqual(query_tab.query_button.text(), 'Query')
         self.assertEqual(query_tab.add_button.text(), 'Add')
         self.assertEqual(query_tab.close_button.text(), 'Close')
+
+    def test_import_row_action_keeps_clicked_row_index(self):
+        """QAction's checked signal must not replace the captured table row."""
+        import_tab = self.dialog.import_tab
+        import_tab.load_records([
+            {
+                'metadata': {
+                    'input_params': {
+                        'query_from': '/images/first',
+                        'import_type': 'GeoTaggedImage',
+                        'search_glob': '**/*.JPG',
+                        'additional_files_and_metadata_glob': '',
+                    }
+                }
+            },
+            {
+                'metadata': {
+                    'input_params': {
+                        'query_from': '/images/second',
+                        'import_type': 'GeoTaggedImage',
+                        'search_glob': '**/*.JPG',
+                        'additional_files_and_metadata_glob': '',
+                    }
+                }
+            },
+        ])
+        import_tab.run_row_drop_all = mock.Mock()
+
+        actions_widget = import_tab.import_table.cellWidget(
+            1,
+            import_tab.ACTIONS_COLUMN,
+        )
+        actions_button = actions_widget.layout().itemAt(0).widget()
+        drop_all_action = next(
+            action for action in actions_button.menu().actions()
+            if action.text() == 'Drop All'
+        )
+
+        drop_all_action.trigger()
+
+        import_tab.run_row_drop_all.assert_called_once_with(1)
 
 
 if __name__ == "__main__":
