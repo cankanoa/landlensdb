@@ -76,16 +76,35 @@ For additional usage examples, see our documentation.
 
 ## Local Import and Database Writes
 
-`SearchLocalToGeoImageFrame` supports:
-- threaded local import with `max_workers`
-- progress reporting through `progress_callback(processed, total)`
-- skipping files already present in PostgreSQL with `skip_images_in_postgresql`
+`import_local_images(...)` exposes file, geometry, metadata, thumbnail, and
+fingerprint behavior as explicit Python parameters. The QGIS YAML editor is a
+configuration front end: it converts nested keys to underscore-separated
+function arguments and passes `metadata` as the only nested mapping.
+
+Every imported row stores canonical, comment-free `import_params` YAML and its
+SHA-256 `input_sha`. Runtime controls such as workers, batch size, skip-existing
+behavior, cancellation, and error handling are not included in that identity.
+
+`source.file_glob` is one complete path pattern passed directly to `wcmatch`,
+for example `/data/photos/**/*.@(jpg|jpeg)`. A `source.sidecar_glob` uses the
+same matcher after substituting `{parent}` and `{base}` for each input image.
+
+The commented starting template is available at
+`landlensdb/examples/import_params.yaml`.
+The editor includes Defaults plus quick presets for EXIF-geotagged photos,
+georeferenced rasters, and WorldView-3 TIL imagery with IMD metadata.
+
+Sidecars are deliberately limited to formats converted into a JSON-like
+mapping before source expressions are evaluated: `.json`, `.geojson`,
+`.yaml`, `.yml`, and WorldView `.imd`. When configured, a sidecar glob must
+resolve to exactly one file per imported image. WorldView IMD values are exposed under
+`sidecar.product`, `sidecar.image`, and `sidecar.bounds`.
 
 `Postgres.upsert_images` is the main database write entry point and supports:
 - `if_exists="fail"`, `"replace"`, and `"append"` for GeoPandas-backed writes
 - `if_exists="upsert"` with `conflict="update"` or `"nothing"` for incremental sync
 - `filter_existing_rows(...)` to keep only paths not already in the selected table
-- `remove_unmatched(...)` to delete rows whose `image_url` is no longer matched on disk for a given import rule
+- `remove_unmatched_for_input(...)` to delete unmatched rows within one `input_sha` group
 
 
 ## Documentation

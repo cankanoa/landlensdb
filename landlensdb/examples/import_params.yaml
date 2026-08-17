@@ -1,0 +1,142 @@
+# input_sha is generated from this document and is not included in the YAML.
+# import_params contains this complete YAML document and is not included recursively.
+
+source:
+  file_glob: "/path/to/photos/**/*.@(jpg|jpeg|png|tif|tiff)"
+  # sidecar_glob: "{parent}/{base}.@(yaml|yml|json|geojson|imd)" # optional; when set, must match exactly one supported sidecar per image
+
+name:
+  source: file.name # options: file.name, file.stem, exif.<field>, raster.<field>, sidecar.<field>, constant
+  required: true
+  default: null
+
+image_url:
+  source: file.path # options: file.path, sidecar.<field>
+  required: true
+
+geometry:
+  source: point_from_exif # options: point_from_exif, bounds_from_image, bounds_from_sidecar
+  output_crs: EPSG:4326
+  required: true
+
+  # Used by point_from_exif.
+  latitude: exif.GPSInfo.GPSLatitude
+  latitude_reference: exif.GPSInfo.GPSLatitudeRef
+  longitude: exif.GPSInfo.GPSLongitude
+  longitude_reference: exif.GPSInfo.GPSLongitudeRef
+
+  # Used by bounds_from_image.
+  # footprint: bounds # options: bounds, center
+
+  # Used by bounds_from_sidecar.
+  # min_x: sidecar.min_x
+  # min_y: sidecar.min_y
+  # max_x: sidecar.max_x
+  # max_y: sidecar.max_y
+  # input_crs: EPSG:4326
+
+metadata:
+  # All metadata fields support:
+  # source: exif.<field>, raster.<field>, sidecar.<field>, file.<field>,
+  #         geometry.<field>, exif_parse_time_to_timez.<field>, constant
+  # required: true, false
+  # default: any YAML value; also supplies the value when source is constant
+
+  captured_at:
+    source: exif_parse_time_to_timez.DateTimeOriginal
+    required: false
+    default: null
+
+  camera:
+    make:
+      source: exif.Make
+      required: false
+      default: null
+
+    model:
+      source: exif.Model
+      required: false
+      default: null
+
+    focal_length:
+      source: exif.FocalLength
+      required: false
+      default: null
+
+    lens_model:
+      source: exif.LensModel
+      required: false
+      default: null
+
+  sensor:
+    altitude:
+      source: exif.GPSInfo.GPSAltitude
+      required: false
+      default: null
+
+    compass_angle:
+      source: exif.GPSInfo.GPSImgDirection
+      required: false
+      default: null
+
+    orientation:
+      source: exif.Orientation
+      required: false
+      default: null
+
+  file:
+    name:
+      source: file.name
+      required: false
+      default: null
+
+    suffix:
+      source: file.suffix
+      required: false
+      default: null
+
+    size:
+      source: file.size
+      required: false
+      default: null
+
+  raster:
+    width:
+      source: raster.width
+      required: false
+      default: null
+
+    height:
+      source: raster.height
+      required: false
+      default: null
+
+    bands:
+      source: raster.bands
+      required: false
+      default: null
+
+    projection:
+      source: raster.projection
+      required: false
+      default: null
+
+    geotransform:
+      source: raster.geotransform
+      required: false
+      default: null
+
+    format:
+      source: raster.format
+      required: false
+      default: null
+
+thumbnail:
+  enabled: true
+  width: 256
+  height: 256
+  resampling: lanczos # options: nearest, bilinear, bicubic, lanczos
+
+fingerprint:
+  enabled: true
+  mode: robust # options: robust, quick

@@ -70,6 +70,7 @@ class Postgres:
         Returns:
             dict: The normalized record.
         """
+
         def _clean_string(value):
             return value.replace("\x00", "")
 
@@ -115,7 +116,9 @@ class Postgres:
             return _normalize_json_value(value)
 
         normalized_record = _normalize_json_value(record)
-        return json.loads(json.dumps(normalized_record, default=_default_json, allow_nan=False))
+        return json.loads(
+            json.dumps(normalized_record, default=_default_json, allow_nan=False)
+        )
 
     def table(self, table_name):
         """
@@ -267,7 +270,7 @@ class Postgres:
 
         with self.engine.connect() as conn:
             for start in range(0, len(normalized_paths), 1000):
-                chunk = normalized_paths[start:start + 1000]
+                chunk = normalized_paths[start : start + 1000]
                 result = conn.execute(
                     select(image_url_column).where(image_url_column.in_(chunk))
                 )
@@ -275,162 +278,34 @@ class Postgres:
 
         return [path for path in normalized_paths if path not in existing_paths]
 
-    def remove_unmatched(
-        self,
-        directory: str,
-        import_type: str | type = "GeoTaggedImage",
-        search_glob: str = "**/*.JPG",
-        additional_files_and_metadata_glob: str | None = None,
-    ):
+    def remove_unmatched_for_input(self, input_sha, image_paths):
+        """Delete rows in one import group whose source path no longer matches."""
         if self.selected_table is None:
             raise ValueError("Select a table first with `table(table_name)`.")
-
-        from .local import SearchLocalToGeoImageFrame
-
-        deleted_rows = 0
+        if "input_sha" not in self.selected_table.c:
+            raise ValueError("The selected table has no 'input_sha' column.")
+        matched_paths = [str(path) for path in image_paths]
+        filters = [self.selected_table.c.input_sha == input_sha]
+        if matched_paths:
+            filters.append(~self.selected_table.c.image_url.in_(matched_paths))
         with self.engine.begin() as conn:
-            importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(import_type)
-            matched_paths = [
-                str(path)
-                for path in SearchLocalToGeoImageFrame._discover_paths(
-                    directory,
-                    search_glob,
-                )
-            ]
+            result = conn.execute(self.selected_table.delete().where(and_(*filters)))
+        return result.rowcount or 0
 
-            delete_filters = [
-                text(
-                    "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = :query_from"
-                ),
-                text(
-                    "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
-                ),
-                text(
-                    "coalesce(metadata::jsonb->'input_params'->>'search_glob', '') = :search_glob"
-                ),
-                text(
-                    "coalesce(metadata::jsonb->'input_params'->>'additional_files_and_metadata_glob', '') = :additional_files_and_metadata_glob"
-                ),
-            ]
-            params = {
-                "query_from": directory,
-                "import_type": importer_cls.__name__,
-                "search_glob": search_glob,
-                "additional_files_and_metadata_glob": additional_files_and_metadata_glob or "",
-            }
-
-            if matched_paths:
-                delete_filters.append(~self.selected_table.c.image_url.in_(matched_paths))
-
-            delete_stmt = self.selected_table.delete().where(and_(*delete_filters))
-            result = conn.execute(delete_stmt, params)
-            deleted_rows += result.rowcount or 0
-
-        return deleted_rows
-
-    def remove_all(
-        self,
-        directory: str,
-        import_type: str | type = "GeoTaggedImage",
-        search_glob: str = "**/*.JPG",
-        additional_files_and_metadata_glob: str | None = None,
-    ):
+    def remove_all_for_input(self, input_sha):
+        """Delete every row belonging to one canonical import configuration."""
         if self.selected_table is None:
             raise ValueError("Select a table first with `table(table_name)`.")
-
-        from .local import SearchLocalToGeoImageFrame
-
-        deleted_rows = 0
+        if "input_sha" not in self.selected_table.c:
+            raise ValueError("The selected table has no 'input_sha' column.")
         with self.engine.begin() as conn:
-            importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(import_type)
-            delete_stmt = self.selected_table.delete().where(
-                and_(
-                    text(
-                        "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = :query_from"
-                    ),
-                    text(
-                        "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
-                    ),
-                    text(
-                        "coalesce(metadata::jsonb->'input_params'->>'search_glob', '') = :search_glob"
-                    ),
-                    text(
-                        "coalesce(metadata::jsonb->'input_params'->>'additional_files_and_metadata_glob', '') = :additional_files_and_metadata_glob"
-                    ),
-                )
-            )
             result = conn.execute(
-                delete_stmt,
-                {
-                    "query_from": directory,
-                    "import_type": importer_cls.__name__,
-                    "search_glob": search_glob,
-                    "additional_files_and_metadata_glob": additional_files_and_metadata_glob or "",
-                },
+                self.selected_table.delete().where(
+                    self.selected_table.c.input_sha == input_sha
+                )
             )
-            deleted_rows += result.rowcount or 0
+        return result.rowcount or 0
 
-        return deleted_rows
-
-    def update_additional_files_and_metadata(
-        self,
-        directory: str,
-        import_type: str | type,
-        search_glob: str,
-        additional_files_and_metadata_glob: str | None,
-    ):
-        if self.selected_table is None:
-            raise ValueError("Select a table first with `table(table_name)`.")
-
-        from .local import SearchLocalToGeoImageFrame
-
-        updated_rows = 0
-        with self.engine.begin() as conn:
-            importer_cls = SearchLocalToGeoImageFrame._resolve_importer_class(import_type)
-            rows = conn.execute(
-                select(self.selected_table.c.image_url, self.selected_table.c.metadata).where(
-                    and_(
-                        text(
-                            "coalesce(metadata::jsonb->'input_params'->>'query_from', '') = :query_from"
-                        ),
-                        text(
-                            "coalesce(metadata::jsonb->'input_params'->>'import_type', '') = :import_type"
-                        ),
-                        text(
-                            "coalesce(metadata::jsonb->'input_params'->>'search_glob', '') = :search_glob"
-                        ),
-                        text(
-                            "coalesce(metadata::jsonb->'input_params'->>'additional_files_and_metadata_glob', '') = :additional_files_and_metadata_glob"
-                        ),
-                    )
-                ),
-                {
-                    "query_from": directory,
-                    "import_type": importer_cls.__name__,
-                    "search_glob": search_glob,
-                    "additional_files_and_metadata_glob": additional_files_and_metadata_glob or "",
-                },
-            ).fetchall()
-
-            for image_url, metadata in rows:
-                metadata = dict(metadata or {})
-                metadata["additional_files_and_metadata"] = (
-                    SearchLocalToGeoImageFrame._resolve_additional_files_and_metadata(
-                        image_url,
-                        additional_files_and_metadata_glob,
-                    )
-                )
-                metadata = self._convert_dicts_to_json(metadata)
-                result = conn.execute(
-                    self.selected_table.update()
-                    .where(self.selected_table.c.image_url == image_url)
-                    .values(metadata=metadata)
-                )
-                updated_rows += result.rowcount or 0
-
-        return updated_rows
-
-    @staticmethod
     def _qualified_table_name(table):
         if table.schema:
             return '"{}"."{}"'.format(table.schema, table.name)
@@ -454,9 +329,7 @@ class Postgres:
         table_ident = table_name.replace('"', '""')
         constraint_ident = constraint_name.replace('"', '""')
         column_ident = column_name.replace('"', '""')
-        conn.execute(
-            text(
-                f"""
+        conn.execute(text(f"""
                 DO $$
                 BEGIN
                     IF NOT EXISTS (
@@ -470,11 +343,11 @@ class Postgres:
                     END IF;
                 END
                 $$;
-                """
-            )
-        )
+                """))
 
-    def upsert_images(self, gif, table_name, conflict="update", if_exists="upsert", *args, **kwargs):
+    def upsert_images(
+        self, gif, table_name, conflict="update", if_exists="upsert", *args, **kwargs
+    ):
         """
         Write image data to the specified table.
 
@@ -501,9 +374,11 @@ class Postgres:
             if "metadata" in gdf_to_write.columns:
                 dtype["metadata"] = JSONB
                 gdf_to_write["metadata"] = gdf_to_write["metadata"].apply(
-                    lambda value: json.dumps(self._convert_dicts_to_json(value))
-                    if isinstance(value, dict)
-                    else value
+                    lambda value: (
+                        json.dumps(self._convert_dicts_to_json(value))
+                        if isinstance(value, dict)
+                        else value
+                    )
                 )
 
             metadata = MetaData()
@@ -557,7 +432,9 @@ class Postgres:
                     )
 
                 for col in gif.required_columns:
-                    stmt = text(f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL")
+                    stmt = text(
+                        f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL"
+                    )
                     conn.execute(stmt)
 
                 self._ensure_unique_constraint(
@@ -590,7 +467,9 @@ class Postgres:
                         if thumbnail_dataset is None:
                             continue
 
-                        thumbnail_raster = self._thumbnail_to_gdal_raster(thumbnail_dataset)
+                        thumbnail_raster = self._thumbnail_to_gdal_raster(
+                            thumbnail_dataset
+                        )
                         conn.execute(
                             update_stmt,
                             {
@@ -616,9 +495,13 @@ class Postgres:
         with self.engine.begin() as conn:
             geometry_column = table.columns.get("geometry")
             if geometry_column is not None:
-                current_geometry_type = getattr(geometry_column.type, "geometry_type", None)
+                current_geometry_type = getattr(
+                    geometry_column.type, "geometry_type", None
+                )
                 current_geometry_type = (
-                    current_geometry_type.upper() if isinstance(current_geometry_type, str) else None
+                    current_geometry_type.upper()
+                    if isinstance(current_geometry_type, str)
+                    else None
                 )
                 if current_geometry_type not in (None, "GEOMETRY"):
                     conn.execute(
@@ -636,11 +519,12 @@ class Postgres:
                 record = self._convert_dicts_to_json(record)
                 fingerprint_value = record.get("fingerprint")
 
-                if conflict == "update" and fingerprint_value and "fingerprint" in table.columns:
-                    updates = {
-                        key: value
-                        for key, value in record.items()
-                    }
+                if (
+                    conflict == "update"
+                    and fingerprint_value
+                    and "fingerprint" in table.columns
+                ):
+                    updates = {key: value for key, value in record.items()}
                     fingerprint_update = (
                         update(table)
                         .where(table.c.fingerprint == fingerprint_value)
@@ -649,9 +533,15 @@ class Postgres:
                     fingerprint_result = conn.execute(fingerprint_update)
                     if fingerprint_result.rowcount:
                         continue
-                elif conflict == "nothing" and fingerprint_value and "fingerprint" in table.columns:
+                elif (
+                    conflict == "nothing"
+                    and fingerprint_value
+                    and "fingerprint" in table.columns
+                ):
                     fingerprint_exists = conn.execute(
-                        select(table.c.fingerprint).where(table.c.fingerprint == fingerprint_value)
+                        select(table.c.fingerprint).where(
+                            table.c.fingerprint == fingerprint_value
+                        )
                     ).first()
                     if fingerprint_exists:
                         continue
@@ -665,8 +555,7 @@ class Postgres:
                     }
                     constraint_name = f"{table.name}_image_url_key"
                     on_conflict_stmt = insert_stmt.on_conflict_do_update(
-                        constraint=constraint_name,
-                        set_=updates
+                        constraint=constraint_name, set_=updates
                     )
                 elif conflict == "nothing":
                     on_conflict_stmt = insert_stmt.on_conflict_do_nothing()

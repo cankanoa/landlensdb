@@ -9,6 +9,9 @@ build-backend = "setuptools.build_meta"
 where = ["."]
 include = ["landlensdb*"]
 
+[tool.setuptools.package-data]
+landlensdb = ["examples/*.yaml"]
+
 [project]
 name = "landlensdb"
 version = "0.1.4.3"
@@ -48,7 +51,8 @@ dependencies = [
     "timezonefinder>=6.5.8",
     "Pillow>=11.0.0",
     "tqdm>=4.67.1",
-    "PyYAML>=6.0.2"
+    "PyYAML>=6.0.2",
+    "wcmatch>=10.0"
 ]
 
 [project.optional-dependencies]

@@ -13,6 +13,7 @@ from sqlalchemy.sql import text
 from tqdm import tqdm
 from ..handlers.db import Postgres
 
+
 def _generate_arrow_icon(compass_angle):
     """Generates an arrow icon based on the specified compass angle.
 
@@ -95,6 +96,7 @@ class GeoImageFrame(GeoDataFrame):
             }
         )
     """
+
     required_columns = {
         "image_url": str,
         "name": str,
@@ -105,6 +107,8 @@ class GeoImageFrame(GeoDataFrame):
         "metadata": dict,
         "thumbnail": Dataset,
         "fingerprint": str,
+        "input_sha": str,
+        "import_params": str,
     }
 
     def __init__(self, *args, **kwargs):
@@ -151,7 +155,10 @@ class GeoImageFrame(GeoDataFrame):
                 raise ValueError(
                     "'fingerprint' must be set for all rows or omitted for all rows."
                 )
-            if fingerprint_present.any() and self.loc[fingerprint_present, "fingerprint"].duplicated().any():
+            if (
+                fingerprint_present.any()
+                and self.loc[fingerprint_present, "fingerprint"].duplicated().any()
+            ):
                 raise ValueError(
                     "'fingerprint' column has duplicate entries. It must be unique when set."
                 )
@@ -230,9 +237,7 @@ class GeoImageFrame(GeoDataFrame):
         table_ident = table_name.replace('"', '""')
         constraint_ident = constraint_name.replace('"', '""')
         column_ident = column_name.replace('"', '""')
-        conn.execute(
-            text(
-                f"""
+        conn.execute(text(f"""
                 DO $$
                 BEGIN
                     IF NOT EXISTS (
@@ -246,16 +251,11 @@ class GeoImageFrame(GeoDataFrame):
                     END IF;
                 END
                 $$;
-                """
-            )
-        )
+                """))
 
     @staticmethod
     def _download_image_from_url(
-        url: str,
-        dest_path: str,
-        max_retries: int = 3,
-        retry_delay: int = 1
+        url: str, dest_path: str, max_retries: int = 3, retry_delay: int = 1
     ) -> str | None:
         """Internal method to download an image from a URL with retries.
 
@@ -349,7 +349,11 @@ class GeoImageFrame(GeoDataFrame):
         # Download images using thread pool
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self._download_image_from_url, url, dest_path): (index, url, dest_path)
+                executor.submit(self._download_image_from_url, url, dest_path): (
+                    index,
+                    url,
+                    dest_path,
+                )
                 for index, url, dest_path in download_tasks
             }
 

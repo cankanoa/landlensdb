@@ -1,14 +1,12 @@
+from pathlib import Path
+
 from landlensdb.geoclasses.geoimageframe import (
     GeoImageFrame,
     _generate_arrow_icon,
     _generate_arrow_svg,
 )
 from landlensdb.handlers.db import Postgres
-from landlensdb.handlers.local import (
-    GeoTaggedImage,
-    GeoTransformImage,
-    SearchLocalToGeoImageFrame,
-)
+from landlensdb.handlers.importer import import_local_images
 from shapely.geometry import Point
 
 
@@ -50,11 +48,9 @@ def test_geoimageframe_accepts_metadata_column():
 
 
 def test_geotagged_image_loads_metadata_and_thumbnail_columns():
-    images = SearchLocalToGeoImageFrame(
-        "test_data/local",
-        import_type=GeoTaggedImage,
-        search_glob=r".*\.JPG$",
-        create_thumbnail=False,
+    images = import_local_images(
+        source_file_glob=str(Path("test_data/local").resolve() / "**/*.jpg"),
+        thumbnail_enabled=False,
     )
 
     assert "metadata" in images.columns
@@ -63,24 +59,28 @@ def test_geotagged_image_loads_metadata_and_thumbnail_columns():
     assert images.iloc[0]["thumbnail"] is None
 
 
-def test_import_images_routes_to_importer_class():
-    images = SearchLocalToGeoImageFrame(
-        "test_data/local",
-        import_type=GeoTaggedImage,
-        search_glob=r".*\.JPG$",
-        additional_columns=[("camera_model", "exif.Model")],
-        create_thumbnail=False,
+def test_import_images_builds_user_defined_metadata():
+    images = import_local_images(
+        source_file_glob=str(Path("test_data/local").resolve() / "**/*.jpg"),
+        metadata={
+            "camera": {
+                "model": {
+                    "source": "exif.Model",
+                    "required": False,
+                    "default": None,
+                }
+            }
+        },
+        thumbnail_enabled=False,
     )
 
     assert len(images) > 0
-    assert "camera_model" in images.columns
+    assert "camera" in images.iloc[0]["metadata"]
 
 
-def test_geotransform_image_is_publicly_importable():
-    assert GeoTransformImage.__name__ == "GeoTransformImage"
-
-
-def test_to_postgis_delegates_to_postgres_upsert_images(monkeypatch, sample_geoimageframe):
+def test_to_postgis_delegates_to_postgres_upsert_images(
+    monkeypatch, sample_geoimageframe
+):
     captured = {}
     fake_engine = type(
         "FakeEngine",
@@ -88,7 +88,9 @@ def test_to_postgis_delegates_to_postgres_upsert_images(monkeypatch, sample_geoi
         {"connect": lambda self: None},
     )()
 
-    def fake_upsert(self, gif, table_name, conflict="update", if_exists="upsert", *args, **kwargs):
+    def fake_upsert(
+        self, gif, table_name, conflict="update", if_exists="upsert", *args, **kwargs
+    ):
         captured["gif"] = gif
         captured["table_name"] = table_name
         captured["if_exists"] = if_exists
@@ -98,7 +100,9 @@ def test_to_postgis_delegates_to_postgres_upsert_images(monkeypatch, sample_geoi
 
     monkeypatch.setattr(Postgres, "upsert_images", fake_upsert)
 
-    result = sample_geoimageframe.to_postgis("images", fake_engine, if_exists="append", chunksize=100)
+    result = sample_geoimageframe.to_postgis(
+        "images", fake_engine, if_exists="append", chunksize=100
+    )
 
     assert result == "ok"
     assert captured["gif"] is sample_geoimageframe

@@ -1,0 +1,217 @@
+# Built-in preset: WorldView-3 TIL imagery with one sibling IMD sidecar.
+source:
+  file_glob: "/path/to/worldview3/**/*.til"
+  sidecar_glob: "{parent}/{base}.imd"
+
+name:
+  source: file.name
+  required: true
+  default: null
+
+image_url:
+  source: file.path
+  required: true
+
+geometry:
+  source: bounds_from_sidecar
+  output_crs: EPSG:4326
+  required: true
+  min_x: sidecar.bounds.min_x
+  min_y: sidecar.bounds.min_y
+  max_x: sidecar.bounds.max_x
+  max_y: sidecar.bounds.max_y
+  input_crs: EPSG:4326
+
+metadata:
+  captured_at:
+    source: sidecar.image.firstLineTime
+    required: false
+    default: null
+  platform:
+    satellite_id:
+      source: sidecar.image.satId
+      required: false
+      default: null
+    mode:
+      source: sidecar.image.mode
+      required: false
+      default: null
+    scan_direction:
+      source: sidecar.image.scanDirection
+      required: false
+      default: null
+    catalog_id:
+      source: sidecar.image.CatId
+      required: false
+      default: null
+    revolution_number:
+      source: sidecar.image.revNumber
+      required: false
+      default: null
+  product:
+    generation_time:
+      source: sidecar.product.generationTime
+      required: false
+      default: null
+    order_id:
+      source: sidecar.product.productOrderId
+      required: false
+      default: null
+    product_catalog_id:
+      source: sidecar.product.productCatalogId
+      required: false
+      default: null
+    child_catalog_id:
+      source: sidecar.product.childCatalogId
+      required: false
+      default: null
+    descriptor:
+      source: sidecar.product.imageDescriptor
+      required: false
+      default: null
+    scale:
+      source: sidecar.product.productScale
+      required: false
+      default: null
+    band_id:
+      source: sidecar.product.bandId
+      required: false
+      default: null
+    pan_sharpen_algorithm:
+      source: sidecar.product.panSharpenAlgorithm
+      required: false
+      default: null
+    rows:
+      source: sidecar.product.numRows
+      required: false
+      default: null
+    columns:
+      source: sidecar.product.numColumns
+      required: false
+      default: null
+    level:
+      source: sidecar.product.productLevel
+      required: false
+      default: null
+    type:
+      source: sidecar.product.productType
+      required: false
+      default: null
+    number_of_looks:
+      source: sidecar.product.numberOfLooks
+      required: false
+      default: null
+    radiometric_level:
+      source: sidecar.product.radiometricLevel
+      required: false
+      default: null
+    radiometric_enhancement:
+      source: sidecar.product.radiometricEnhancement
+      required: false
+      default: null
+    bits_per_pixel:
+      source: sidecar.product.bitsPerPixel
+      required: false
+      default: null
+    compression_type:
+      source: sidecar.product.compressionType
+      required: false
+      default: null
+    resampling_kernel:
+      source: sidecar.image.resamplingKernel
+      required: false
+      default: null
+  acquisition:
+    line_rate:
+      source: sidecar.image.avgLineRate
+      required: false
+      default: null
+    exposure_duration:
+      source: sidecar.image.exposureDuration
+      required: false
+      default: null
+    mean_row_gsd:
+      source: sidecar.image.meanCollectedRowGSD
+      required: false
+      default: null
+    mean_column_gsd:
+      source: sidecar.image.meanCollectedColGSD
+      required: false
+      default: null
+    mean_gsd:
+      source: sidecar.image.meanCollectedGSD
+      required: false
+      default: null
+  accuracy:
+    product_accuracy:
+      source: sidecar.product.productAccuracy
+      required: false
+      default: null
+    rmse_2d:
+      source: sidecar.product.RMSE2D
+      required: false
+      default: null
+    row_uncertainty:
+      source: sidecar.image.rowUncertainty
+      required: false
+      default: null
+    column_uncertainty:
+      source: sidecar.image.colUncertainty
+      required: false
+      default: null
+    pniirs:
+      source: sidecar.image.PNIIRS
+      required: false
+      default: null
+    cloud_cover:
+      source: sidecar.image.cloudCover
+      required: false
+      default: null
+    position_knowledge_source:
+      source: sidecar.image.positionKnowledgeSrc
+      required: false
+      default: null
+    attitude_knowledge_source:
+      source: sidecar.image.attitudeKnowledgeSrc
+      required: false
+      default: null
+  illumination:
+    sun_azimuth:
+      source: sidecar.image.meanSunAz
+      required: false
+      default: null
+    sun_elevation:
+      source: sidecar.image.meanSunEl
+      required: false
+      default: null
+  view_geometry:
+    satellite_azimuth:
+      source: sidecar.image.meanSatAz
+      required: false
+      default: null
+    satellite_elevation:
+      source: sidecar.image.meanSatEl
+      required: false
+      default: null
+    in_track_view_angle:
+      source: sidecar.image.meanInTrackViewAngle
+      required: false
+      default: null
+    cross_track_view_angle:
+      source: sidecar.image.meanCrossTrackViewAngle
+      required: false
+      default: null
+    off_nadir_view_angle:
+      source: sidecar.image.meanOffNadirViewAngle
+      required: false
+      default: null
+
+thumbnail:
+  enabled: true
+  width: 256
+  height: 256
+  resampling: lanczos
+
+fingerprint:
+  enabled: true
+  mode: robust

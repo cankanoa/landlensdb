@@ -1,0 +1,55 @@
+# Built-in preset: raster footprint derived from its GDAL geotransform.
+source:
+  file_glob: "/path/to/rasters/**/*.@(tif|tiff|vrt|img|jp2)"
+
+name:
+  source: file.name
+  required: true
+  default: null
+
+image_url:
+  source: file.path
+  required: true
+
+geometry:
+  source: bounds_from_image
+  output_crs: EPSG:4326
+  required: true
+  footprint: bounds
+
+metadata:
+  raster:
+    width:
+      source: raster.width
+      required: false
+      default: null
+    height:
+      source: raster.height
+      required: false
+      default: null
+    bands:
+      source: raster.bands
+      required: false
+      default: null
+    projection:
+      source: raster.projection
+      required: false
+      default: null
+    geotransform:
+      source: raster.geotransform
+      required: false
+      default: null
+    format:
+      source: raster.format
+      required: false
+      default: null
+
+thumbnail:
+  enabled: true
+  width: 256
+  height: 256
+  resampling: lanczos
+
+fingerprint:
+  enabled: true
+  mode: robust
