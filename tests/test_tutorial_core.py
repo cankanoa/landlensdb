@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
@@ -9,10 +10,12 @@ from sqlalchemy import DateTime, Float, Integer, String, text
 from landlensdb.geoclasses.geoimageframe import GeoImageFrame
 from landlensdb.handlers.cloud import Mapillary
 from landlensdb.handlers.db import Postgres
-from landlensdb.handlers.local import GeoTaggedImage, SearchLocalToGeoImageFrame
-from landlensdb.process.road_network import (get_osm_lines,
-                                             optimize_network_for_snapping,
-                                             validate_network_topology)
+from landlensdb.handlers.importer import import_local_images
+from landlensdb.process.road_network import (
+    get_osm_lines,
+    optimize_network_for_snapping,
+    validate_network_topology,
+)
 from landlensdb.process.snap import snap_to_road_network
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/landlens_test")
@@ -96,21 +99,30 @@ def prepare_data_for_db(images, create_thumbnails=True):
     # Convert data types and handle nulls
     images = images.copy()
 
-    if 'metadata' in images.columns:
-        if 'altitude' not in images.columns:
-            images['altitude'] = images['metadata'].apply(
-                lambda value: (value or {}).get('sensor', {}).get('altitude')
-                if isinstance(value, dict) else None
+    if "metadata" in images.columns:
+        if "altitude" not in images.columns:
+            images["altitude"] = images["metadata"].apply(
+                lambda value: (
+                    (value or {}).get("sensor", {}).get("altitude")
+                    if isinstance(value, dict)
+                    else None
+                )
             )
-        if 'compass_angle' not in images.columns:
-            images['compass_angle'] = images['metadata'].apply(
-                lambda value: (value or {}).get('sensor', {}).get('compass_angle')
-                if isinstance(value, dict) else None
+        if "compass_angle" not in images.columns:
+            images["compass_angle"] = images["metadata"].apply(
+                lambda value: (
+                    (value or {}).get("sensor", {}).get("compass_angle")
+                    if isinstance(value, dict)
+                    else None
+                )
             )
-        if 'camera_type' not in images.columns:
-            images['camera_type'] = images['metadata'].apply(
-                lambda value: (value or {}).get('camera', {}).get('camera_type')
-                if isinstance(value, dict) else None
+        if "camera_type" not in images.columns:
+            images["camera_type"] = images["metadata"].apply(
+                lambda value: (
+                    (value or {}).get("camera", {}).get("camera_type")
+                    if isinstance(value, dict)
+                    else None
+                )
             )
 
     # Convert numeric fields
@@ -146,8 +158,8 @@ def prepare_data_for_db(images, create_thumbnails=True):
         ).astype("Int64")
 
     # Create thumbnails for local images if needed
-    if create_thumbnails and 'image_url' in images.columns:
-        images['thumb_url'] = images['image_url'].apply(
+    if create_thumbnails and "image_url" in images.columns:
+        images["thumb_url"] = images["image_url"].apply(
             lambda x: x if os.path.exists(x) else x
         )
 
@@ -156,11 +168,9 @@ def prepare_data_for_db(images, create_thumbnails=True):
 
 def test_local_images():
     print("\nTesting local image loading...")
-    local_images = SearchLocalToGeoImageFrame(
-        "test_data/local",
-        import_type=GeoTaggedImage,
-        search_glob=r".*\.JPG$",
-        create_thumbnail=False,
+    local_images = import_local_images(
+        source_file_glob=str(Path("test_data/local").resolve() / "**/*.jpg"),
+        thumbnail_enabled=False,
     )
     print(f"Loaded {len(local_images)} local images")
     print("Sample data:")
@@ -395,8 +405,10 @@ def test_road_network_snapping(images):
         print("\nSample data with snapped geometry:")
         print(
             pd.DataFrame(images)[
-                ['name', 'geometry', 'snapped_geometry', 'snapped_angle']
-            ].head().to_string()
+                ["name", "geometry", "snapped_geometry", "snapped_angle"]
+            ]
+            .head()
+            .to_string()
         )
 
         # Generate visualization

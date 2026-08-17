@@ -16,6 +16,7 @@ from sqlalchemy.sql import text
 from tqdm import tqdm
 from ..handlers.db import Postgres
 
+
 def _hex_to_rgba(hex_color: str, alpha: float = 0.3) -> str:
     """Convert ``#RRGGBB`` to an ``rgba(...)`` CSS color."""
     value = hex_color.lstrip("#")
@@ -112,6 +113,7 @@ class GeoImageFrame(GeoDataFrame):
             }
         )
     """
+
     required_columns = {
         "image_url": str,
         "name": str,
@@ -122,6 +124,8 @@ class GeoImageFrame(GeoDataFrame):
         "metadata": dict,
         "thumbnail": Dataset,
         "fingerprint": str,
+        "input_sha": str,
+        "import_params": str,
     }
 
     def __init__(self, *args, **kwargs):
@@ -152,7 +156,7 @@ class GeoImageFrame(GeoDataFrame):
 
         if not has_geometry:
             return pd.DataFrame(result)
-        if set(cls._required_columns).issubset(result.columns):
+        if set(cls.required_columns).issubset(result.columns):
             return cls(result)
         return result
 
@@ -162,7 +166,7 @@ class GeoImageFrame(GeoDataFrame):
         if not isinstance(result, pd.DataFrame):
             return result
 
-        is_complete = set(cls._required_columns).issubset(result.columns)
+        is_complete = set(cls.required_columns).issubset(result.columns)
         has_geometry = (result.dtypes == "geometry").any()
 
         if is_complete and has_geometry:
@@ -215,7 +219,10 @@ class GeoImageFrame(GeoDataFrame):
                 raise ValueError(
                     "'fingerprint' must be set for all rows or omitted for all rows."
                 )
-            if fingerprint_present.any() and self.loc[fingerprint_present, "fingerprint"].duplicated().any():
+            if (
+                fingerprint_present.any()
+                and self.loc[fingerprint_present, "fingerprint"].duplicated().any()
+            ):
                 raise ValueError(
                     "'fingerprint' column has duplicate entries. It must be unique when set."
                 )
@@ -294,9 +301,7 @@ class GeoImageFrame(GeoDataFrame):
         table_ident = table_name.replace('"', '""')
         constraint_ident = constraint_name.replace('"', '""')
         column_ident = column_name.replace('"', '""')
-        conn.execute(
-            text(
-                f"""
+        conn.execute(text(f"""
                 DO $$
                 BEGIN
                     IF NOT EXISTS (
@@ -310,9 +315,7 @@ class GeoImageFrame(GeoDataFrame):
                     END IF;
                 END
                 $$;
-                """
-            )
-        )
+                """))
 
     @staticmethod
     def _download_image_from_url(

@@ -49,7 +49,7 @@ class SetupTab(QtWidgets.QWidget):
         self.server_homebrew_radio = QtWidgets.QRadioButton('Homebrew')
         self.server_windows_radio = QtWidgets.QRadioButton('Windows')
         self.server_conda_radio = QtWidgets.QRadioButton('Conda')
-        self.server_homebrew_radio.setChecked(True)
+        self.server_conda_radio.setChecked(True)
 
         server_radio_row = QtWidgets.QHBoxLayout()
         server_radio_row.addWidget(self.server_installer_radio)
@@ -92,6 +92,19 @@ class SetupTab(QtWidgets.QWidget):
             )
         )
         server_section_layout.addWidget(self.server_group)
+
+        self.server_requirements_label = QtWidgets.QLabel(
+            '<b>Server requirements</b>'
+            '<ul>'
+            '<li>PostgreSQL 14+ running and reachable</li>'
+            '<li>PostGIS and postgis_raster installed and activated</li>'
+            '<li>PostGIS GDAL raster drivers enabled</li>'
+            '<li>Login can use the database/schema and create tables</li>'
+            '</ul>'
+        )
+        self.server_requirements_label.setTextFormat(QtCore.Qt.RichText)
+        self.server_requirements_label.setWordWrap(True)
+        server_section_layout.addWidget(self.server_requirements_label)
         layout.addWidget(server_section)
 
         connection_section = QtWidgets.QWidget()

@@ -1,87 +1,71 @@
 # -*- coding: utf-8 -*-
+"""QGIS import workflow grouped by canonical import parameter SHA."""
 
 import threading
-from datetime import datetime
 from urllib.parse import quote_plus
 
+import psycopg2
+from psycopg2 import sql
 from qgis.PyQt import QtCore, QtWidgets
 from qgis.core import Qgis
+from sqlalchemy import create_engine
 
-from ..shared.connection_dialog import ConnectionDialog
+from ..landlensdb import (
+    Postgres,
+    calculate_input_sha,
+    import_local_images,
+    import_yaml_to_function_params,
+    load_example_import_yaml,
+    load_import_presets,
+    normalize_import_yaml,
+)
+from ..landlensdb.handlers.importer import discover_image_paths
+from ..landlensdb.handlers.local import ImportCancelledError
 from ..shared.connection_utils import (
     connection_kwargs,
     fetch_base_tables,
     load_connection_settings,
-    save_connection_settings,
-    test_connection_values,
     validate_connection_values,
 )
-from ..shared.import_params import unique_import_parameter_rows
-import psycopg2
-from psycopg2 import sql
-from sqlalchemy import create_engine
-
-from ..landlensdb import SearchLocalToGeoImageFrame, Postgres
-from ..landlensdb.handlers.local import ImportCancelledError
-
+from ..shared.import_settings import (
+    has_saved_import_parameters,
+    load_import_parameters,
+    save_import_parameters,
+)
+from ..shared.metadata_settings import fetch_metadata_tree
+from ..shared.yaml_editor import ImportYamlDialog
 
 
 class AddTableDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super(AddTableDialog, self).__init__(parent)
-        self.setWindowTitle('Add Table')
-        self.resize(360, 100)
-
+        self.setWindowTitle("Add Table")
         layout = QtWidgets.QVBoxLayout(self)
-        form = QtWidgets.QHBoxLayout()
-        form.addWidget(QtWidgets.QLabel('Name'))
-        self.name_input = QtWidgets.QLineEdit()
-        form.addWidget(self.name_input, 1)
-        layout.addLayout(form)
-
-        buttons = QtWidgets.QHBoxLayout()
-        self.create_button = QtWidgets.QPushButton('Create')
-        self.cancel_button = QtWidgets.QPushButton('Cancel')
-        buttons.addStretch()
-        buttons.addWidget(self.create_button)
-        buttons.addWidget(self.cancel_button)
-        layout.addLayout(buttons)
-
-        self.create_button.clicked.connect(self.accept)
-        self.cancel_button.clicked.connect(self.reject)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Name"))
+        self.name_input = QtWidgets.QLineEdit(self)
+        row.addWidget(self.name_input, 1)
+        layout.addLayout(row)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
     def table_name(self):
         return self.name_input.text().strip()
 
 
 class ImportTab(QtWidgets.QWidget):
-    STATUS_COLUMN = 0
-    ACTIONS_COLUMN = 1
-    IMPORT_TYPE_COLUMN = 2
-    QUERY_FROM_COLUMN = 3
-    SEARCH_GLOB_COLUMN = 4
-    ADDITIONAL_GLOB_COLUMN = 5
-    HEADERS = [
-        '',
-        'Actions',
-        'import_type',
-        'query_from',
-        'search_glob',
-        'additional_files_and_metadata_glob',
-    ]
-    ADD_TABLE_SENTINEL = '__add_table__'
-    IMPORT_TYPES = ['', 'GeoTaggedImage', 'GeoTransformImage', 'WorldView3Image']
-    IMPORT_EXAMPLE = (
-        "Example geotagged images:\n"
-        " - query_from: /folder/with/images\n"
-        " - import_type: GeoTaggedImage\n"
+    """Import images and show one row per canonical import configuration."""
 
-        "Example Worldview-3 images:\n"
-        " - query_from: /folder/with/images\n"
-        " - import_type: WorldView3Image\n"
-        " - search_glob: **/*.TIL\n"
-        " - additional_files_and_metadata_glob: ./{base}.yml"
-    )
+    COUNT_COLUMN = 0
+    FILE_GLOB_COLUMN = 1
+    IMPORT_PARAMS_COLUMN = 2
+    ACTIONS_COLUMN = 3
+    HEADERS = ["Rows", "file_glob", "import_params", "Actions"]
 
     def __init__(self, iface, parent=None):
         super(ImportTab, self).__init__(parent)
@@ -90,142 +74,76 @@ class ImportTab(QtWidgets.QWidget):
         self._selected_table = None
         self._cancel_import_event = threading.Event()
         self._import_active = False
-        self._last_refreshed_at = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(10)
 
-        top_row = QtWidgets.QHBoxLayout()
-        self.table_help_button = QtWidgets.QToolButton(self)
-        self.table_help_button.setText('?')
-        self.table_help_button.setAutoRaise(True)
-        self.table_help_button.setToolTip('How the table section works')
-        self.table_help_button.clicked.connect(self._show_table_help)
-        top_row.addWidget(self.table_help_button)
-        self.table_label = QtWidgets.QLabel('Table:')
-        top_row.addWidget(self.table_label)
-        self.table_button = QtWidgets.QToolButton()
+        table_row = QtWidgets.QHBoxLayout()
+        table_row.addWidget(QtWidgets.QLabel("Table:"))
+        self.table_button = QtWidgets.QToolButton(self)
         self.table_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.table_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.table_button.setArrowType(QtCore.Qt.DownArrow)
-        self.table_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.table_button.setStyleSheet('')
-        top_row.addWidget(self.table_button, 1)
-        self.refresh_table_button = QtWidgets.QToolButton()
-        self.refresh_table_button.setAutoRaise(True)
-        self.refresh_table_button.setIcon(
-            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
+        self.table_button.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
         )
-        self.refresh_table_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.refresh_table_button.setToolTip('Refresh input parameter rows from the selected table.')
-        self.refresh_table_button.clicked.connect(self.refresh_table)
-        top_row.addWidget(self.refresh_table_button)
-        self.all_actions_button = self._build_actions_menu_button(
-            label='Actions',
-            tooltip='Run table-level actions for all saved input parameters.',
-            actions=[
-                ('Update', 'Update all saved input parameters in the selected table.', self.run_all_updates),
-                (
-                    'Update New',
-                    'Update all saved input parameters, skipping images already in PostgreSQL.',
-                    lambda: self.run_all_updates(skip_existing=True),
-                ),
-                (
-                    'Drop Old',
-                    'Remove rows whose source files no longer exist on disk.',
-                    self.run_all_drop_old,
-                ),
-                (
-                    'Drop All',
-                    'Remove all rows for all saved input parameters in this table.',
-                    self.run_all_drop_all,
-                ),
-                (
-                    'Sync (Drop Old/Update)',
-                    'Drop old rows, then update all saved input parameters.',
-                    self.run_all_sync,
-                ),
-                (
-                    'Get Additional Metadata',
-                    'Resolve the additional metadata glob for all saved rows in this table.',
-                    self.run_all_get_additional_metadata,
-                ),
-            ],
-        )
-        top_row.addWidget(self.all_actions_button)
-        layout.addLayout(top_row)
+        table_row.addWidget(self.table_button, 1)
+        self.refresh_button = QtWidgets.QPushButton("Refresh", self)
+        self.refresh_button.clicked.connect(self.refresh_table)
+        table_row.addWidget(self.refresh_button)
+        layout.addLayout(table_row)
 
         self.import_table = QtWidgets.QTableWidget(self)
         self.import_table.setColumnCount(len(self.HEADERS))
         self.import_table.setHorizontalHeaderLabels(self.HEADERS)
         self.import_table.verticalHeader().setVisible(False)
-        self.import_table.setAlternatingRowColors(True)
-        self.import_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self.import_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.import_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.import_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
-        self.import_table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
-        self.import_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.import_table)
+        self.import_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.import_table.setHorizontalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollPerPixel
+        )
+        self.import_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.import_table.horizontalHeader().setMinimumSectionSize(24)
+        self.import_table.horizontalHeader().setStretchLastSection(False)
+        self.import_table.itemDoubleClicked.connect(
+            self.open_selected_group_import_parameters
+        )
+        layout.addWidget(self.import_table, 1)
 
-        button_row = QtWidgets.QHBoxLayout()
-        self.connection_button = QtWidgets.QPushButton('Connection')
-        button_row.addWidget(self.connection_button)
-        button_row.addWidget(QtWidgets.QLabel('Threads:'))
+        runtime_row = QtWidgets.QHBoxLayout()
+        runtime_row.addWidget(QtWidgets.QLabel("Threads:"))
         self.thread_count_input = QtWidgets.QSpinBox(self)
-        self.thread_count_input.setMinimum(1)
-        self.thread_count_input.setMaximum(256)
-        self.thread_count_input.setValue(25)
-        self.thread_count_input.setFixedWidth(72)
-        button_row.addWidget(self.thread_count_input)
-        button_row.addWidget(QtWidgets.QLabel('Batch Size:'))
+        self.thread_count_input.setRange(1, 256)
+        self.thread_count_input.setValue(4)
+        runtime_row.addWidget(self.thread_count_input)
+        runtime_row.addWidget(QtWidgets.QLabel("Batch size:"))
         self.batch_size_input = QtWidgets.QSpinBox(self)
-        self.batch_size_input.setMinimum(1)
-        self.batch_size_input.setMaximum(10000)
+        self.batch_size_input.setRange(1, 10000)
         self.batch_size_input.setValue(100)
-        self.batch_size_input.setFixedWidth(84)
-        button_row.addWidget(self.batch_size_input)
-        self.import_progress_bar = QtWidgets.QProgressBar(self)
-        self.import_progress_bar.setTextVisible(False)
-        self.import_progress_bar.setRange(0, 0)
-        self.import_progress_bar.setValue(0)
-        self.import_progress_bar.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Fixed,
-        )
-        self.import_progress_label = QtWidgets.QLabel('0/0', self)
-        self.import_progress_label.setAlignment(
-            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
-        )
-        button_row.addWidget(self.import_progress_bar, 1)
-        button_row.addWidget(self.import_progress_label)
-        self.cancel_import_button = QtWidgets.QToolButton(self)
-        self.cancel_import_button.setText('x')
-        self.cancel_import_button.setAutoRaise(True)
-        self.cancel_import_button.setToolTip('Cancel the active import.')
-        self.cancel_import_button.clicked.connect(self._cancel_active_import)
-        button_row.addWidget(self.cancel_import_button)
-        layout.addLayout(button_row)
+        runtime_row.addWidget(self.batch_size_input)
+        runtime_row.addWidget(QtWidgets.QLabel("On error:"))
+        self.on_error_input = QtWidgets.QComboBox(self)
+        self.on_error_input.addItems(["skip", "warn", "error"])
+        runtime_row.addWidget(self.on_error_input)
+        self.open_yaml_button = QtWidgets.QPushButton("Import Parameters…", self)
+        self.open_yaml_button.clicked.connect(self.open_import_parameters)
+        runtime_row.addWidget(self.open_yaml_button)
+        self.actions_button = self._build_actions_button()
+        runtime_row.addWidget(self.actions_button)
+        self.progress_bar = QtWidgets.QProgressBar(self)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        runtime_row.addWidget(self.progress_bar, 1)
+        self.cancel_button = QtWidgets.QPushButton("Cancel", self)
+        self.cancel_button.clicked.connect(self._cancel_active_import)
+        runtime_row.addWidget(self.cancel_button)
+        layout.addLayout(runtime_row)
 
-        self.connection_button.clicked.connect(self.open_connection_dialog)
-
-        self._update_connection_button_text()
         self._refresh_table_choices()
         self.load_records([])
-        self._set_last_updated(None)
-        self._reset_progress()
         self._set_import_active(False)
-
-    def _show_table_help(self):
-        QtWidgets.QMessageBox.information(
-            self,
-            'Table',
-            (
-                "Choose the table that stores your imported image rows. Each saved input parameters "
-                "in the table defines what folder to search, which importer to use, and "
-                "what files to match.\n\nExamples:\n{}"
-            ).format(self.IMPORT_EXAMPLE),
-        )
 
     def showEvent(self, event):
         super(ImportTab, self).showEvent(event)
@@ -233,1176 +151,585 @@ class ImportTab(QtWidgets.QWidget):
 
     def reload_connection_settings(self, values=None):
         self.connection_values = dict(values or load_connection_settings())
-        self._update_connection_button_text()
         self._refresh_table_choices()
-
-    def open_connection_dialog(self):
-        dialog = ConnectionDialog(self.connection_values, self._test_connection_values, self)
-        if dialog.exec_():
-            self.connection_values = dialog.values()
-            save_connection_settings(self.connection_values)
-            self._update_connection_button_text()
-            self._refresh_table_choices()
-
-    def _test_connection_values(self, values):
-        success, message = test_connection_values(values)
-        if success:
-            self.connection_values = dict(values)
-            save_connection_settings(self.connection_values)
-            self._update_connection_button_text()
-            self._refresh_table_choices()
-        return success, message
-
-    def _update_connection_button_text(self):
-        label = self.connection_values.get('name') or self.connection_values.get('database') or 'Connection'
-        self.connection_button.setText('Connection' if label == 'Connection' else 'Connection: {}'.format(label))
-
-    def _refresh_table_choices(self, selected_table=None):
-        current_table = selected_table or self.current_table_name()
-        tables = self._fetch_tables()
-
-        if current_table in tables:
-            self._selected_table = current_table
-        elif tables:
-            self._selected_table = tables[0]
-        else:
-            self._selected_table = None
-
-        menu = QtWidgets.QMenu(self.table_button)
-        for table_name in tables:
-            menu.addAction(table_name, lambda checked=False, name=table_name: self._select_table(name))
-        if tables:
-            menu.addSeparator()
-            delete_menu = menu.addMenu('Delete Table')
-            for table_name in tables:
-                delete_menu.addAction(
-                    table_name,
-                    lambda checked=False, name=table_name: self.drop_selected_table(name),
-                )
-        menu.addAction('Add Table...', self.add_table)
-        menu.setMinimumWidth(max(self.table_button.width(), 240))
-
-        self.table_button.setMenu(menu)
-        button_label = self._selected_table or 'Choose Table'
-        self.table_button.setText(button_label)
 
     def current_table_name(self):
         return self._selected_table
 
+    def _refresh_table_choices(self, selected_table=None):
+        tables = fetch_base_tables(self.connection_values)
+        current = selected_table or self._selected_table
+        self._selected_table = (
+            current if current in tables else (tables[0] if tables else None)
+        )
+        menu = QtWidgets.QMenu(self.table_button)
+        for table_name in tables:
+            menu.addAction(
+                table_name,
+                lambda checked=False, name=table_name: self._select_table(name),
+            )
+        if tables:
+            menu.addSeparator()
+            drop_menu = menu.addMenu("Delete Table")
+            for table_name in tables:
+                drop_menu.addAction(
+                    table_name,
+                    lambda checked=False, name=table_name: self.drop_selected_table(
+                        name
+                    ),
+                )
+        menu.addAction("Add Table…", self.add_table)
+        self.table_button.setMenu(menu)
+        self.table_button.setText(self._selected_table or "Choose Table")
+
     def _select_table(self, table_name):
         self._selected_table = table_name
         self.table_button.setText(table_name)
-        self.load_records([])
-        self._set_last_updated(None)
+        self.refresh_table()
 
     def add_table(self):
         valid, message = validate_connection_values(self.connection_values)
         if not valid:
             self._show_message(message, Qgis.Critical)
             return
-
         dialog = AddTableDialog(self)
-        if not dialog.exec_():
-            self._refresh_table_choices()
+        if not dialog.exec_() or not dialog.table_name():
             return
-
         table_name = dialog.table_name()
-        if not table_name:
-            self._show_message('Table name is required.', Qgis.Critical)
-            self._refresh_table_choices()
-            return
-
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        schema_name = (
+            self.connection_values.get("schema", "public").strip() or "public"
+        )
         try:
-            with psycopg2.connect(**connection_kwargs(self.connection_values)) as connection:
+            with psycopg2.connect(
+                **connection_kwargs(self.connection_values)
+            ) as connection:
                 with connection.cursor() as cursor:
-                    cursor.execute('CREATE EXTENSION IF NOT EXISTS postgis')
-                    cursor.execute('CREATE EXTENSION IF NOT EXISTS postgis_raster')
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis_raster")
                     cursor.execute(
-                        sql.SQL(
-                            """
-                            CREATE TABLE {}.{} (
+                        sql.SQL("""CREATE TABLE {}.{} (
                                 image_url text NOT NULL,
                                 name text NOT NULL,
                                 geometry geometry(Geometry, 4326) NOT NULL,
-                                metadata jsonb,
+                                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                                thumbnail raster,
                                 fingerprint text,
-                                thumbnail raster
-                            )
-                            """
-                        ).format(
-                            sql.Identifier(schema_name),
-                            sql.Identifier(table_name),
+                                input_sha text NOT NULL,
+                                import_params text NOT NULL
+                            )""").format(
+                            sql.Identifier(schema_name), sql.Identifier(table_name)
                         )
                     )
                     cursor.execute(
                         sql.SQL(
-                            'ALTER TABLE {}.{} ADD CONSTRAINT {} UNIQUE (image_url)'
+                            "ALTER TABLE {}.{} ADD CONSTRAINT {} UNIQUE (image_url)"
                         ).format(
                             sql.Identifier(schema_name),
                             sql.Identifier(table_name),
-                            sql.Identifier('{}_image_url_key'.format(table_name)),
+                            sql.Identifier("{}_image_url_key".format(table_name)),
                         )
                     )
                     cursor.execute(
-                        sql.SQL(
-                            'ALTER TABLE {}.{} ADD CONSTRAINT {} UNIQUE (fingerprint)'
-                        ).format(
+                        sql.SQL("CREATE INDEX {} ON {}.{} (input_sha)").format(
+                            sql.Identifier("{}_input_sha_idx".format(table_name)),
                             sql.Identifier(schema_name),
                             sql.Identifier(table_name),
-                            sql.Identifier('{}_fingerprint_key'.format(table_name)),
                         )
                     )
                 connection.commit()
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Could not create table: {}'.format(exc), Qgis.Critical)
-            self._refresh_table_choices()
+        except Exception as exc:
+            self._show_message("Could not create table: {}".format(exc), Qgis.Critical)
             return
-
-        self._refresh_table_choices(selected_table=table_name)
-        self._selected_table = table_name
-        self.table_button.setText(table_name)
+        self._refresh_table_choices(table_name)
         self.load_records([])
-        self._set_last_updated(None)
-        self._show_message('Created table "{}".'.format(table_name), Qgis.Info)
 
     def drop_selected_table(self, table_name=None):
         table_name = table_name or self.current_table_name()
         if not table_name:
             return
-
-        answer = QtWidgets.QMessageBox.question(
-            self,
-            'Drop Table',
-            'Drop table "{}"?'.format(table_name),
-        )
-        if answer != QtWidgets.QMessageBox.Yes:
+        if (
+            QtWidgets.QMessageBox.question(
+                self, "Drop Table", 'Drop table "{}"?'.format(table_name)
+            )
+            != QtWidgets.QMessageBox.Yes
+        ):
             return
-
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
         try:
-            with psycopg2.connect(**connection_kwargs(self.connection_values)) as connection:
+            with psycopg2.connect(
+                **connection_kwargs(self.connection_values)
+            ) as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        sql.SQL('DROP TABLE {}.{}').format(
-                            sql.Identifier(schema_name),
-                            sql.Identifier(table_name),
+                        sql.SQL("DROP TABLE {}.{}").format(
+                            sql.Identifier(schema_name), sql.Identifier(table_name)
                         )
                     )
                 connection.commit()
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Could not drop table: {}'.format(exc), Qgis.Critical)
+        except Exception as exc:
+            self._show_message("Could not drop table: {}".format(exc), Qgis.Critical)
             return
-
+        self._selected_table = None
         self._refresh_table_choices()
         self.load_records([])
-        self._set_last_updated(None)
-        self._show_message('Dropped table "{}".'.format(table_name), Qgis.Info)
 
     def refresh_table(self):
-        valid, message = validate_connection_values(self.connection_values)
-        if not valid:
-            self._show_message(message, Qgis.Critical)
-            return
-
         table_name = self.current_table_name()
         if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
+            self.load_records([])
             return
-
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
-        records = []
-
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
         try:
-            with psycopg2.connect(**connection_kwargs(self.connection_values)) as connection:
+            with psycopg2.connect(
+                **connection_kwargs(self.connection_values)
+            ) as connection:
                 with connection.cursor() as cursor:
-                    if schema_name:
-                        cursor.execute(
-                            sql.SQL('SET search_path TO {}, public').format(
-                                sql.Identifier(schema_name),
-                            )
-                        )
                     cursor.execute(
                         sql.SQL(
-                            """
-                            SELECT
-                                metadata::jsonb->'input_params'->>'query_from' AS query_from,
-                                metadata::jsonb->'input_params'->>'import_type' AS import_type,
-                                metadata::jsonb->'input_params'->>'search_glob' AS search_glob,
-                                metadata::jsonb->'input_params'->>'additional_files_and_metadata_glob' AS additional_files_and_metadata_glob,
-                                COUNT(*) AS row_count
-                            FROM {}.{}
-                            WHERE metadata::jsonb ? 'input_params'
-                            GROUP BY 1, 2, 3, 4
-                            ORDER BY 1, 2, 3, 4
-                            """
+                            "SELECT input_sha, COUNT(*), MIN(import_params) "
+                            "FROM {}.{} WHERE input_sha IS NOT NULL "
+                            "GROUP BY input_sha ORDER BY input_sha"
                         ).format(
-                            sql.Identifier(schema_name),
-                            sql.Identifier(table_name),
+                            sql.Identifier(schema_name), sql.Identifier(table_name)
                         )
                     )
                     records = [
                         {
-                            'metadata': {
-                                'input_params': {
-                                    'query_from': row[0],
-                                    'import_type': row[1],
-                                    'search_glob': row[2],
-                                    'additional_files_and_metadata_glob': row[3],
-                                    'row_count': row[4],
-                                }
-                            }
+                            "input_sha": row[0],
+                            "row_count": row[1],
+                            "import_params": row[2],
                         }
                         for row in cursor.fetchall()
                     ]
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Could not load import parameters: {}'.format(exc), Qgis.Critical)
+                connection.commit()
+        except Exception as exc:
+            self._show_message(
+                "Could not load import groups: {}".format(exc), Qgis.Critical
+            )
             return
-
         self.load_records(records)
-        self._set_last_updated(datetime.now())
-        self._show_message('Loaded {} input parameter set(s).'.format(len(records)), Qgis.Info)
-
-    def _set_last_updated(self, timestamp):
-        self._last_refreshed_at = timestamp
-        if timestamp is None:
-            self.refresh_table_button.setText('Last updated: never')
-            return
-        self.refresh_table_button.setText(
-            'Last updated: {}'.format(timestamp.strftime('%Y-%m-%d %H:%M:%S'))
-        )
 
     def load_records(self, records):
-        unique_rows = unique_import_parameter_rows(records)
-        row_counts = {}
-        for record in records:
-            input_params = (record.get('metadata') or {}).get('input_params') or {}
-            input_params_key = (
-                input_params.get('query_from') or '',
-                input_params.get('import_type') or '',
-                input_params.get('search_glob') or '',
-                input_params.get('additional_files_and_metadata_glob') or '',
-            )
-            row_counts[input_params_key] = input_params.get(
-                'row_count',
-                row_counts.get(input_params_key, 0),
-            )
+        self.import_table.setRowCount(len(records or []))
+        for row_index, record in enumerate(records or []):
+            input_sha = str(record.get("input_sha") or "")
+            count = int(record.get("row_count") or 0)
+            import_params = record.get("import_params")
+            count_item = QtWidgets.QTableWidgetItem(str(count))
+            count_item.setData(QtCore.Qt.UserRole, input_sha)
+            count_item.setData(QtCore.Qt.UserRole + 1, import_params)
+            self.import_table.setItem(row_index, self.COUNT_COLUMN, count_item)
 
-        self.import_table.clearContents()
-        self.import_table.setRowCount(len(unique_rows) + 1)
-        for row_index, row_values in enumerate(unique_rows):
+            file_glob = self._file_glob_from_import_params(import_params)
+            file_glob_item = QtWidgets.QTableWidgetItem(file_glob)
+            file_glob_item.setToolTip(file_glob)
+            self.import_table.setItem(
+                row_index, self.FILE_GLOB_COLUMN, file_glob_item
+            )
             self.import_table.setCellWidget(
                 row_index,
-                self.STATUS_COLUMN,
-                self._build_status_widget(
-                    row_index,
-                    row_values,
-                    row_counts.get(row_values, 0),
-                    editable=True,
-                ),
+                self.IMPORT_PARAMS_COLUMN,
+                self._build_import_params_button(input_sha),
             )
             self.import_table.setCellWidget(
                 row_index,
                 self.ACTIONS_COLUMN,
-                self._build_actions_widget(row_index, include_update_new=True),
+                self._build_actions_button(input_sha, import_params),
             )
-            self.import_table.setCellWidget(row_index, self.IMPORT_TYPE_COLUMN, self._build_import_type_widget(row_values[1], row_index))
-            self.import_table.setCellWidget(row_index, self.QUERY_FROM_COLUMN, self._build_query_from_widget(row_values[0], row_index))
-            self.import_table.setCellWidget(row_index, self.SEARCH_GLOB_COLUMN, self._build_search_glob_widget(row_values[2], row_index))
-            self.import_table.setCellWidget(
-                row_index,
-                self.ADDITIONAL_GLOB_COLUMN,
-                self._build_additional_glob_widget(row_values[3], row_index),
+        if self.import_table.rowCount():
+            self.import_table.selectRow(0)
+        QtCore.QTimer.singleShot(0, self._resize_import_columns)
+
+    @staticmethod
+    def _file_glob_from_import_params(import_params):
+        if not import_params:
+            return ""
+        try:
+            parameters = import_yaml_to_function_params(import_params)
+        except Exception:
+            return ""
+        return str(parameters.get("source_file_glob") or "")
+
+    def _resize_import_columns(self):
+        """Give file_glob spare width while retaining content-size minima."""
+        if not hasattr(self, "import_table"):
+            return
+        for column in range(self.import_table.columnCount()):
+            self.import_table.resizeColumnToContents(column)
+        used_width = sum(
+            self.import_table.columnWidth(column)
+            for column in range(self.import_table.columnCount())
+        )
+        spare_width = self.import_table.viewport().width() - used_width
+        if spare_width > 0:
+            self.import_table.setColumnWidth(
+                self.FILE_GLOB_COLUMN,
+                self.import_table.columnWidth(self.FILE_GLOB_COLUMN) + spare_width,
             )
-            self._update_status_widget(row_index)
 
-        add_row_index = len(unique_rows)
-        self.import_table.setCellWidget(
-            add_row_index,
-            self.STATUS_COLUMN,
-            self._build_status_widget(add_row_index, None, 0, editable=False),
-        )
-        self.import_table.setCellWidget(
-            add_row_index,
-            self.ACTIONS_COLUMN,
-            self._build_actions_widget(add_row_index, include_update_new=False),
-        )
-        self.import_table.setCellWidget(add_row_index, self.IMPORT_TYPE_COLUMN, self._build_import_type_widget('', add_row_index))
-        self.import_table.setCellWidget(add_row_index, self.QUERY_FROM_COLUMN, self._build_query_from_widget('', add_row_index))
-        self.import_table.setCellWidget(add_row_index, self.SEARCH_GLOB_COLUMN, self._build_search_glob_widget('', add_row_index))
-        self.import_table.setCellWidget(
-            add_row_index,
-            self.ADDITIONAL_GLOB_COLUMN,
-            self._build_additional_glob_widget('', add_row_index),
-        )
-        self._update_status_widget(add_row_index)
+    def resizeEvent(self, event):
+        super(ImportTab, self).resizeEvent(event)
+        QtCore.QTimer.singleShot(0, self._resize_import_columns)
 
-        header = self.import_table.horizontalHeader()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
-        self.import_table.resizeColumnsToContents()
+    def selected_input_sha(self):
+        row = self.import_table.currentRow()
+        if row < 0:
+            return None
+        item = self.import_table.item(row, self.COUNT_COLUMN)
+        return item.data(QtCore.Qt.UserRole) if item else None
 
-    def run_row_update(self, row_index, skip_existing=False):
+    def _fetch_first_import_params(self, input_sha):
         table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
+        if not table_name or not input_sha:
+            return None
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
+        with psycopg2.connect(
+            **connection_kwargs(self.connection_values)
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT import_params FROM {}.{} WHERE input_sha = %s ORDER BY image_url LIMIT 1"
+                    ).format(sql.Identifier(schema_name), sql.Identifier(table_name)),
+                    (input_sha,),
+                )
+                row = cursor.fetchone()
+        return row[0] if row else None
 
-        row_params = self._row_parameters(row_index)
-        if row_params is None:
-            self._show_message('Import row is incomplete.', Qgis.Critical)
-            return
+    def open_import_parameters(self, *_args):
+        example = load_example_import_yaml()
+        yaml_text = load_import_parameters(example)
+        self._show_import_parameters(yaml_text)
 
-        query_from, import_type, search_glob, additional_glob = row_params
-        if not query_from or not import_type or not search_glob:
+    def _show_import_parameters(self, yaml_text):
+        dialog = ImportYamlDialog(
+            yaml_text,
+            normalize_import_yaml,
+            presets=load_import_presets(),
+            parent=self,
+        )
+        if dialog.exec_():
+            save_import_parameters(dialog.yaml_text())
+            self._show_message("Import parameters saved.", Qgis.Info)
+
+    def _build_import_params_button(self, input_sha):
+        button = QtWidgets.QPushButton("View YAML", self)
+        button.clicked.connect(
+            lambda checked=False, sha=input_sha: self.open_group_import_parameters(sha)
+        )
+        return button
+
+    def open_selected_group_import_parameters(self, *_args):
+        input_sha = self.selected_input_sha()
+        if input_sha:
+            self.open_group_import_parameters(input_sha)
+
+    def open_group_import_parameters(self, input_sha):
+        try:
+            yaml_text = self._fetch_first_import_params(input_sha)
+        except Exception as exc:
             self._show_message(
-                'query_from, import_type, and search_glob are required.',
-                Qgis.Critical,
+                "Could not load import parameters: {}".format(exc), Qgis.Critical
             )
             return
-
-        try:
-            self._run_import_update(
-                table_name,
-                query_from,
-                import_type,
-                search_glob,
-                additional_glob,
-                skip_existing=skip_existing,
+        if not yaml_text:
+            self._show_message(
+                "This import group has no stored import parameters.", Qgis.Warning
             )
-        except ImportCancelledError:
-            self._show_message('Import cancelled.', Qgis.Warning)
-            self.refresh_table()
             return
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Import update failed: {}'.format(exc), Qgis.Critical)
-            return
-
-        self._show_message('Updated "{}" from {}.'.format(table_name, query_from), Qgis.Info)
-        self.refresh_table()
-
-    def run_all_updates(self, skip_existing=False):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        update_rows = self._saved_input_parameter_rows()
-        if not update_rows:
-            self._show_message('No saved input parameter rows to update.', Qgis.Critical)
-            return
-
-        for query_from, import_type, search_glob, additional_glob in update_rows:
-            try:
-                self._run_import_update(
-                    table_name,
-                    query_from,
-                    import_type,
-                    search_glob,
-                    additional_glob,
-                    skip_existing=skip_existing,
-                )
-            except ImportCancelledError:
-                self._show_message('Import cancelled.', Qgis.Warning)
-                self.refresh_table()
-                return
-            except Exception as exc:  # pragma: no cover
-                self._show_message('Import update failed: {}'.format(exc), Qgis.Critical)
-                return
-
-        self._show_message(
-            'Updated {} input parameter set(s) for "{}".'.format(
-                len(update_rows),
-                table_name,
-            ),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def run_all_drop_old(self):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        update_rows = self._saved_input_parameter_rows()
-        if not update_rows:
-            self._show_message('No saved input parameter rows to prune.', Qgis.Critical)
-            return
-
-        deleted_rows = 0
-        for query_from, import_type, search_glob, additional_glob in update_rows:
-            try:
-                deleted_rows += self._run_drop_old(
-                    table_name,
-                    query_from,
-                    import_type,
-                    search_glob,
-                    additional_glob,
-                )
-            except Exception as exc:  # pragma: no cover
-                self._show_message('Drop Old failed: {}'.format(exc), Qgis.Critical)
-                return
-
-        self._show_message(
-            'Dropped {} old row(s) from "{}".'.format(deleted_rows, table_name),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def run_all_drop_all(self):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        update_rows = self._saved_input_parameter_rows()
-        if not update_rows:
-            self._show_message('No saved input parameter rows to drop.', Qgis.Critical)
-            return
-
-        deleted_rows = 0
-        for query_from, import_type, search_glob, additional_glob in update_rows:
-            try:
-                deleted_rows += self._run_drop_all(
-                    table_name,
-                    query_from,
-                    import_type,
-                    search_glob,
-                    additional_glob,
-                )
-            except Exception as exc:  # pragma: no cover
-                self._show_message('Drop All failed: {}'.format(exc), Qgis.Critical)
-                return
-
-        self._show_message(
-            'Dropped {} row(s) from "{}".'.format(deleted_rows, table_name),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def run_all_sync(self):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        update_rows = self._saved_input_parameter_rows()
-        if not update_rows:
-            self._show_message('No saved input parameter rows to sync.', Qgis.Critical)
-            return
-
-        for query_from, import_type, search_glob, additional_glob in update_rows:
-            try:
-                self._run_drop_old(
-                    table_name,
-                    query_from,
-                    import_type,
-                    search_glob,
-                    additional_glob,
-                )
-                self._run_import_update(
-                    table_name,
-                    query_from,
-                    import_type,
-                    search_glob,
-                    additional_glob,
-                    skip_existing=False,
-                )
-            except Exception as exc:  # pragma: no cover
-                self._show_message('Sync failed: {}'.format(exc), Qgis.Critical)
-                return
-
-        self._show_message(
-            'Synced {} input parameter set(s) for "{}".'.format(
-                len(update_rows),
-                table_name,
-            ),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def run_row_drop_old(self, row_index):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        row_params = self._saved_input_params(row_index)
-        if row_params is None:
-            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
-            return
-
-        query_from, import_type, search_glob, additional_glob = row_params
-        if not query_from or not import_type or not search_glob:
-            self._show_message('query_from, import_type, and search_glob are required.', Qgis.Critical)
-            return
-
-        try:
-            deleted_rows = self._run_drop_old(
-                table_name,
-                query_from,
-                import_type,
-                search_glob,
-                additional_glob,
-            )
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Drop Old failed: {}'.format(exc), Qgis.Critical)
-            return
-
-        self._show_message(
-            'Dropped {} old row(s) from "{}".'.format(deleted_rows, table_name),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def run_row_drop_all(self, row_index):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        row_params = self._saved_input_params(row_index)
-        if row_params is None:
-            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
-            return
-
-        query_from, import_type, search_glob, additional_glob = row_params
-        if not query_from or not import_type or not search_glob:
-            self._show_message('query_from, import_type, and search_glob are required.', Qgis.Critical)
-            return
-
-        try:
-            deleted_rows = self._run_drop_all(
-                table_name,
-                query_from,
-                import_type,
-                search_glob,
-                additional_glob,
-            )
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Drop All failed: {}'.format(exc), Qgis.Critical)
-            return
-
-        self._show_message(
-            'Dropped {} row(s) from "{}".'.format(deleted_rows, table_name),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def run_row_sync(self, row_index):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        row_params = self._saved_input_params(row_index)
-        if row_params is None:
-            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
-            return
-
-        query_from, import_type, search_glob, additional_glob = row_params
-        if not query_from or not import_type or not search_glob:
-            self._show_message('query_from, import_type, and search_glob are required.', Qgis.Critical)
-            return
-
-        try:
-            self._run_drop_old(table_name, query_from, import_type, search_glob, additional_glob)
-            self._run_import_update(
-                table_name,
-                query_from,
-                import_type,
-                search_glob,
-                additional_glob,
-                skip_existing=False,
-            )
-        except ImportCancelledError:
-            self._show_message('Sync cancelled.', Qgis.Warning)
-            self.refresh_table()
-            return
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Sync failed: {}'.format(exc), Qgis.Critical)
-            return
-
-        self._show_message('Synced "{}" from {}.'.format(table_name, query_from), Qgis.Info)
-        self.refresh_table()
-
-    def run_row_get_additional_metadata(self, row_index):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        row_params = self._saved_input_params(row_index)
-        if row_params is None:
-            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
-            return
-
-        query_from, import_type, search_glob, additional_glob = row_params
-        if not query_from or not import_type or not search_glob:
-            self._show_message('query_from, import_type, and search_glob are required.', Qgis.Critical)
-            return
-
-        try:
-            updated_rows = self._run_get_additional_metadata(
-                table_name,
-                query_from,
-                import_type,
-                search_glob,
-                additional_glob,
-            )
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Get Additional Metadata failed: {}'.format(exc), Qgis.Critical)
-            return
-
-        self._show_message(
-            'Updated additional metadata for {} row(s).'.format(updated_rows),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def run_all_get_additional_metadata(self):
-        table_name = self.current_table_name()
-        if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
-            return
-
-        update_rows = self._saved_input_parameter_rows()
-        if not update_rows:
-            self._show_message('No saved input parameter rows to update.', Qgis.Critical)
-            return
-
-        updated_rows = 0
-        for query_from, import_type, search_glob, additional_glob in update_rows:
-            try:
-                updated_rows += self._run_get_additional_metadata(
-                    table_name,
-                    query_from,
-                    import_type,
-                    search_glob,
-                    additional_glob,
-                )
-            except Exception as exc:  # pragma: no cover
-                self._show_message('Get Additional Metadata failed: {}'.format(exc), Qgis.Critical)
-                return
-
-        self._show_message(
-            'Updated additional metadata for {} row(s).'.format(updated_rows),
-            Qgis.Info,
-        )
-        self.refresh_table()
-
-    def _build_query_from_widget(self, value, row_index):
-        widget = QtWidgets.QWidget(self.import_table)
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        line_edit = QtWidgets.QLineEdit(value)
-        line_edit.setPlaceholderText('/folder/to/search')
-        line_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        line_edit.textChanged.connect(lambda _text, row=row_index: self._mark_row_dirty(row))
-        browse_button = QtWidgets.QToolButton(widget)
-        browse_button.setText('...')
-        browse_button.clicked.connect(lambda: self._browse_query_from(line_edit))
-        layout.addWidget(line_edit, 1)
-        layout.addWidget(browse_button)
-        widget.line_edit = line_edit
-        min_width = line_edit.fontMetrics().horizontalAdvance(value or 'Select folder') + 48
-        widget.setMinimumWidth(max(180, min_width))
-        return widget
-
-    def _build_import_type_widget(self, value, row_index):
-        combo = QtWidgets.QComboBox(self.import_table)
-        combo.addItems(self.IMPORT_TYPES)
-        index = combo.findText(value)
-        combo.setCurrentIndex(index if index >= 0 else 0)
-        combo.currentTextChanged.connect(lambda _text, row=row_index: self._mark_row_dirty(row))
-        return combo
-
-    def _build_search_glob_widget(self, value, row_index):
-        widget = QtWidgets.QLineEdit(value, self.import_table)
-        widget.setPlaceholderText('**/*.JPG')
-        widget.textChanged.connect(lambda _text, row=row_index: self._mark_row_dirty(row))
-        min_width = widget.fontMetrics().horizontalAdvance(value or '.*') + 32
-        widget.setMinimumWidth(max(140, min_width))
-        return widget
-
-    def _build_additional_glob_widget(self, value, row_index):
-        widget = QtWidgets.QLineEdit(value, self.import_table)
-        widget.setPlaceholderText('./{base}.yml')
-        widget.textChanged.connect(lambda _text, row=row_index: self._mark_row_dirty(row))
-        min_width = widget.fontMetrics().horizontalAdvance(value or './{base}.yml') + 32
-        widget.setMinimumWidth(max(180, min_width))
-        return widget
-
-    def _browse_query_from(self, line_edit):
-        directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
-            'Select Folder',
-            line_edit.text().strip() or '',
-        )
-        if directory:
-            line_edit.setText(directory)
-
-    def _query_from_input(self, row_index):
-        widget = self.import_table.cellWidget(row_index, self.QUERY_FROM_COLUMN)
-        return getattr(widget, 'line_edit', None)
-
-    def _import_type_input(self, row_index):
-        widget = self.import_table.cellWidget(row_index, self.IMPORT_TYPE_COLUMN)
-        return widget if isinstance(widget, QtWidgets.QComboBox) else None
-
-    def _search_glob_input(self, row_index):
-        widget = self.import_table.cellWidget(row_index, self.SEARCH_GLOB_COLUMN)
-        return widget if isinstance(widget, QtWidgets.QLineEdit) else None
-
-    def _additional_glob_input(self, row_index):
-        widget = self.import_table.cellWidget(row_index, self.ADDITIONAL_GLOB_COLUMN)
-        return widget if isinstance(widget, QtWidgets.QLineEdit) else None
-
-    def _row_parameters(self, row_index):
-        import_type_input = self._import_type_input(row_index)
-        query_from_input = self._query_from_input(row_index)
-        search_glob_input = self._search_glob_input(row_index)
-        additional_glob_input = self._additional_glob_input(row_index)
-        if (
-            query_from_input is None
-            or import_type_input is None
-            or search_glob_input is None
-            or additional_glob_input is None
-        ):
-            return None
-        return (
-            query_from_input.text().strip(),
-            import_type_input.currentText().strip(),
-            search_glob_input.text().strip(),
-            additional_glob_input.text().strip(),
-        )
-
-    def _saved_input_params(self, row_index):
-        status_widget = self._status_widget(row_index)
-        if status_widget is None:
-            return None
-        return getattr(status_widget, 'original_input_params', None)
-
-    def _saved_input_parameter_rows(self):
-        rows = []
-        for row_index in range(max(self.import_table.rowCount() - 1, 0)):
-            row_params = self._saved_input_params(row_index)
-            if row_params is None:
-                continue
-            query_from, import_type, search_glob, additional_glob = row_params
-            if not query_from or not import_type or not search_glob:
-                continue
-            rows.append(row_params)
-        return rows
-
-    def _fetch_tables(self):
-        return fetch_base_tables(self.connection_values)
-
-    def _build_database_url(self):
-        values = self.connection_values
-        database = quote_plus(values.get('database', '').strip())
-        service = values.get('service', '').strip()
-        user = quote_plus(values.get('user', '').strip())
-        password = quote_plus(values.get('password', ''))
-        auth = ''
-        if user:
-            auth = user
-            if values.get('password', ''):
-                auth = '{}:{}'.format(auth, password)
-            auth = '{}@'.format(auth)
-        if service:
-            return 'postgresql+psycopg2://{auth}/{database}'.format(
-                auth=auth,
-                database=database,
-            )
-
-        host = values.get('host', '').strip()
-        port = values.get('port', '').strip() or '5432'
-        return 'postgresql+psycopg2://{auth}{host}:{port}/{database}'.format(
-            auth=auth,
-            host=host,
-            port=port,
-            database=database,
-        )
-
-    def _engine_connect_args(self):
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
-        service = self.connection_values.get('service', '').strip()
-        connect_args = {
-            'options': '-csearch_path={},public'.format(schema_name),
-        }
-        if service:
-            connect_args['service'] = service
-        user = self.connection_values.get('user', '').strip()
-        password = self.connection_values.get('password', '')
-        if user:
-            connect_args['user'] = user
-        if password:
-            connect_args['password'] = password
-        return connect_args
-
-    def _show_message(self, message, level):
-        if self.iface is not None:
-            self.iface.messageBar().pushMessage('Landlensdb', message, level=level, duration=6)
-
-    def _build_actions_widget(self, row_index, include_update_new):
-        widget = QtWidgets.QWidget(self.import_table)
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        primary_button = QtWidgets.QPushButton('Add')
-        primary_button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        primary_button.setToolTip('Add this input parameters row to the selected table.')
-        primary_button.clicked.connect(
-            lambda _=False, row=row_index: self.run_row_update(row)
-        )
-        if not include_update_new:
-            layout.addWidget(primary_button)
-
-        if include_update_new:
-            actions_button = self._build_actions_menu_button(
-                label='Actions',
-                tooltip='Run actions for this saved input parameters row.',
-                actions=[
-                    (
-                        'Update',
-                        'Update this input parameters row from disk into the selected table.',
-                        lambda row=row_index: self.run_row_update(row),
-                    ),
-                    (
-                        'Update New',
-                        'Update these input parameters, skipping images already in PostgreSQL.',
-                        lambda row=row_index: self.run_row_update(row, skip_existing=True),
-                    ),
-                    (
-                        'Drop Old',
-                        'Remove rows for this input parameters row whose files no longer exist on disk.',
-                        lambda row=row_index: self.run_row_drop_old(row),
-                    ),
-                    (
-                        'Drop All',
-                        'Remove all rows currently stored for this input parameters row.',
-                        lambda row=row_index: self.run_row_drop_all(row),
-                    ),
-                    (
-                        'Sync (Drop Old/Update)',
-                        'Drop old rows, then update this input parameters row from disk.',
-                        lambda row=row_index: self.run_row_sync(row),
-                    ),
-                    (
-                        'Get Additional Metadata',
-                        'Resolve and save additional files and YAML metadata for this row.',
-                        lambda row=row_index: self.run_row_get_additional_metadata(row),
-                    ),
-                ],
-            )
-            layout.addWidget(actions_button)
-
-        return widget
-
-    def _build_actions_menu_button(self, label, tooltip, actions):
-        button = QtWidgets.QPushButton(label, self)
-        button.setToolTip(tooltip)
-        button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-
+        self._show_import_parameters(yaml_text)
+
+    def _build_actions_button(self, input_sha=None, yaml_text=None):
+        button = QtWidgets.QToolButton(self)
+        button.setText("Actions")
+        button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         menu = QtWidgets.QMenu(button)
-        for action_label, action_tooltip, callback in actions:
-            action = menu.addAction(action_label)
-            action.setToolTip(action_tooltip)
-            action.triggered.connect(
-                lambda _checked=False, action_callback=callback: action_callback()
+        if input_sha:
+            callbacks = (
+                ("Update", lambda: self.run_row_updates(input_sha, yaml_text, False)),
+                (
+                    "Update New",
+                    lambda: self.run_row_updates(input_sha, yaml_text, True),
+                ),
+                ("Drop Old", lambda: self.run_row_drop_old(input_sha, yaml_text)),
+                ("Drop All", lambda: self.run_row_drop_all(input_sha, yaml_text)),
+                (
+                    "Sync (Drop Old/Update)",
+                    lambda: self.run_row_sync(input_sha, yaml_text),
+                ),
+                (
+                    "Fetch Metadata Structure",
+                    lambda checked=False: self.fetch_metadata(input_sha),
+                ),
             )
+        else:
+            callbacks = (
+                ("Update", lambda: self.run_all_updates(False)),
+                ("Update New", lambda: self.run_all_updates(True)),
+                ("Drop Old", self.run_all_drop_old),
+                ("Drop All", self.run_all_drop_all),
+                ("Sync (Drop Old/Update)", self.run_all_sync),
+                (
+                    "Fetch Metadata Structure",
+                    lambda checked=False: self.fetch_metadata("all"),
+                ),
+            )
+        for label, callback in callbacks:
+            menu.addAction(label, callback)
         button.setMenu(menu)
         return button
 
-    def _build_status_widget(self, row_index, original_input_params, row_count, editable):
-        widget = QtWidgets.QWidget(self.import_table)
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setSpacing(6)
+    def _saved_config(self):
+        yaml_text = load_import_parameters(load_example_import_yaml())
+        return calculate_input_sha(yaml_text), yaml_text
 
-        left_button = QtWidgets.QToolButton(widget)
-        left_button.setAutoRaise(True)
-        left_button.setFixedSize(18, 18)
+    def _row_configs(self):
+        configs = []
+        for row in range(self.import_table.rowCount()):
+            item = self.import_table.item(row, self.COUNT_COLUMN)
+            if item is None:
+                continue
+            input_sha = item.data(QtCore.Qt.UserRole)
+            yaml_text = item.data(QtCore.Qt.UserRole + 1)
+            if input_sha and not yaml_text:
+                yaml_text = self._fetch_first_import_params(input_sha)
+            if input_sha and yaml_text:
+                configs.append((input_sha, yaml_text))
+        return configs
 
-        right_label = QtWidgets.QLabel(str(row_count) if editable else '', widget)
-        right_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+    def _update_configs(self):
+        configs = self._row_configs()
+        if has_saved_import_parameters() or not configs:
+            saved = self._saved_config()
+            if saved[0] not in {input_sha for input_sha, _yaml in configs}:
+                configs.append(saved)
+        return configs
 
-        sync_button = QtWidgets.QToolButton(widget)
-        sync_button.setAutoRaise(True)
-        sync_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
-        sync_button.setIconSize(QtCore.QSize(16, 16))
-        sync_button.setToolTip('Drop all rows for the old input parameters, then update using the edited values.')
-        sync_button.clicked.connect(lambda _=False, row=row_index: self.run_row_edit_sync(row))
-        sync_button.hide()
-
-        layout.addWidget(left_button)
-        layout.addWidget(right_label)
-        layout.addWidget(sync_button)
-
-        widget.original_input_params = tuple(original_input_params) if original_input_params else None
-        widget.row_count = int(row_count or 0)
-        widget.left_button = left_button
-        widget.right_label = right_label
-        widget.sync_button = sync_button
-        widget.editable = editable
-        widget.dirty = False
-
-        left_button.clicked.connect(lambda _=False, row=row_index: self._handle_status_left_click(row))
-        return widget
-
-    def _status_widget(self, row_index):
-        return self.import_table.cellWidget(row_index, self.STATUS_COLUMN)
-
-    def _current_input_params(self, row_index):
-        return self._row_parameters(row_index)
-
-    def _mark_row_dirty(self, row_index):
-        status_widget = self._status_widget(row_index)
-        if status_widget is None or not getattr(status_widget, 'editable', False):
-            return
-        original_input_params = getattr(status_widget, 'original_input_params', None)
-        current_input_params = self._current_input_params(row_index)
-        status_widget.dirty = current_input_params != original_input_params
-        self._update_status_widget(row_index)
-
-    def _update_status_widget(self, row_index):
-        status_widget = self._status_widget(row_index)
-        if status_widget is None:
-            return
-
-        left_button = status_widget.left_button
-        right_label = status_widget.right_label
-        sync_button = status_widget.sync_button
-
-        if not status_widget.editable:
-            left_button.hide()
-            right_label.setText('')
-            sync_button.hide()
-            return
-
-        left_button.show()
-        if status_widget.dirty:
-            left_button.setText('x')
-            left_button.setToolTip('Exit edit mode and revert this input parameters row to its saved values.')
-            left_button.setStyleSheet('QToolButton { color: #c53030; font-size: 16px; font-weight: bold; }')
-            right_label.hide()
-            sync_button.show()
-        else:
-            left_button.setText('●')
-            left_button.setToolTip('These input parameters match the saved values.')
-            left_button.setStyleSheet('QToolButton { color: #1f9d55; font-size: 14px; }')
-            right_label.setText(str(status_widget.row_count))
-            right_label.show()
-            sync_button.hide()
-
-    def _handle_status_left_click(self, row_index):
-        status_widget = self._status_widget(row_index)
-        if status_widget is None or not status_widget.editable or not status_widget.dirty:
-            return
-        self._revert_row_to_original(row_index)
-
-    def _revert_row_to_original(self, row_index):
-        status_widget = self._status_widget(row_index)
-        if status_widget is None or not status_widget.original_input_params:
-            return
-
-        query_from, import_type, search_glob, additional_glob = status_widget.original_input_params
-        import_type_input = self._import_type_input(row_index)
-        query_from_input = self._query_from_input(row_index)
-        search_glob_input = self._search_glob_input(row_index)
-        additional_glob_input = self._additional_glob_input(row_index)
-        if (
-            query_from_input is None
-            or import_type_input is None
-            or search_glob_input is None
-            or additional_glob_input is None
-        ):
-            return
-
-        query_from_input.blockSignals(True)
-        import_type_input.blockSignals(True)
-        search_glob_input.blockSignals(True)
-        additional_glob_input.blockSignals(True)
-        query_from_input.setText(query_from)
-        import_type_input.setCurrentIndex(max(import_type_input.findText(import_type), 0))
-        search_glob_input.setText(search_glob)
-        additional_glob_input.setText(additional_glob)
-        query_from_input.blockSignals(False)
-        import_type_input.blockSignals(False)
-        search_glob_input.blockSignals(False)
-        additional_glob_input.blockSignals(False)
-
-        status_widget.dirty = False
-        self._update_status_widget(row_index)
-
-    def run_row_edit_sync(self, row_index):
+    def _run_updates(self, configs, skip_existing):
         table_name = self.current_table_name()
         if not table_name:
-            self._show_message('Choose a table first.', Qgis.Critical)
+            self._show_message("Choose or create a table first.", Qgis.Critical)
             return
-
-        status_widget = self._status_widget(row_index)
-        if status_widget is None or not status_widget.editable or not status_widget.dirty:
+        if not configs:
+            self._show_message("No import parameters are available.", Qgis.Warning)
             return
-
-        old_input_params = getattr(status_widget, 'original_input_params', None)
-        new_input_params = self._current_input_params(row_index)
-        if not old_input_params:
-            self._show_message('No saved input parameters exist for this row.', Qgis.Critical)
-            return
-        if not new_input_params or not new_input_params[0] or not new_input_params[1] or not new_input_params[2]:
-            self._show_message(
-                'query_from, import_type, and search_glob are required.',
-                Qgis.Critical,
-            )
-            return
-
         try:
-            self._run_drop_all(table_name, old_input_params[0], old_input_params[1], old_input_params[2], old_input_params[3])
-            self._run_import_update(
-                table_name,
-                new_input_params[0],
-                new_input_params[1],
-                new_input_params[2],
-                new_input_params[3],
-                skip_existing=False,
-            )
+            db = self._database(table_name, select_table=True)
+            self._cancel_import_event.clear()
+            self._set_import_active(True)
+            wrote = False
+            for _input_sha, yaml_text in configs:
+                function_params = import_yaml_to_function_params(yaml_text)
+                try:
+                    batches = import_local_images(
+                        **function_params,
+                        max_workers=self.thread_count_input.value(),
+                        batch_size=self.batch_size_input.value(),
+                        return_as_yield=True,
+                        progress_callback=self._update_progress,
+                        skip_images_in_postgresql=db,
+                        skip_existing=bool(skip_existing),
+                        on_error=self.on_error_input.currentText(),
+                        cancel_event=self._cancel_import_event,
+                    )
+                    for images in batches:
+                        db.upsert_images(images, table_name, conflict="update")
+                        wrote = True
+                except ValueError as exc:
+                    if skip_existing and "No new files match" in str(exc):
+                        continue
+                    raise
+            if not wrote:
+                self._show_message("No new images were found.", Qgis.Info)
+            else:
+                self._show_message("Import update completed.", Qgis.Info)
         except ImportCancelledError:
-            self._show_message('Row sync cancelled.', Qgis.Warning)
-            self.refresh_table()
-            return
-        except Exception as exc:  # pragma: no cover
-            self._show_message('Row sync failed: {}'.format(exc), Qgis.Critical)
-            return
-
-        self._show_message('Saved edited input parameters for "{}".'.format(table_name), Qgis.Info)
-        self.refresh_table()
-
-    def _run_import_update(
-        self,
-        table_name,
-        query_from,
-        import_type,
-        search_glob,
-        additional_glob,
-        skip_existing=False,
-    ):
-        self._cancel_import_event.clear()
-        self._set_import_active(True)
-        self._reset_progress()
-        db = Postgres(self._build_database_url())
-        db.engine = create_engine(
-            self._build_database_url(),
-            connect_args=self._engine_connect_args(),
-        )
-        if skip_existing:
-            db.table(table_name)
-        try:
-            wrote_batches = False
-            for images in SearchLocalToGeoImageFrame(
-                query_from,
-                import_type=import_type,
-                search_glob=search_glob,
-                additional_files_and_metadata_glob=additional_glob,
-                max_workers=self.thread_count_input.value(),
-                batch_size=self.batch_size_input.value(),
-                return_as_yield=True,
-                progress_callback=self._update_progress,
-                skip_images_in_postgresql=db if skip_existing else None,
-                cancel_event=self._cancel_import_event,
-            ):
-                db.upsert_images(images, table_name, conflict='update')
-                wrote_batches = True
-            if not wrote_batches:
-                raise ValueError('No valid images were processed into a GeoImageFrame.')
+            self._show_message("Import cancelled.", Qgis.Warning)
+        except Exception as exc:
+            self._show_message("Import failed: {}".format(exc), Qgis.Critical)
         finally:
             self._set_import_active(False)
+            self.refresh_table()
 
-    def _run_drop_old(self, table_name, query_from, import_type, search_glob, additional_glob):
+    def _run_drop_old(self, configs):
+        deleted = 0
+        db = self._database(self.current_table_name(), True)
+        for input_sha, yaml_text in configs:
+            parameters = import_yaml_to_function_params(yaml_text)
+            paths = discover_image_paths(parameters["source_file_glob"])
+            deleted += db.remove_unmatched_for_input(input_sha, paths)
+        return deleted
+
+    def _run_drop_all(self, configs):
+        db = self._database(self.current_table_name(), True)
+        return sum(db.remove_all_for_input(input_sha) for input_sha, _yaml in configs)
+
+    def run_all_updates(self, skip_existing=False):
+        self._run_updates(self._update_configs(), skip_existing)
+
+    def run_row_updates(self, input_sha, yaml_text, skip_existing=False):
+        if not yaml_text:
+            yaml_text = self._fetch_first_import_params(input_sha)
+        self._run_updates([(input_sha, yaml_text)], skip_existing)
+
+    def run_all_drop_old(self):
+        try:
+            deleted = self._run_drop_old(self._row_configs())
+        except Exception as exc:
+            self._show_message("Drop Old failed: {}".format(exc), Qgis.Critical)
+            return
+        self._show_message("Removed {} stale row(s).".format(deleted), Qgis.Info)
+        self.refresh_table()
+
+    def run_row_drop_old(self, input_sha, yaml_text):
+        try:
+            if not yaml_text:
+                yaml_text = self._fetch_first_import_params(input_sha)
+            deleted = self._run_drop_old([(input_sha, yaml_text)])
+        except Exception as exc:
+            self._show_message("Drop Old failed: {}".format(exc), Qgis.Critical)
+            return
+        self._show_message("Removed {} stale row(s).".format(deleted), Qgis.Info)
+        self.refresh_table()
+
+    def run_all_drop_all(self):
+        configs = self._row_configs()
+        if not configs:
+            return
+        if (
+            QtWidgets.QMessageBox.question(
+                self, "Drop All Imports", "Delete every imported row in this table?"
+            )
+            != QtWidgets.QMessageBox.Yes
+        ):
+            return
+        try:
+            deleted = self._run_drop_all(configs)
+        except Exception as exc:
+            self._show_message("Drop All failed: {}".format(exc), Qgis.Critical)
+            return
+        self._show_message("Removed {} row(s).".format(deleted), Qgis.Info)
+        self.refresh_table()
+
+    def run_row_drop_all(self, input_sha, yaml_text):
+        if (
+            QtWidgets.QMessageBox.question(
+                self, "Drop Import Group", "Delete every row in this import group?"
+            )
+            != QtWidgets.QMessageBox.Yes
+        ):
+            return
+        try:
+            deleted = self._run_drop_all([(input_sha, yaml_text)])
+        except Exception as exc:
+            self._show_message("Drop All failed: {}".format(exc), Qgis.Critical)
+            return
+        self._show_message("Removed {} row(s).".format(deleted), Qgis.Info)
+        self.refresh_table()
+
+    def run_all_sync(self):
+        configs = self._update_configs()
+        try:
+            self._run_drop_old(configs)
+        except Exception as exc:
+            self._show_message("Sync failed: {}".format(exc), Qgis.Critical)
+            return
+        self._run_updates(configs, False)
+
+    def run_row_sync(self, input_sha, yaml_text):
+        if not yaml_text:
+            yaml_text = self._fetch_first_import_params(input_sha)
+        try:
+            self._run_drop_old([(input_sha, yaml_text)])
+        except Exception as exc:
+            self._show_message("Sync failed: {}".format(exc), Qgis.Critical)
+            return
+        self._run_updates([(input_sha, yaml_text)], False)
+
+    def fetch_metadata(self, input_sha):
+        """Fetch one metadata row per input SHA and save the parameter tree."""
+        table_name = self.current_table_name()
+        if not table_name:
+            self._show_message("Choose or create a table first.", Qgis.Critical)
+            return
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
+        try:
+            with psycopg2.connect(
+                **connection_kwargs(self.connection_values)
+            ) as connection:
+                with connection.cursor() as cursor:
+                    source_query = sql.SQL("SELECT * FROM {}.{}").format(
+                        sql.Identifier(schema_name), sql.Identifier(table_name)
+                    )
+                    tree = fetch_metadata_tree(cursor, source_query, input_sha)
+        except Exception as exc:
+            self._show_message(
+                "Could not fetch metadata structure: {}".format(exc), Qgis.Critical
+            )
+            return
+        self._show_message("Metadata structure fetched.", Qgis.Info)
+        return tree
+
+    def _database(self, table_name, select_table=False):
         db = Postgres(self._build_database_url())
         db.engine = create_engine(
-            self._build_database_url(),
-            connect_args=self._engine_connect_args(),
+            self._build_database_url(), connect_args=self._engine_connect_args()
         )
-        db.table(table_name)
-        return db.remove_unmatched(
-            query_from,
-            import_type=import_type,
-            search_glob=search_glob,
-            additional_files_and_metadata_glob=additional_glob,
+        if select_table:
+            db.table(table_name)
+        return db
+
+    def _build_database_url(self):
+        values = self.connection_values
+        database = quote_plus(values.get("database", "").strip())
+        service = values.get("service", "").strip()
+        user = quote_plus(values.get("user", "").strip())
+        password = quote_plus(values.get("password", ""))
+        auth = user
+        if auth and values.get("password", ""):
+            auth = "{}:{}".format(auth, password)
+        if auth:
+            auth += "@"
+        if service:
+            return "postgresql+psycopg2://{}/{database}".format(auth, database=database)
+        return "postgresql+psycopg2://{}{}:{}/{}".format(
+            auth,
+            values.get("host", "").strip(),
+            values.get("port", "").strip() or "5432",
+            database,
         )
 
-    def _run_drop_all(self, table_name, query_from, import_type, search_glob, additional_glob):
-        db = Postgres(self._build_database_url())
-        db.engine = create_engine(
-            self._build_database_url(),
-            connect_args=self._engine_connect_args(),
-        )
-        db.table(table_name)
-        return db.remove_all(
-            query_from,
-            import_type=import_type,
-            search_glob=search_glob,
-            additional_files_and_metadata_glob=additional_glob,
-        )
-
-    def _run_get_additional_metadata(
-        self,
-        table_name,
-        query_from,
-        import_type,
-        search_glob,
-        additional_glob,
-    ):
-        db = Postgres(self._build_database_url())
-        db.engine = create_engine(
-            self._build_database_url(),
-            connect_args=self._engine_connect_args(),
-        )
-        db.table(table_name)
-        return db.update_additional_files_and_metadata(
-            query_from,
-            import_type=import_type,
-            search_glob=search_glob,
-            additional_files_and_metadata_glob=additional_glob,
-        )
-
-    def _reset_progress(self):
-        self.import_progress_bar.setRange(0, 1)
-        self.import_progress_bar.setValue(0)
-        self.import_progress_label.setText('0/0')
+    def _engine_connect_args(self):
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
+        args = {"options": "-csearch_path={},public".format(schema_name)}
+        service = self.connection_values.get("service", "").strip()
+        if service:
+            args["service"] = service
+        if self.connection_values.get("user", "").strip():
+            args["user"] = self.connection_values["user"].strip()
+        if self.connection_values.get("password", ""):
+            args["password"] = self.connection_values["password"]
+        return args
 
     def _set_import_active(self, active):
         self._import_active = bool(active)
-        if self._import_active:
-            self.cancel_import_button.setStyleSheet(
-                'QToolButton { color: #c53030; font-size: 16px; font-weight: bold; }'
-            )
-        else:
-            self.cancel_import_button.setStyleSheet(
-                'QToolButton { color: #a0aec0; font-size: 16px; font-weight: bold; }'
-            )
+        self.cancel_button.setEnabled(self._import_active)
+        self.open_yaml_button.setEnabled(not self._import_active)
 
     def _cancel_active_import(self):
-        if not self._import_active:
-            return
-        self._cancel_import_event.set()
+        if self._import_active:
+            self._cancel_import_event.set()
 
     def _update_progress(self, processed, total):
-        total = max(int(total or 0), 0)
-        processed = max(min(int(processed or 0), total if total else 0), 0)
-        maximum = total if total > 0 else 1
-        self.import_progress_bar.setRange(0, maximum)
-        self.import_progress_bar.setValue(processed)
-        self.import_progress_label.setText('{}/{}'.format(processed, total))
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            app.processEvents()
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(processed)
+        self.progress_bar.setFormat("{}/{}".format(processed, total))
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.processEvents()
+
+    def _show_message(self, message, level):
+        if self.iface is not None:
+            self.iface.messageBar().pushMessage(
+                "Landlensdb", message, level=level, duration=6
+            )

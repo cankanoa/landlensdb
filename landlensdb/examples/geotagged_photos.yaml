@@ -1,0 +1,63 @@
+# Built-in preset: photos positioned by EXIF GPS tags.
+source:
+  file_glob: "/path/to/photos/**/*.@(jpg|jpeg|png|tif|tiff)"
+
+name:
+  source: file.name
+  required: true
+  default: null
+
+image_url:
+  source: file.path
+  required: true
+
+geometry:
+  source: point_from_exif
+  output_crs: EPSG:4326
+  required: true
+  latitude: exif.GPSInfo.GPSLatitude
+  latitude_reference: exif.GPSInfo.GPSLatitudeRef
+  longitude: exif.GPSInfo.GPSLongitude
+  longitude_reference: exif.GPSInfo.GPSLongitudeRef
+
+metadata:
+  captured_at:
+    source: exif_parse_time_to_timez.DateTimeOriginal
+    required: false
+    default: null
+  camera:
+    focal_length:
+      source: exif.FocalLength
+      required: false
+      default: null
+    make:
+      source: exif.Make
+      required: false
+      default: null
+    model:
+      source: exif.Model
+      required: false
+      default: null
+  sensor:
+    altitude:
+      source: exif.GPSInfo.GPSAltitude
+      required: false
+      default: null
+    compass_angle:
+      source: exif.GPSInfo.GPSImgDirection
+      required: false
+      default: null
+    orientation:
+      source: exif.Orientation
+      required: false
+      default: null
+
+thumbnail:
+  enabled: true
+  width: 256
+  height: 256
+  resampling: lanczos
+
+fingerprint:
+  enabled: true
+  mode: robust

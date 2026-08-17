@@ -4,10 +4,14 @@ from qgis.PyQt import QtCore, QtGui, QtWidgets
 from qgis.core import QgsMapLayerType, QgsProject
 
 from ..landlensdb.geoclasses.geoimageframe import GeoImageFrame
-from ..landlensdb.handlers.local import GeoTaggedImage, GeoTransformImage, WorldView3Image
 from shapely.wkb import loads as load_wkb
 
-from ..shared.connection_utils import connection_kwargs, load_connection_settings, psycopg2, sql
+from ..shared.connection_utils import (
+    connection_kwargs,
+    load_connection_settings,
+    psycopg2,
+    sql,
+)
 
 
 class ImageCanvas(QtWidgets.QGraphicsView):
@@ -19,11 +23,13 @@ class ImageCanvas(QtWidgets.QGraphicsView):
         self._fit_scale = 1.0
         self._current_scale = 1.0
         self.setScene(self._scene)
-        self.setRenderHints(QtGui.QPainter.SmoothPixmapTransform | QtGui.QPainter.Antialiasing)
+        self.setRenderHints(
+            QtGui.QPainter.SmoothPixmapTransform | QtGui.QPainter.Antialiasing
+        )
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
         self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
-        self.setBackgroundBrush(QtGui.QColor('#111111'))
+        self.setBackgroundBrush(QtGui.QColor("#111111"))
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.setMinimumSize(280, 220)
 
@@ -41,6 +47,7 @@ class ImageCanvas(QtWidgets.QGraphicsView):
         self.setSceneRect(QtCore.QRectF())
 
     def wheelEvent(self, event):
+        event.accept()
         if self._pixmap_item.pixmap().isNull():
             return
         step = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -72,6 +79,13 @@ class ImageCanvas(QtWidgets.QGraphicsView):
         self.resetTransform()
         self.scale(self._fit_scale, self._fit_scale)
         self._current_scale = self._fit_scale
+
+
+class ImageScrollArea(QtWidgets.QScrollArea):
+    """Keep scrollbar navigation while ignoring wheel gestures on the outer area."""
+
+    def wheelEvent(self, event):
+        event.accept()
 
 
 class ImageTile(QtWidgets.QFrame):
@@ -112,12 +126,12 @@ def _build_chevron_icon(direction):
     pixmap.fill(QtCore.Qt.transparent)
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing)
-    pen = QtGui.QPen(QtGui.QColor('black'))
+    pen = QtGui.QPen(QtGui.QColor("black"))
     pen.setWidth(2)
     pen.setCapStyle(QtCore.Qt.RoundCap)
     pen.setJoinStyle(QtCore.Qt.RoundJoin)
     painter.setPen(pen)
-    if direction == 'left':
+    if direction == "left":
         painter.drawPolyline(
             QtCore.QPointF(11.5, 4.0),
             QtCore.QPointF(6.0, 9.0),
@@ -134,7 +148,7 @@ def _build_chevron_icon(direction):
 
 
 class ViewTab(QtWidgets.QWidget):
-    ACTIVE_LAYER_VALUE = '__active_layer__'
+    ACTIVE_LAYER_VALUE = "__active_layer__"
 
     def __init__(self, iface, parent=None):
         super(ViewTab, self).__init__(parent)
@@ -159,70 +173,86 @@ class ViewTab(QtWidgets.QWidget):
         header_row = QtWidgets.QHBoxLayout()
         outer_layout.addLayout(header_row)
 
-        header_row.addWidget(QtWidgets.QLabel('Source:', self))
-        self.source_button = QtWidgets.QPushButton('Preview', self)
+        header_row.addWidget(QtWidgets.QLabel("Source:", self))
+        self.source_button = QtWidgets.QPushButton("Preview", self)
         self.source_menu = QtWidgets.QMenu(self)
-        self.preview_action = self.source_menu.addAction('Preview')
-        self.path_action = self.source_menu.addAction('Path')
-        self.preview_action.triggered.connect(lambda: self._set_source_mode('preview'))
-        self.path_action.triggered.connect(lambda: self._set_source_mode('path'))
+        self.preview_action = self.source_menu.addAction("Preview")
+        self.path_action = self.source_menu.addAction("Path")
+        self.preview_action.triggered.connect(lambda: self._set_source_mode("preview"))
+        self.path_action.triggered.connect(lambda: self._set_source_mode("path"))
         self.source_button.setMenu(self.source_menu)
         header_row.addWidget(self.source_button)
 
-        header_row.addWidget(QtWidgets.QLabel('Update from selection:', self))
+        header_row.addWidget(QtWidgets.QLabel("Update from selection:", self))
         self.update_from_selection_toggle = QtWidgets.QCheckBox(self)
         self.update_from_selection_toggle.setChecked(True)
-        self.update_from_selection_toggle.toggled.connect(self._handle_update_toggle_changed)
+        self.update_from_selection_toggle.toggled.connect(
+            self._handle_update_toggle_changed
+        )
         header_row.addWidget(self.update_from_selection_toggle)
 
-        header_row.addWidget(QtWidgets.QLabel('Select layer:', self))
+        header_row.addWidget(QtWidgets.QLabel("Select layer:", self))
         self.layer_selector = LayerSelectionComboBox(self)
         self.layer_selector.setMinimumWidth(220)
         self.layer_selector.popupAboutToShow.connect(self._refresh_layer_selector)
-        self.layer_selector.currentIndexChanged.connect(self._handle_layer_selector_changed)
+        self.layer_selector.currentIndexChanged.connect(
+            self._handle_layer_selector_changed
+        )
         header_row.addWidget(self.layer_selector)
 
-        header_row.addWidget(QtWidgets.QLabel('Navigate:', self))
+        header_row.addWidget(QtWidgets.QLabel("Navigate:", self))
         self.bulk_previous_button = QtWidgets.QToolButton(self)
-        self.bulk_previous_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekBackward))
+        self.bulk_previous_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekBackward)
+        )
         self.bulk_previous_button.setAutoRaise(True)
-        self.bulk_previous_button.clicked.connect(lambda: self._navigate_selection(-1, bulk=True))
+        self.bulk_previous_button.clicked.connect(
+            lambda: self._navigate_selection(-1, bulk=True)
+        )
         header_row.addWidget(self.bulk_previous_button)
 
         self.previous_button = QtWidgets.QToolButton(self)
-        self.previous_button.setIcon(_build_chevron_icon('left'))
+        self.previous_button.setIcon(_build_chevron_icon("left"))
         self.previous_button.setAutoRaise(True)
-        self.previous_button.clicked.connect(lambda: self._navigate_selection(-1, bulk=False))
+        self.previous_button.clicked.connect(
+            lambda: self._navigate_selection(-1, bulk=False)
+        )
         header_row.addWidget(self.previous_button)
 
-        self.organize_button = QtWidgets.QPushButton('Select Organize Field', self)
+        self.organize_button = QtWidgets.QPushButton("Select Organize Field", self)
         self.organize_menu = QtWidgets.QMenu(self.organize_button)
         self.organize_button.clicked.connect(self._open_organize_menu)
         header_row.addWidget(self.organize_button)
 
         self.next_button = QtWidgets.QToolButton(self)
-        self.next_button.setIcon(_build_chevron_icon('right'))
+        self.next_button.setIcon(_build_chevron_icon("right"))
         self.next_button.setAutoRaise(True)
-        self.next_button.clicked.connect(lambda: self._navigate_selection(1, bulk=False))
+        self.next_button.clicked.connect(
+            lambda: self._navigate_selection(1, bulk=False)
+        )
         header_row.addWidget(self.next_button)
 
         self.bulk_next_button = QtWidgets.QToolButton(self)
-        self.bulk_next_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekForward))
+        self.bulk_next_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekForward)
+        )
         self.bulk_next_button.setAutoRaise(True)
-        self.bulk_next_button.clicked.connect(lambda: self._navigate_selection(1, bulk=True))
+        self.bulk_next_button.clicked.connect(
+            lambda: self._navigate_selection(1, bulk=True)
+        )
         header_row.addWidget(self.bulk_next_button)
 
-        header_row.addWidget(QtWidgets.QLabel('North up:', self))
+        header_row.addWidget(QtWidgets.QLabel("North up:", self))
         self.north_up_toggle = QtWidgets.QCheckBox(self)
         self.north_up_toggle.toggled.connect(self._render_geoimageframe)
         header_row.addWidget(self.north_up_toggle)
 
         header_row.addStretch(1)
-        self.status_label = QtWidgets.QLabel('', self)
+        self.status_label = QtWidgets.QLabel("", self)
         self.status_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         header_row.addWidget(self.status_label)
 
-        self.scroll_area = QtWidgets.QScrollArea(self)
+        self.scroll_area = ImageScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
         outer_layout.addWidget(self.scroll_area, 1)
@@ -233,7 +263,7 @@ class ViewTab(QtWidgets.QWidget):
         self.grid_layout.setSpacing(0)
         self.scroll_area.setWidget(self.grid_host)
 
-        self._source_mode = 'preview'
+        self._source_mode = "preview"
         self._refresh_layer_selector()
         self._update_navigation_buttons()
 
@@ -262,7 +292,7 @@ class ViewTab(QtWidgets.QWidget):
 
     def _set_source_mode(self, mode):
         self._source_mode = mode
-        self.source_button.setText('Preview' if mode == 'preview' else 'Path')
+        self.source_button.setText("Preview" if mode == "preview" else "Path")
         self._render_geoimageframe()
 
     def _handle_layer_selector_changed(self, _index):
@@ -303,25 +333,31 @@ class ViewTab(QtWidgets.QWidget):
 
     def _disconnect_watched_layer(self):
         if self._watched_layer is not None and self._watch_connected:
-            self._watched_layer.selectionChanged.disconnect(self._handle_selection_changed)
+            self._watched_layer.selectionChanged.disconnect(
+                self._handle_selection_changed
+            )
         self._watched_layer = None
         self._watch_connected = False
 
     def _connect_iface_signals(self):
         if self._iface_connected:
             return
-        if self.iface is not None and hasattr(self.iface, 'currentLayerChanged'):
+        if self.iface is not None and hasattr(self.iface, "currentLayerChanged"):
             self.iface.currentLayerChanged.connect(self._handle_current_layer_changed)
             self._iface_connected = True
 
     def _disconnect_iface_signals(self):
         if not self._iface_connected:
             return
-        if self.iface is not None and hasattr(self.iface, 'currentLayerChanged'):
-            self.iface.currentLayerChanged.disconnect(self._handle_current_layer_changed)
+        if self.iface is not None and hasattr(self.iface, "currentLayerChanged"):
+            self.iface.currentLayerChanged.disconnect(
+                self._handle_current_layer_changed
+            )
         self._iface_connected = False
 
-    def _handle_selection_changed(self, _selected=None, _deselected=None, _clear_and_select=None):
+    def _handle_selection_changed(
+        self, _selected=None, _deselected=None, _clear_and_select=None
+    ):
         if not self._sync_enabled():
             self._disconnect_watched_layer()
             return
@@ -358,7 +394,7 @@ class ViewTab(QtWidgets.QWidget):
             selected_value = self._selected_layer_id
         self.layer_selector.blockSignals(True)
         self.layer_selector.clear()
-        self.layer_selector.addItem('Active Layer', self.ACTIVE_LAYER_VALUE)
+        self.layer_selector.addItem("Active Layer", self.ACTIVE_LAYER_VALUE)
         for layer in self._vector_layers():
             self.layer_selector.addItem(layer.name(), layer.id())
         index = self.layer_selector.findData(selected_value)
@@ -375,45 +411,61 @@ class ViewTab(QtWidgets.QWidget):
             return
         layer = self._watched_layer or self._selected_vector_layer()
         if layer is None:
-            self.status_label.setText('No selected vector layer.')
+            self.status_label.setText("No selected vector layer.")
             self.set_geoimageframe(None)
             return
         field_names = [field.name() for field in layer.fields()]
-        if 'image_url' not in field_names:
-            self.status_label.setText('The active layer does not have an image_url field.')
+        if "image_url" not in field_names:
+            self.status_label.setText(
+                "The active layer does not have an image_url field."
+            )
             self.set_geoimageframe(None)
             return
         selected_features = list(layer.selectedFeatures())
         image_urls = []
         for feature in selected_features:
-            image_url = feature['image_url']
+            image_url = feature["image_url"]
             if image_url:
                 image_urls.append(str(image_url))
         if not image_urls:
-            self.status_label.setText('Select features in layers added by Landlensdb to view them.')
+            self.status_label.setText(
+                "Select features in layers added by Landlensdb to view them."
+            )
             self.set_geoimageframe(None)
             self._update_navigation_buttons()
             return
-        if layer.customProperty('landlensdb/query_text', '') and layer.customProperty('landlensdb/geometry_column', ''):
+        if layer.customProperty("landlensdb/query_text", "") and layer.customProperty(
+            "landlensdb/geometry_column", ""
+        ):
             geoimageframe = self._fetch_geoimageframe_for_image_urls(layer, image_urls)
         else:
-            geoimageframe = self._geoimageframe_from_selected_features(selected_features)
-        self.status_label.setText('Loaded {} image{}'.format(len(geoimageframe), '' if len(geoimageframe) == 1 else 's'))
+            geoimageframe = self._geoimageframe_from_selected_features(
+                selected_features
+            )
+        self.status_label.setText(
+            "Loaded {} image{}".format(
+                len(geoimageframe), "" if len(geoimageframe) == 1 else "s"
+            )
+        )
         self.set_geoimageframe(geoimageframe)
         self._update_navigation_buttons()
 
     def _fetch_geoimageframe_for_image_urls(self, layer, image_urls):
         if psycopg2 is None:
-            self.status_label.setText('psycopg2 is not available in this QGIS Python environment.')
+            self.status_label.setText(
+                "psycopg2 is not available in this QGIS Python environment."
+            )
             return self._empty_geoimageframe()
 
-        query_text = layer.customProperty('landlensdb/query_text', '')
-        geometry_column = layer.customProperty('landlensdb/geometry_column', '')
+        query_text = layer.customProperty("landlensdb/query_text", "")
+        geometry_column = layer.customProperty("landlensdb/geometry_column", "")
         if not query_text or not geometry_column:
-            self.status_label.setText('The active layer is missing Landlensdb query metadata.')
+            self.status_label.setText(
+                "The active layer is missing Landlensdb query metadata."
+            )
             return self._empty_geoimageframe()
 
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
         geometry_identifier = '"{}"'.format(geometry_column.replace('"', '""'))
         query = """
             SELECT
@@ -430,14 +482,16 @@ class ViewTab(QtWidgets.QWidget):
             ORDER BY q.image_url
         """.format(
             geometry_column=geometry_identifier,
-            query_text=query_text.replace('%', '%%'),
+            query_text=query_text.replace("%", "%%"),
         )
 
-        with psycopg2.connect(**connection_kwargs(self.connection_values)) as connection:
+        with psycopg2.connect(
+            **connection_kwargs(self.connection_values)
+        ) as connection:
             with connection.cursor() as cursor:
                 if schema_name:
                     cursor.execute(
-                        sql.SQL('SET search_path TO {}, public').format(
+                        sql.SQL("SET search_path TO {}, public").format(
                             sql.Identifier(schema_name),
                         )
                     )
@@ -448,11 +502,17 @@ class ViewTab(QtWidgets.QWidget):
         for image_url, name, metadata, geometry_wkb, preview_png in rows:
             records.append(
                 {
-                    'image_url': image_url,
-                    'name': name or image_url,
-                    'metadata': metadata or {},
-                    'geometry': load_wkb(bytes(geometry_wkb)) if geometry_wkb is not None else None,
-                    'preview_png': bytes(preview_png) if preview_png is not None else None,
+                    "image_url": image_url,
+                    "name": name or image_url,
+                    "metadata": metadata or {},
+                    "geometry": (
+                        load_wkb(bytes(geometry_wkb))
+                        if geometry_wkb is not None
+                        else None
+                    ),
+                    "preview_png": (
+                        bytes(preview_png) if preview_png is not None else None
+                    ),
                 }
             )
         if not records:
@@ -494,7 +554,9 @@ class ViewTab(QtWidgets.QWidget):
 
     def _open_organize_menu(self):
         self._rebuild_organize_menu()
-        self.organize_menu.exec_(self.organize_button.mapToGlobal(self.organize_button.rect().bottomLeft()))
+        self.organize_menu.exec_(
+            self.organize_button.mapToGlobal(self.organize_button.rect().bottomLeft())
+        )
 
     def _rebuild_organize_menu(self):
         self.organize_menu.clear()
@@ -504,25 +566,34 @@ class ViewTab(QtWidgets.QWidget):
         )
 
     def _populate_metadata_sections(self, menu, leaf_callback):
-        metadata_classes = [
-            ('GeoTaggedImage', GeoTaggedImage),
-            ('GeoTransformImage', GeoTransformImage),
-            ('WorldView3Image', WorldView3Image),
-        ]
-        metadata_schemas = {
-            label: self._strip_additional_metadata_section(importer_cls._get_metadata())
-            for label, importer_cls in metadata_classes
-        }
-        base_schema = self._metadata_schema_intersection(list(metadata_schemas.values()))
-        if base_schema:
-            submenu = menu.addMenu('Base')
-            self._populate_metadata_submenu(submenu, base_schema, [], 'Base', leaf_callback)
-        for label, _importer_cls in metadata_classes:
-            unique_schema = self._metadata_schema_difference(metadata_schemas[label], base_schema)
-            if not unique_schema:
-                continue
-            submenu = menu.addMenu(label)
-            self._populate_metadata_submenu(submenu, unique_schema, [], label, leaf_callback)
+        schema = {}
+        frame = self._current_geoimageframe
+        if frame is not None and "metadata" in frame.columns:
+            for value in frame["metadata"]:
+                schema = self._merge_metadata_schema(schema, value or {})
+        if not schema:
+            action = menu.addAction("No metadata fields")
+            action.setEnabled(False)
+            return
+        submenu = menu.addMenu("Metadata")
+        self._populate_metadata_submenu(
+            submenu,
+            schema,
+            [],
+            "Metadata",
+            leaf_callback,
+        )
+
+    def _merge_metadata_schema(self, current, value):
+        merged = dict(current or {})
+        if not isinstance(value, dict):
+            return merged
+        for key, item in value.items():
+            if isinstance(item, dict):
+                merged[key] = self._merge_metadata_schema(merged.get(key, {}), item)
+            else:
+                merged.setdefault(key, None)
+        return merged
 
     def _strip_additional_metadata_section(self, metadata):
         if not isinstance(metadata, dict):
@@ -530,7 +601,7 @@ class ViewTab(QtWidgets.QWidget):
         return {
             key: value
             for key, value in metadata.items()
-            if key != 'additional_files_and_metadata'
+            if key != "additional_files_and_metadata"
         }
 
     def _metadata_schema_intersection(self, schemas):
@@ -539,11 +610,17 @@ class ViewTab(QtWidgets.QWidget):
         first_schema = schemas[0]
         shared = {}
         for key, value in first_schema.items():
-            if not all(isinstance(schema, dict) and key in schema for schema in schemas[1:]):
+            if not all(
+                isinstance(schema, dict) and key in schema for schema in schemas[1:]
+            ):
                 continue
             other_values = [schema[key] for schema in schemas[1:]]
-            if isinstance(value, dict) and all(isinstance(other, dict) for other in other_values):
-                nested_shared = self._metadata_schema_intersection([value] + other_values)
+            if isinstance(value, dict) and all(
+                isinstance(other, dict) for other in other_values
+            ):
+                nested_shared = self._metadata_schema_intersection(
+                    [value] + other_values
+                )
                 if nested_shared:
                     shared[key] = nested_shared
             else:
@@ -565,12 +642,16 @@ class ViewTab(QtWidgets.QWidget):
                     difference[key] = nested_difference
         return difference
 
-    def _populate_metadata_submenu(self, menu, metadata, path_parts, section_label, leaf_callback):
+    def _populate_metadata_submenu(
+        self, menu, metadata, path_parts, section_label, leaf_callback
+    ):
         for key, value in metadata.items():
             current_path = path_parts + [key]
             if isinstance(value, dict):
                 submenu = menu.addMenu(key)
-                self._populate_metadata_submenu(submenu, value, current_path, section_label, leaf_callback)
+                self._populate_metadata_submenu(
+                    submenu, value, current_path, section_label, leaf_callback
+                )
                 continue
             action = menu.addAction(key)
             action.triggered.connect(
@@ -582,29 +663,29 @@ class ViewTab(QtWidgets.QWidget):
 
     def _set_organize_field(self, path_parts):
         self._organize_path = list(path_parts)
-        self.organize_button.setText('Organize by: {}'.format('.'.join(path_parts)))
+        self.organize_button.setText("Organize by: {}".format(".".join(path_parts)))
         self._rebuild_navigation_cache()
         self._update_navigation_buttons()
 
     def _metadata_sql_expression(self, path_parts):
         if not path_parts:
-            return 'metadata'
+            return "metadata"
         sql_parts = ["metadata::jsonb"]
         for key in path_parts[:-1]:
             sql_parts.append("->'{}'".format(key.replace("'", "''")))
         sql_parts.append("->>'{}'".format(path_parts[-1].replace("'", "''")))
-        return ''.join(sql_parts)
+        return "".join(sql_parts)
 
     def _rebuild_navigation_cache(self):
         layer = self._selected_vector_layer()
         self._navigation_cache = None
         if layer is None or not self._organize_path:
             return
-        query_text = layer.customProperty('landlensdb/query_text', '')
+        query_text = layer.customProperty("landlensdb/query_text", "")
         if not query_text:
             return
         organize_sql = self._metadata_sql_expression(self._organize_path)
-        schema_name = self.connection_values.get('schema', 'public').strip() or 'public'
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
         query = """
             SELECT q.image_url, {organize_sql}
             FROM ({query_text}) AS q
@@ -612,13 +693,15 @@ class ViewTab(QtWidgets.QWidget):
             ORDER BY {organize_sql} NULLS LAST, q.image_url
         """.format(
             organize_sql=organize_sql,
-            query_text=query_text.replace('%', '%%'),
+            query_text=query_text.replace("%", "%%"),
         )
-        with psycopg2.connect(**connection_kwargs(self.connection_values)) as connection:
+        with psycopg2.connect(
+            **connection_kwargs(self.connection_values)
+        ) as connection:
             with connection.cursor() as cursor:
                 if schema_name:
                     cursor.execute(
-                        sql.SQL('SET search_path TO {}, public').format(
+                        sql.SQL("SET search_path TO {}, public").format(
                             sql.Identifier(schema_name),
                         )
                     )
@@ -626,7 +709,7 @@ class ViewTab(QtWidgets.QWidget):
                 rows = cursor.fetchall()
         feature_id_by_url = {}
         for feature in layer.getFeatures():
-            image_url = feature['image_url']
+            image_url = feature["image_url"]
             if image_url:
                 feature_id_by_url[str(image_url)] = feature.id()
         ordered_urls = []
@@ -636,40 +719,48 @@ class ViewTab(QtWidgets.QWidget):
                 ordered_urls.append(image_url)
                 values_by_url[image_url] = organize_value
         self._navigation_cache = {
-            'layer_id': layer.id(),
-            'ordered_urls': ordered_urls,
-            'index_by_url': {image_url: index for index, image_url in enumerate(ordered_urls)},
-            'feature_id_by_url': feature_id_by_url,
-            'values_by_url': values_by_url,
+            "layer_id": layer.id(),
+            "ordered_urls": ordered_urls,
+            "index_by_url": {
+                image_url: index for index, image_url in enumerate(ordered_urls)
+            },
+            "feature_id_by_url": feature_id_by_url,
+            "values_by_url": values_by_url,
         }
 
     def _navigate_selection(self, direction, bulk):
         cache = self._navigation_cache
         layer = self._selected_vector_layer()
-        if cache is None or layer is None or cache.get('layer_id') != layer.id():
+        if cache is None or layer is None or cache.get("layer_id") != layer.id():
             return
         selected_urls = []
         for feature in layer.selectedFeatures():
-            image_url = feature['image_url']
+            image_url = feature["image_url"]
             if image_url:
                 image_url = str(image_url)
-                if image_url in cache['index_by_url']:
+                if image_url in cache["index_by_url"]:
                     selected_urls.append(image_url)
         if not selected_urls:
             return
-        selected_indices = sorted(cache['index_by_url'][image_url] for image_url in selected_urls)
+        selected_indices = sorted(
+            cache["index_by_url"][image_url] for image_url in selected_urls
+        )
         step = len(selected_indices) if bulk else 1
-        max_index = len(cache['ordered_urls']) - 1
+        max_index = len(cache["ordered_urls"]) - 1
         target_indices = []
         for index in selected_indices:
             target_index = index + (direction * step)
             target_index = max(0, min(max_index, target_index))
             target_indices.append(target_index)
-        target_urls = [cache['ordered_urls'][index] for index in target_indices]
+        target_urls = [cache["ordered_urls"][index] for index in target_indices]
         if not target_urls:
             return
         layer.selectByIds(
-            [cache['feature_id_by_url'][image_url] for image_url in target_urls if image_url in cache['feature_id_by_url']]
+            [
+                cache["feature_id_by_url"][image_url]
+                for image_url in target_urls
+                if image_url in cache["feature_id_by_url"]
+            ]
         )
 
     def _update_navigation_buttons(self):
@@ -680,21 +771,23 @@ class ViewTab(QtWidgets.QWidget):
         self.bulk_next_button.setEnabled(enabled)
 
     def _build_tile_content(self, row):
-        if self._source_mode == 'preview':
-            preview_png = row.get('preview_png')
+        if self._source_mode == "preview":
+            preview_png = row.get("preview_png")
             if not preview_png:
-                return None, 'No Image\nNo preview raster is available for this image.'
+                return None, "No Image\nNo preview raster is available for this image."
             image = QtGui.QImage.fromData(preview_png)
             if image.isNull():
-                return None, 'No Image\nThe preview raster could not be decoded.'
-            return self._apply_north_up(QtGui.QPixmap.fromImage(image), row), 'Preview'
+                return None, "No Image\nThe preview raster could not be decoded."
+            return self._apply_north_up(QtGui.QPixmap.fromImage(image), row), "Preview"
 
         image_path = self._image_path_for_row(row)
         if not image_path:
-            return None, 'No Image\nNo image path is available for this image.'
+            return None, "No Image\nNo image path is available for this image."
         image = QtGui.QImage(image_path)
         if image.isNull():
-            return None, 'No Image\nThe image path could not be loaded:\n{}'.format(image_path)
+            return None, "No Image\nThe image path could not be loaded:\n{}".format(
+                image_path
+            )
         return self._apply_north_up(QtGui.QPixmap.fromImage(image), row), image_path
 
     def _apply_north_up(self, pixmap, row):
@@ -708,15 +801,15 @@ class ViewTab(QtWidgets.QWidget):
         return pixmap.transformed(transform, QtCore.Qt.SmoothTransformation)
 
     def _compass_angle_for_row(self, row):
-        metadata = row.get('metadata') or {}
-        sensor = metadata.get('sensor') or {}
-        angle = sensor.get('compass_angle')
-        if angle in (None, ''):
+        metadata = row.get("metadata") or {}
+        sensor = metadata.get("sensor") or {}
+        angle = sensor.get("compass_angle")
+        if angle in (None, ""):
             return None
         return angle
 
     def _image_path_for_row(self, row):
-        return row.get('image_url')
+        return row.get("image_url")
 
     def _compute_grid_size(self, image_count):
         if image_count <= 0:
@@ -728,38 +821,38 @@ class ViewTab(QtWidgets.QWidget):
     def _empty_geoimageframe(self):
         return GeoImageFrame(
             {
-                'image_url': [],
-                'name': [],
-                'geometry': [],
-                'metadata': [],
-                'preview_png': [],
+                "image_url": [],
+                "name": [],
+                "geometry": [],
+                "metadata": [],
+                "preview_png": [],
             }
         )
 
     def _geoimageframe_from_selected_features(self, features):
         records = []
         for feature in features:
-            image_url = feature['image_url']
+            image_url = feature["image_url"]
             if not image_url:
                 continue
             records.append(
                 {
-                    'image_url': str(image_url),
-                    'name': str(feature['image_url']),
-                    'geometry': feature.geometry().asWkb(),
-                    'metadata': {},
-                    'preview_png': None,
+                    "image_url": str(image_url),
+                    "name": str(feature["image_url"]),
+                    "geometry": feature.geometry().asWkb(),
+                    "metadata": {},
+                    "preview_png": None,
                 }
             )
         shapely_records = []
         for record in records:
             shapely_records.append(
                 {
-                    'image_url': record['image_url'],
-                    'name': record['name'],
-                    'geometry': load_wkb(bytes(record['geometry'])),
-                    'metadata': record['metadata'],
-                    'preview_png': record['preview_png'],
+                    "image_url": record["image_url"],
+                    "name": record["name"],
+                    "geometry": load_wkb(bytes(record["geometry"])),
+                    "metadata": record["metadata"],
+                    "preview_png": record["preview_png"],
                 }
             )
         if not shapely_records:
