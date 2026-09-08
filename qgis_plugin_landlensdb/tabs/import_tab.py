@@ -211,7 +211,7 @@ class ImportTab(QtWidgets.QWidget):
                                 image_url text NOT NULL,
                                 name text NOT NULL,
                                 geometry geometry(Geometry, 4326) NOT NULL,
-                                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                                metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
                                 thumbnail raster,
                                 fingerprint text,
                                 input_sha text NOT NULL,
