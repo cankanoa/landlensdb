@@ -10,7 +10,7 @@ where = ["."]
 include = ["landlensdb*"]
 
 [tool.setuptools.package-data]
-landlensdb = ["examples/*.yaml"]
+landlensdb = ["examples/*.json"]
 
 [project]
 name = "landlensdb"

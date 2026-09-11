@@ -2,7 +2,7 @@
 
 from qgis.PyQt import QtCore
 
-IMPORT_PARAMETERS_KEY = "Landlensdb/import_parameters"
+IMPORT_PARAMETERS_KEY = "Landlensdb/import_config_json"
 
 
 def has_saved_import_parameters():
@@ -11,11 +11,11 @@ def has_saved_import_parameters():
 
 
 def load_import_parameters(default_text):
-    """Return the last saved YAML document or the supplied default."""
+    """Return the last saved JSON document or the supplied default."""
     value = QtCore.QSettings().value(IMPORT_PARAMETERS_KEY, default_text, type=str)
     return value or default_text
 
 
-def save_import_parameters(yaml_text):
-    """Persist the current YAML document for subsequent import actions."""
-    QtCore.QSettings().setValue(IMPORT_PARAMETERS_KEY, yaml_text)
+def save_import_parameters(json_text):
+    """Persist the current JSON document for subsequent import actions."""
+    QtCore.QSettings().setValue(IMPORT_PARAMETERS_KEY, json_text)

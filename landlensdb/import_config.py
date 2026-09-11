@@ -1,176 +1,137 @@
-"""Import parameter serialization shared by Python, PostgreSQL, and QGIS."""
+"""Compact JSON import configurations shared by Python, PostgreSQL, and QGIS."""
 
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
-import yaml
-
-EXAMPLE_IMPORT_PARAMS_PATH = Path(__file__).with_name("examples") / "import_params.yaml"
-IMPORT_PRESET_PATHS = {
-    "Defaults": EXAMPLE_IMPORT_PARAMS_PATH,
-    "Geotagged photos": Path(__file__).with_name("examples") / "geotagged_photos.yaml",
-    "Georeferenced rasters": Path(__file__).with_name("examples")
-    / "georeferenced_rasters.yaml",
-    "WorldView-3 (TIL + IMD)": Path(__file__).with_name("examples") / "worldview3.yaml",
-}
+IMPORT_TEMPLATE_DIRECTORY = Path(__file__).with_name("examples")
+REQUIRED_FIELDS = ("file_glob", "name", "image_url", "geometry")
+GEOMETRY_MODES = {"point_from_exif", "bounds_from_image"}
+GEOMETRY_CORNERS = ("upper_left", "upper_right", "lower_right", "lower_left")
 
 
-def load_example_import_yaml() -> str:
-    """Return the commented import template used by the QGIS editor."""
-    return EXAMPLE_IMPORT_PARAMS_PATH.read_text(encoding="utf-8")
+def load_example_import_json() -> str:
+    """Use the first available template when no configuration has been saved."""
+    return next(iter(load_import_presets().values()), "{}")
 
 
 def load_import_presets() -> dict[str, str]:
-    """Return the built-in quick-import presets in display order."""
+    """Discover the current JSON files on every call, using filenames as labels."""
     return {
-        name: path.read_text(encoding="utf-8")
-        for name, path in IMPORT_PRESET_PATHS.items()
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(
+            IMPORT_TEMPLATE_DIRECTORY.glob("*"), key=lambda path: path.name.casefold()
+        )
+        if path.is_file() and path.suffix.lower() == ".json"
     }
 
 
-def parse_import_yaml(value: str | Mapping[str, Any]) -> dict[str, Any]:
-    """Parse YAML or copy an existing mapping and require a mapping root."""
-    if isinstance(value, str):
-        parsed = yaml.safe_load(value)
-    elif isinstance(value, Mapping):
-        parsed = dict(value)
-    else:
-        raise TypeError("Import parameters must be YAML text or a mapping.")
-    if not isinstance(parsed, dict):
-        raise ValueError("Import parameter YAML must contain a mapping at its root.")
-    return parsed
+def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Require the compact model and reject unsupported configuration options."""
+    if not isinstance(config, Mapping):
+        raise ValueError("Import configuration must be a JSON object.")
+    allowed = set(REQUIRED_FIELDS) | {
+        "sidecar_glob",
+        "metadata",
+        "thumbnail",
+        "fingerprint",
+    }
+    unknown = set(config) - allowed
+    if unknown:
+        raise ValueError(
+            "Unknown import options: {}".format(", ".join(sorted(unknown)))
+        )
+    for key in ("file_glob", "name", "image_url"):
+        if not isinstance(config.get(key), str) or not config[key].strip():
+            raise ValueError("`{}` must be a non-empty string.".format(key))
+    geometry = config.get("geometry")
+    if isinstance(geometry, dict):
+        if set(geometry) != set(GEOMETRY_CORNERS):
+            raise ValueError(
+                "`geometry` must contain exactly these four corners: {}.".format(
+                    ", ".join(GEOMETRY_CORNERS)
+                )
+            )
+        for corner in GEOMETRY_CORNERS:
+            pair = geometry[corner]
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise ValueError(
+                    "`geometry.{}` must be [longitude, latitude].".format(corner)
+                )
+            for value in pair:
+                if not (
+                    type(value) in (int, float)
+                    or isinstance(value, str)
+                    and value.strip()
+                ):
+                    raise ValueError(
+                        "`geometry.{}` coordinates must be numbers or metadata paths.".format(
+                            corner
+                        )
+                    )
+                if (
+                    isinstance(value, str)
+                    and value.startswith("sidecar.")
+                    and not config.get("sidecar_glob")
+                ):
+                    raise ValueError("Sidecar geometry paths require `sidecar_glob`.")
+    elif not isinstance(geometry, str) or geometry not in GEOMETRY_MODES:
+        raise ValueError("Unsupported geometry: {!r}.".format(geometry))
+    if "sidecar_glob" in config and (
+        not isinstance(config["sidecar_glob"], str)
+        or not config["sidecar_glob"].strip()
+    ):
+        raise ValueError("`sidecar_glob` must be a non-empty string.")
+    for key in ("metadata", "thumbnail", "fingerprint"):
+        if key in config and not isinstance(config[key], dict):
+            raise ValueError("`{}` must be a JSON object.".format(key))
+    for key, options in (
+        ("thumbnail", {"enabled", "width", "height", "resampling"}),
+        ("fingerprint", {"enabled", "mode"}),
+    ):
+        section = config.get(key, {})
+        if set(section) - options:
+            raise ValueError("Unknown {} options.".format(key))
+        if "enabled" in section and not isinstance(section["enabled"], bool):
+            raise ValueError("`{}.enabled` must be a boolean.".format(key))
+    thumbnail = config.get("thumbnail", {})
+    for key in ("width", "height"):
+        if key in thumbnail and (type(thumbnail[key]) is not int or thumbnail[key] < 1):
+            raise ValueError("`thumbnail.{}` must be a positive integer.".format(key))
+    if "resampling" in thumbnail and (
+        not isinstance(thumbnail["resampling"], str)
+        or not thumbnail["resampling"].strip()
+    ):
+        raise ValueError("`thumbnail.resampling` must be a non-empty string.")
+    if config.get("fingerprint", {}).get("mode", "robust") not in {"robust", "quick"}:
+        raise ValueError("`fingerprint.mode` must be 'robust' or 'quick'.")
+    # Snapshot the parsed JSON so callers cannot change a running import's config.
+    return json.loads(json.dumps(dict(config), allow_nan=False))
 
 
-def normalize_import_yaml(value: str | Mapping[str, Any]) -> str:
-    """Return stable YAML without comments or formatting differences."""
-    parsed = parse_import_yaml(value)
-    return yaml.safe_dump(
-        parsed,
-        allow_unicode=True,
-        default_flow_style=False,
+def parse_import_json(text: str) -> dict[str, Any]:
+    """Parse and validate one JSON configuration; YAML is not accepted."""
+    return validate_import_config(json.loads(text))
+
+
+def normalize_import_json(value: str | Mapping[str, Any]) -> str:
+    config = (
+        parse_import_json(value)
+        if isinstance(value, str)
+        else validate_import_config(value)
+    )
+    return json.dumps(
+        config,
         sort_keys=True,
-        width=4096,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     )
 
 
 def calculate_input_sha(value: str | Mapping[str, Any]) -> str:
-    """Return the SHA-256 digest of normalized import parameters."""
-    normalized = normalize_import_yaml(value)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
-def _flatten_mapping(mapping: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
-    flattened: dict[str, Any] = {}
-    for key, value in mapping.items():
-        parameter_name = "{}_{}".format(prefix, key) if prefix else str(key)
-        if isinstance(value, Mapping):
-            flattened.update(_flatten_mapping(value, parameter_name))
-        else:
-            flattened[parameter_name] = value
-    return flattened
-
-
-def import_yaml_to_function_params(value: str | Mapping[str, Any]) -> dict[str, Any]:
-    """Translate nested YAML keys to flat Python keyword arguments.
-
-    ``metadata`` is deliberately preserved as one nested mapping. It is the
-    only import argument whose structure is user-defined.
-    """
-    parsed = parse_import_yaml(value)
-    metadata = parsed.pop("metadata", {})
-    if not isinstance(metadata, dict):
-        raise ValueError("`metadata` must be a mapping.")
-    parameters = _flatten_mapping(parsed)
-    parameters["metadata"] = metadata
-    return parameters
-
-
-def build_import_params_mapping(
-    *,
-    source_file_glob: str,
-    source_sidecar_glob: str | None,
-    name_source: str,
-    name_required: bool,
-    name_default: Any,
-    image_url_source: str,
-    image_url_required: bool,
-    geometry_source: str,
-    geometry_output_crs: str,
-    geometry_required: bool,
-    geometry_latitude: str,
-    geometry_latitude_reference: str,
-    geometry_longitude: str,
-    geometry_longitude_reference: str,
-    geometry_footprint: str,
-    geometry_min_x: str | None,
-    geometry_min_y: str | None,
-    geometry_max_x: str | None,
-    geometry_max_y: str | None,
-    geometry_input_crs: str | None,
-    metadata: Mapping[str, Any],
-    thumbnail_enabled: bool,
-    thumbnail_width: int,
-    thumbnail_height: int,
-    thumbnail_resampling: str,
-    fingerprint_enabled: bool,
-    fingerprint_mode: str,
-) -> dict[str, Any]:
-    """Build the effective nested import configuration from function args."""
-    source = {"file_glob": source_file_glob}
-    if source_sidecar_glob:
-        source["sidecar_glob"] = source_sidecar_glob
-
-    geometry: dict[str, Any] = {
-        "source": geometry_source,
-        "output_crs": geometry_output_crs,
-        "required": bool(geometry_required),
-    }
-    if geometry_source == "point_from_exif":
-        geometry.update(
-            {
-                "latitude": geometry_latitude,
-                "latitude_reference": geometry_latitude_reference,
-                "longitude": geometry_longitude,
-                "longitude_reference": geometry_longitude_reference,
-            }
-        )
-    elif geometry_source == "bounds_from_image":
-        geometry["footprint"] = geometry_footprint
-    elif geometry_source == "bounds_from_sidecar":
-        geometry.update(
-            {
-                "min_x": geometry_min_x,
-                "min_y": geometry_min_y,
-                "max_x": geometry_max_x,
-                "max_y": geometry_max_y,
-                "input_crs": geometry_input_crs,
-            }
-        )
-
-    return {
-        "source": source,
-        "name": {
-            "source": name_source,
-            "required": bool(name_required),
-            "default": name_default,
-        },
-        "image_url": {
-            "source": image_url_source,
-            "required": bool(image_url_required),
-        },
-        "geometry": geometry,
-        "metadata": dict(metadata),
-        "thumbnail": {
-            "enabled": bool(thumbnail_enabled),
-            "width": int(thumbnail_width),
-            "height": int(thumbnail_height),
-            "resampling": thumbnail_resampling,
-        },
-        "fingerprint": {
-            "enabled": bool(fingerprint_enabled),
-            "mode": fingerprint_mode,
-        },
-    }
+    """Hash the JSON configuration independently of whitespace and key order."""
+    return hashlib.sha256(normalize_import_json(value).encode("utf-8")).hexdigest()

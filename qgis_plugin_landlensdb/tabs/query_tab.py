@@ -14,13 +14,16 @@ import io
 import json
 from datetime import datetime
 
-from qgis.PyQt import QtCore, QtWidgets, uic
+from qgis.PyQt import QtCore, QtGui, QtWidgets, uic
 from qgis.PyQt.QtWidgets import QAbstractItemView
 from qgis.core import (
     Qgis,
     QgsAction,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsDataSourceUri,
     QgsFeatureRequest,
+    QgsGeometry,
     QgsLayerTreeGroup,
     QgsProject,
     QgsRasterLayer,
@@ -28,6 +31,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
+from ..shared.bbox_selection import BboxSelectionTool
 from ..shared.connection_utils import (
     connection_kwargs,
     fetch_base_tables,
@@ -129,12 +133,18 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         super(QueryTab, self).__init__(parent)
         self.iface = iface
         self.setupUi(self)
+        # Use the inherited QGIS palette throughout the loaded form, including
+        # containers which install their own palette during setup.
+        for widget in self.findChildren(QtWidgets.QWidget):
+            if widget.testAttribute(QtCore.Qt.WA_SetPalette):
+                widget.setPalette(QtGui.QPalette())
 
         self.connection_values = {}
         self._metadata_loaded = False
         self._last_query_state = None
         self._thumbnail_support_cache = {}
         self._staged_metadata_items = []
+        self._bbox_tool = None
         self._additional_metadata_schema = load_metadata_tree()
         self._shared_table_name = (
             QtCore.QSettings().value(self.SHARED_TABLE_KEY, "", type=str) or ""
@@ -476,26 +486,23 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self._set_row_buttons(
             "row_three_layout", [(item, item) for item in self.STATIC_ROW_THREE]
         )
-        self._set_row_buttons(
-            "row_five_layout", [("Spatial Query", None), ("Metadata Query", None)]
+        actions = (
+            (
+                "File Spatial Query",
+                "file_spatial_query_button",
+                self._open_spatial_query_dialog,
+            ),
+            ("Select Bbox Query", "bbox_query_button", self._start_bbox_query),
+            ("Metadata Query", "metadata_query_button", self._open_metadata_query_menu),
         )
-        spatial_button = self.row_five_layout.itemAt(0).widget()
-        if spatial_button is not None:
-            try:
-                spatial_button.clicked.disconnect()
-            except TypeError:
-                pass
-            spatial_button.clicked.connect(self._open_spatial_query_dialog)
-        metadata_item = self.row_five_layout.takeAt(1)
-        metadata_button = metadata_item.widget() if metadata_item is not None else None
-        if metadata_button is not None:
-            try:
-                metadata_button.clicked.disconnect()
-            except TypeError:
-                pass
-            metadata_button.clicked.connect(self._open_metadata_query_menu)
-            self.metadata_query_button = metadata_button
-            self.row_five_layout.insertWidget(1, metadata_button)
+        self._clear_layout(self.row_five_layout)
+        for label, attribute, callback in actions:
+            button = QtWidgets.QPushButton(label, self)
+            button.setMinimumHeight(30)
+            button.clicked.connect(callback)
+            self.row_five_layout.addWidget(button)
+            setattr(self, attribute, button)
+        self.row_five_layout.addStretch()
 
     def _render_dynamic_buttons(self, tables, columns):
         table_items = [(table, table) for table in tables] or [("No tables", None)]
@@ -1680,27 +1687,103 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             self._show_error("The selected vector geometry is empty.")
             return
 
-        wkt = geometry.asWkt()
-        srid = layer.crs().postgisSrid()
-        if srid <= 0:
-            srid = 4326
+        self._insert_spatial_query(geometry, layer.crs())
 
-        spatial_function = "ST_Intersects"
-        if QgsWkbTypes.geometryType(layer.wkbType()) == QgsWkbTypes.PointGeometry:
-            spatial_function = "ST_DWithin"
-            snippet = "{}(geometry, ST_GeomFromText('{}', {}), 0)".format(
-                spatial_function,
-                wkt.replace("'", "''"),
-                srid,
+    def _insert_spatial_query(self, geometry, crs):
+        """Use the same CRS-aware condition for file and map selections."""
+        if not crs.isValid():
+            self._show_error(
+                "The spatial query source has no valid coordinate reference system."
             )
+            return
+        geometry = QgsGeometry(geometry)
+        srid = crs.postgisSrid()
+        if srid <= 0:
+            try:
+                geometry.transform(
+                    QgsCoordinateTransform(
+                        crs,
+                        QgsCoordinateReferenceSystem("EPSG:4326"),
+                        QgsProject.instance(),
+                    )
+                )
+            except Exception as exc:
+                self._show_error(
+                    "Could not transform the spatial query geometry: {}".format(exc)
+                )
+                return
+            srid = 4326
+        source = "ST_Transform(ST_GeomFromText('{}', {}), ST_SRID(geometry))".format(
+            geometry.asWkt().replace("'", "''"), srid
+        )
+        if geometry.type() == QgsWkbTypes.PointGeometry:
+            snippet = "ST_DWithin(geometry, {}, 0)".format(source)
         else:
-            snippet = "{}(geometry, ST_GeomFromText('{}', {}))".format(
-                spatial_function,
-                wkt.replace("'", "''"),
-                srid,
-            )
+            snippet = "ST_Intersects(geometry, {})".format(source)
         self._insert_sql(snippet)
         self._show_info("Spatial query text inserted. Adjust it if needed.")
+
+    def _start_bbox_query(self):
+        if self._bbox_tool is not None:
+            return
+        canvas = self.iface.mapCanvas() if self.iface is not None else None
+        if canvas is None:
+            self._show_error("A QGIS map canvas is required to select a bounding box.")
+            return
+        if not canvas.mapSettings().destinationCrs().isValid():
+            self._show_error(
+                "Set the map's coordinate reference system before selecting a bounding box."
+            )
+            return
+        self._bbox_canvas = canvas
+        self._bbox_previous_tool = canvas.mapTool()
+        self._bbox_window = self.window()
+        self._bbox_restore_window = (
+            self._bbox_window is not canvas.window() and self._bbox_window.isVisible()
+        )
+        self._bbox_tool = BboxSelectionTool(canvas)
+        self._bbox_tool.extentChanged.connect(self._bbox_selected)
+        self._bbox_tool.cancelled.connect(self._finish_bbox_selection)
+        canvas.mapToolSet.connect(self._bbox_map_tool_changed)
+        canvas.setMapTool(self._bbox_tool)
+        self._show_info(
+            "Drag a rectangle on the map. Press Escape or right-click to cancel."
+        )
+        if self._bbox_restore_window:
+            self._bbox_window.hide()
+        canvas.setFocus()
+
+    def _bbox_selected(self, rectangle):
+        if rectangle.isEmpty():
+            self._show_info("Drag a rectangle with a nonzero width and height.")
+            return
+        crs = self._bbox_canvas.mapSettings().destinationCrs()
+        self._finish_bbox_selection()
+        self._insert_spatial_query(QgsGeometry.fromRect(rectangle), crs)
+
+    def _bbox_map_tool_changed(self, tool, _previous_tool):
+        if self._bbox_tool is not None and tool is not self._bbox_tool:
+            self._finish_bbox_selection()
+
+    def _finish_bbox_selection(self, show_window=True):
+        tool = self._bbox_tool
+        if tool is None:
+            return
+        self._bbox_tool = None
+        canvas = self._bbox_canvas
+        canvas.mapToolSet.disconnect(self._bbox_map_tool_changed)
+        if canvas.mapTool() is tool:
+            if self._bbox_previous_tool is not None:
+                canvas.setMapTool(self._bbox_previous_tool)
+            else:
+                canvas.unsetMapTool(tool)
+        tool.clearRubberBand()
+        tool.deleteLater()
+        if show_window and self._bbox_restore_window:
+            self._bbox_window.show()
+            self._bbox_window.raise_()
+            self._bbox_window.activateWindow()
+            self.sql_input.setFocus()
 
     def _open_metadata_query_menu(self):
         button = getattr(self, "metadata_query_button", None)

@@ -1,0 +1,29 @@
+{
+  "file_glob": "/path/to/photos/**/*.@(jpg|jpeg|png|JPG|JPEG|PNG)",
+  "name": "file.name",
+  "image_url": "file.path",
+  "geometry": "point_from_exif",
+  "metadata": {
+    "captured_at": "exif_parse_time_to_timez.DateTimeOriginal",
+    "camera": {
+      "focal_length": "exif.FocalLength",
+      "make": "exif.Make",
+      "model": "exif.Model"
+    },
+    "sensor": {
+      "altitude": "exif.GPSInfo.GPSAltitude",
+      "compass_angle": "exif.GPSInfo.GPSImgDirection",
+      "orientation": "exif.Orientation"
+    }
+  },
+  "thumbnail": {
+    "enabled": true,
+    "width": 256,
+    "height": 256,
+    "resampling": "lanczos"
+  },
+  "fingerprint": {
+    "enabled": false,
+    "mode": "robust"
+  }
+}

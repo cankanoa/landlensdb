@@ -173,6 +173,8 @@ class Landlensdb:
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
+        if hasattr(self, 'dlg'):
+            self.dlg.query_tab._finish_bbox_selection(show_window=False)
         for action in self.actions:
             self.iface.removePluginMenu(
                 self.tr(u'&Landlensdb'),

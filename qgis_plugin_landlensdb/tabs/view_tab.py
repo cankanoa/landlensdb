@@ -121,32 +121,6 @@ class LayerSelectionComboBox(QtWidgets.QComboBox):
         super(LayerSelectionComboBox, self).showPopup()
 
 
-def _build_chevron_icon(direction):
-    pixmap = QtGui.QPixmap(18, 18)
-    pixmap.fill(QtCore.Qt.transparent)
-    painter = QtGui.QPainter(pixmap)
-    painter.setRenderHint(QtGui.QPainter.Antialiasing)
-    pen = QtGui.QPen(QtGui.QColor("black"))
-    pen.setWidth(2)
-    pen.setCapStyle(QtCore.Qt.RoundCap)
-    pen.setJoinStyle(QtCore.Qt.RoundJoin)
-    painter.setPen(pen)
-    if direction == "left":
-        painter.drawPolyline(
-            QtCore.QPointF(11.5, 4.0),
-            QtCore.QPointF(6.0, 9.0),
-            QtCore.QPointF(11.5, 14.0),
-        )
-    else:
-        painter.drawPolyline(
-            QtCore.QPointF(6.5, 4.0),
-            QtCore.QPointF(12.0, 9.0),
-            QtCore.QPointF(6.5, 14.0),
-        )
-    painter.end()
-    return QtGui.QIcon(pixmap)
-
-
 class ViewTab(QtWidgets.QWidget):
     ACTIVE_LAYER_VALUE = "__active_layer__"
 
@@ -212,7 +186,7 @@ class ViewTab(QtWidgets.QWidget):
         header_row.addWidget(self.bulk_previous_button)
 
         self.previous_button = QtWidgets.QToolButton(self)
-        self.previous_button.setIcon(_build_chevron_icon("left"))
+        self.previous_button.setArrowType(QtCore.Qt.LeftArrow)
         self.previous_button.setAutoRaise(True)
         self.previous_button.clicked.connect(
             lambda: self._navigate_selection(-1, bulk=False)
@@ -225,7 +199,7 @@ class ViewTab(QtWidgets.QWidget):
         header_row.addWidget(self.organize_button)
 
         self.next_button = QtWidgets.QToolButton(self)
-        self.next_button.setIcon(_build_chevron_icon("right"))
+        self.next_button.setArrowType(QtCore.Qt.RightArrow)
         self.next_button.setAutoRaise(True)
         self.next_button.clicked.connect(
             lambda: self._navigate_selection(1, bulk=False)

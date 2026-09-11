@@ -306,6 +306,7 @@ class Postgres:
             )
         return result.rowcount or 0
 
+    @staticmethod
     def _qualified_table_name(table):
         if table.schema:
             return '"{}"."{}"'.format(table.schema, table.name)
@@ -329,7 +330,9 @@ class Postgres:
         table_ident = table_name.replace('"', '""')
         constraint_ident = constraint_name.replace('"', '""')
         column_ident = column_name.replace('"', '""')
-        conn.execute(text(f"""
+        conn.execute(
+            text(
+                f"""
                 DO $$
                 BEGIN
                     IF NOT EXISTS (
@@ -343,10 +346,19 @@ class Postgres:
                     END IF;
                 END
                 $$;
-                """))
+                """
+            )
+        )
 
     def upsert_images(
-        self, gif, table_name, conflict="update", if_exists="upsert", *args, **kwargs
+        self,
+        gif,
+        table_name,
+        conflict="update",
+        if_exists="upsert",
+        *args,
+        input_sha=None,
+        **kwargs,
     ):
         """
         Write image data to the specified table.
@@ -358,6 +370,7 @@ class Postgres:
                 ("update" or "nothing"). Defaults to "update".
             if_exists (str, optional): Write behavior ("fail", "replace",
                 "append", or "upsert"). Defaults to "upsert".
+            input_sha (str, optional): Restrict updates to this import group.
 
         Raises:
             ValueError: If an invalid write mode or conflict resolution type is provided.
@@ -487,6 +500,7 @@ class Postgres:
             )
 
         data = gif.to_dict(orient="records")
+        srid = gif.crs.to_epsg() if gif.crs is not None else None
 
         meta = MetaData()
         table = Table(table_name, meta, autoload_with=self.engine)
@@ -504,12 +518,13 @@ class Postgres:
                     else None
                 )
                 if current_geometry_type not in (None, "GEOMETRY"):
+                    table_srid = max(getattr(geometry_column.type, "srid", 0), 0)
                     conn.execute(
                         text(
                             "ALTER TABLE {} "
-                            "ALTER COLUMN geometry TYPE geometry(Geometry, 4326) "
-                            "USING ST_SetSRID(geometry, 4326)".format(
-                                self._qualified_table_name(table)
+                            "ALTER COLUMN geometry TYPE geometry(Geometry, {}) "
+                            "USING geometry".format(
+                                self._qualified_table_name(table), table_srid
                             )
                         )
                     )
@@ -517,6 +532,8 @@ class Postgres:
                 thumbnail_value = record.pop("thumbnail", None)
                 record = self._convert_geometries_to_wkt(record)
                 record = self._convert_dicts_to_json(record)
+                if srid and record.get("geometry"):
+                    record["geometry"] = "SRID={};{}".format(srid, record["geometry"])
                 fingerprint_value = record.get("fingerprint")
 
                 if (
@@ -530,6 +547,10 @@ class Postgres:
                         .where(table.c.fingerprint == fingerprint_value)
                         .values(**updates)
                     )
+                    if input_sha is not None:
+                        fingerprint_update = fingerprint_update.where(
+                            table.c.input_sha == input_sha
+                        )
                     fingerprint_result = conn.execute(fingerprint_update)
                     if fingerprint_result.rowcount:
                         continue
@@ -555,7 +576,13 @@ class Postgres:
                     }
                     constraint_name = f"{table.name}_image_url_key"
                     on_conflict_stmt = insert_stmt.on_conflict_do_update(
-                        constraint=constraint_name, set_=updates
+                        constraint=constraint_name,
+                        set_=updates,
+                        where=(
+                            table.c.input_sha == input_sha
+                            if input_sha is not None
+                            else None
+                        ),
                     )
                 elif conflict == "nothing":
                     on_conflict_stmt = insert_stmt.on_conflict_do_nothing()
@@ -564,7 +591,11 @@ class Postgres:
                         "Invalid conflict resolution type. Choose 'update' or 'nothing'."
                     )
 
-                conn.execute(on_conflict_stmt)
+                written = conn.execute(
+                    on_conflict_stmt.returning(table.c.image_url)
+                ).first()
+                if written is None:
+                    continue
 
                 if thumbnail_value is not None:
                     thumbnail_updates.append(

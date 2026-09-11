@@ -35,7 +35,7 @@ class SqlBuilderController(object):
                 self.clear_layout(child_layout)
 
     def make_insert_button(self, label, insert_text=None):
-        button = QtWidgets.QPushButton(label)
+        button = QtWidgets.QPushButton(label, self.owner)
         button.setMinimumHeight(30)
         button.clicked.connect(lambda: self.insert_sql(insert_text or label))
         return button

@@ -5,22 +5,34 @@ __author__ = "cankanoa@gmail.com"
 __date__ = "2026-03-13"
 __copyright__ = "Copyright 2026, Kanoa Lindiwe LLC"
 
+import json
 import unittest
 
 from qgis.PyQt import QtCore, QtGui, QtWidgets
 
 from ..landlensdb_dialog import LandlensdbDialog
-from ..landlensdb.import_config import load_example_import_yaml, load_import_presets
+from ..landlensdb.import_config import load_example_import_json, load_import_presets
 from ..shared.import_settings import (
     IMPORT_PARAMETERS_KEY,
     load_import_parameters,
     save_import_parameters,
 )
-from ..shared.yaml_editor import ImportYamlDialog
+from ..shared.json_editor import ImportJsonDialog
 from ..tabs.view_tab import ImageCanvas, ImageScrollArea
 from .utilities import get_qgis_app
 
 QGIS_APP = get_qgis_app()
+
+
+def import_config_json(file_glob):
+    return json.dumps(
+        {
+            "file_glob": file_glob,
+            "name": "file.name",
+            "image_url": "file.path",
+            "geometry": "point_from_exif",
+        }
+    )
 
 
 class LandlensdbDialogTest(unittest.TestCase):
@@ -114,19 +126,19 @@ class LandlensdbDialogTest(unittest.TestCase):
     def test_import_rows_are_grouped_by_input_sha(self):
         """The import tab displays one row for each canonical input SHA."""
         import_tab = self.dialog.import_tab
-        first_yaml = "source:\n  file_glob: /photos/first/**/*.jpg\n"
-        second_yaml = "source:\n  file_glob: /photos/second/**/*.tif\n"
+        first_json = import_config_json("/photos/first/**/*.jpg")
+        second_json = import_config_json("/photos/second/**/*.tif")
         import_tab.load_records(
             [
                 {
                     "input_sha": "a" * 64,
                     "row_count": 2,
-                    "import_params": first_yaml,
+                    "import_params": first_json,
                 },
                 {
                     "input_sha": "b" * 64,
                     "row_count": 3,
-                    "import_params": second_yaml,
+                    "import_params": second_json,
                 },
             ]
         )
@@ -158,15 +170,15 @@ class LandlensdbDialogTest(unittest.TestCase):
         params_button = import_tab.import_table.cellWidget(
             0, import_tab.IMPORT_PARAMS_COLUMN
         )
-        self.assertEqual(params_button.text(), "View YAML")
-        opened_yaml = []
+        self.assertEqual(params_button.text(), "View JSON")
+        opened_json = []
         import_tab._fetch_first_import_params = lambda input_sha: (
-            first_yaml if input_sha == "a" * 64 else None
+            first_json if input_sha == "a" * 64 else None
         )
-        import_tab._show_import_parameters = opened_yaml.append
+        import_tab._show_import_parameters = opened_json.append
         params_button.click()
-        self.assertEqual(opened_yaml, [first_yaml])
-        self.assertEqual(import_tab.open_yaml_button.text(), "Import Parameters…")
+        self.assertEqual(opened_json, [first_json])
+        self.assertEqual(import_tab.open_json_button.text(), "Import Parameters…")
         self.assertFalse(hasattr(import_tab, "connection_button"))
         self.assertFalse(hasattr(import_tab, "skip_existing_input"))
         expected_actions = [
@@ -197,30 +209,74 @@ class LandlensdbDialogTest(unittest.TestCase):
         had_original = settings.contains(IMPORT_PARAMETERS_KEY)
         original = settings.value(IMPORT_PARAMETERS_KEY) if had_original else None
         try:
-            save_import_parameters("source:\n  file_glob: /tmp/*.jpg\n")
+            save_import_parameters(import_config_json("/tmp/*.jpg"))
             self.assertEqual(
                 load_import_parameters("default"),
-                "source:\n  file_glob: /tmp/*.jpg\n",
+                import_config_json("/tmp/*.jpg"),
             )
-            dialog = ImportYamlDialog(
-                load_example_import_yaml(),
+            dialog = ImportJsonDialog(
+                load_example_import_json(),
                 lambda value: value,
-                presets=load_import_presets(),
             )
             self.assertEqual(dialog.save_button.text(), "Save")
             self.assertEqual(dialog.copy_button.text(), "Copy")
             dialog.copy_button.click()
             self.assertEqual(
-                QtWidgets.QApplication.clipboard().text(), dialog.yaml_text()
+                QtWidgets.QApplication.clipboard().text(), dialog.json_text()
             )
             self.assertFalse(hasattr(dialog, "reset_button"))
             self.assertFalse(hasattr(dialog, "normalize_button"))
-            self.assertEqual(dialog.preset_input.itemText(0), "Defaults")
+            self.assertEqual(
+                [action.text() for action in dialog.preset_menu.actions()],
+                list(load_import_presets()),
+            )
         finally:
             if had_original:
                 settings.setValue(IMPORT_PARAMETERS_KEY, original)
             else:
                 settings.remove(IMPORT_PARAMETERS_KEY)
+
+    def test_dialog_buttons_follow_parent_palette_when_theme_changes(self):
+        host = QtWidgets.QWidget()
+        dialog = LandlensdbDialog(None, host)
+        popup = ImportJsonDialog(
+            load_example_import_json(), lambda value: value, parent=dialog.import_tab
+        )
+        self.addCleanup(host.close)
+        self.addCleanup(dialog.close)
+        self.addCleanup(popup.close)
+        for foreground, background in (("#eeeeee", "#252525"), ("#111111", "#eeeeee")):
+            palette = QtGui.QPalette(host.style().standardPalette())
+            for role in (
+                QtGui.QPalette.ButtonText,
+                QtGui.QPalette.WindowText,
+                QtGui.QPalette.Text,
+            ):
+                palette.setColor(role, QtGui.QColor(foreground))
+            for role in (
+                QtGui.QPalette.Button,
+                QtGui.QPalette.Window,
+                QtGui.QPalette.Base,
+            ):
+                palette.setColor(role, QtGui.QColor(background))
+            host.setPalette(palette)
+            for button in dialog.findChildren(QtWidgets.QAbstractButton):
+                # Table corner buttons have their own internal Qt style palette.
+                if type(button) is QtWidgets.QAbstractButton:
+                    continue
+                self.assertEqual(button.styleSheet(), "")
+                self.assertEqual(
+                    button.palette().color(
+                        QtGui.QPalette.Active, QtGui.QPalette.ButtonText
+                    ),
+                    palette.color(QtGui.QPalette.Active, QtGui.QPalette.ButtonText),
+                    button.objectName() or button.text(),
+                )
+        self.assertEqual(
+            dialog.view_tab.previous_button.arrowType(), QtCore.Qt.LeftArrow
+        )
+        self.assertEqual(dialog.view_tab.next_button.arrowType(), QtCore.Qt.RightArrow)
+
 
 if __name__ == "__main__":
     suite = unittest.makeSuite(LandlensdbDialogTest)
