@@ -1,9 +1,10 @@
-from qgis.PyQt import QtWidgets
+from qgis.PyQt import QtCore, QtWidgets
 
 
 class ConnectionDialog(QtWidgets.QDialog):
     def __init__(self, values, test_callback, parent=None):
         super(ConnectionDialog, self).__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_WindowPropagation)
         self._test_callback = test_callback
         self.setWindowTitle('Connection')
         self.resize(520, 300)

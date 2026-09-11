@@ -28,15 +28,16 @@ class OverviewTab(QtWidgets.QWidget):
             <p>Use <b>Setup</b> to create PostGIS extension SQL and save the PostgreSQL connection used by Import and Query. The plugin depends on QPIP for Python package installation, which should have already installed the required packages.</p>
 
             <h3>Import</h3>
-            <p>Use <b>Import Parameters</b> to configure and save an import in a colorized YAML editor. The saved document is restored when the editor reopens. Presets cover the defaults, EXIF-geotagged photos, georeferenced rasters, and WorldView-3 TIL + IMD products. Imports are grouped by the SHA-256 digest of their normalized parameters. Each row stores that digest and the canonical YAML used to create it.</p>
-            <p>The YAML controls one full-path wcmatch file glob, field sources, geometry extraction, user-defined metadata, thumbnails, and fingerprints. Threads, batch size, and error handling remain QGIS controls and are not stored in the YAML. Use <b>Update New</b> when existing image paths should be skipped.</p>
-            <p>Actions let you update a selected import group, remove rows whose files no longer match, or remove the complete group.</p>
+            <p><b>Import Parameters</b> opens a <b>Search Glob</b> field that automatically saves valid path-pattern edits while preserving the other loaded settings. Enable <b>Advanced settings</b> to edit the full JSON, then use <b>Save</b>. <b>Open Template Folder</b> opens the preset files. Presets cover EXIF-geotagged photos, georeferenced rasters, and WorldView-3 TIL + IMD products. Imports are grouped by the SHA-256 digest of their normalized parameters. Each row stores that digest and the canonical JSON used to create it.</p>
+            <p>The JSON controls one full-path wcmatch file glob, field sources, geometry extraction, user-defined metadata, thumbnails, and fingerprints. Threads, batch size, error handling, and output CRS are controls below the table. Output CRS must match the destination table; new tables use the chosen CRS.</p>
+            <p><b>Add</b> imports new images using the saved <b>Import Parameters</b> and leaves existing images unchanged. <b>Actions</b> beside <b>Refresh</b> applies to every import group in the chosen table. Each row's <b>Actions</b> applies only to that group. Use these menus to update images, remove old or all rows, sync, or fetch metadata structure. <b>Update New</b> skips existing image paths.</p>
 
             <h3>Additional Metadata</h3>
-            <p>An optional sidecar glob must resolve exactly one supported file per image when configured. JSON, GeoJSON, YAML, and WorldView IMD files are converted to a JSON-like mapping before metadata expressions are evaluated. Metadata mappings explicitly select values from EXIF, raster, sidecar, file, geometry, constants, or automatic EXIF time parsing.</p>
+            <p>An optional sidecar glob must resolve exactly one supported file per image when configured. JSON, GeoJSON, YAML, and WorldView IMD files are converted to a JSON-like mapping before metadata expressions are evaluated. Metadata values can reference EXIF, raster, sidecar, file, geometry, or automatic EXIF time parsing. Other values are stored literally.</p>
 
             <h3>Query</h3>
             <p>Use <b>Query</b> to preview SQL results and build spatial and metadata expressions. The query text is the source for previewing, viewing, grouping, and metadata copy actions.</p>
+            <p><b>File Spatial Query</b> inserts a spatial condition from a vector file. <b>Select Bbox Query</b> lets you drag a rectangle on the QGIS map, then returns to the query editor with an intersection condition. Press Escape or right-click to cancel. Both spatial helpers transform the source geometry into the database geometry's CRS.</p>
             <p>The SQL must return <code>image_url</code>. If <code>image_url</code> is a string, each row is added directly. If it is a list of strings, the other columns define the QGIS group hierarchy from left to right.</p>
 
             <h3>View And Copy</h3>

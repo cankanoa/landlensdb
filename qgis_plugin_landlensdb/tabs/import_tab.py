@@ -7,17 +7,16 @@ from urllib.parse import quote_plus
 import psycopg2
 from psycopg2 import sql
 from qgis.PyQt import QtCore, QtWidgets
-from qgis.core import Qgis
+from qgis.core import Qgis, QgsCoordinateReferenceSystem
 from sqlalchemy import create_engine
 
 from ..landlensdb import (
     Postgres,
     calculate_input_sha,
     import_local_images,
-    import_yaml_to_function_params,
-    load_example_import_yaml,
-    load_import_presets,
-    normalize_import_yaml,
+    parse_import_json,
+    load_example_import_json,
+    normalize_import_json,
 )
 from ..landlensdb.handlers.importer import discover_image_paths
 from ..landlensdb.handlers.local import ImportCancelledError
@@ -28,17 +27,17 @@ from ..shared.connection_utils import (
     validate_connection_values,
 )
 from ..shared.import_settings import (
-    has_saved_import_parameters,
     load_import_parameters,
     save_import_parameters,
 )
 from ..shared.metadata_settings import fetch_metadata_tree
-from ..shared.yaml_editor import ImportYamlDialog
+from ..shared.json_editor import ImportJsonDialog
 
 
 class AddTableDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super(AddTableDialog, self).__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_WindowPropagation)
         self.setWindowTitle("Add Table")
         layout = QtWidgets.QVBoxLayout(self)
         row = QtWidgets.QHBoxLayout()
@@ -81,10 +80,7 @@ class ImportTab(QtWidgets.QWidget):
 
         table_row = QtWidgets.QHBoxLayout()
         table_row.addWidget(QtWidgets.QLabel("Table:"))
-        self.table_button = QtWidgets.QToolButton(self)
-        self.table_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        self.table_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.table_button.setArrowType(QtCore.Qt.DownArrow)
+        self.table_button = QtWidgets.QPushButton(self)
         self.table_button.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
         )
@@ -92,6 +88,11 @@ class ImportTab(QtWidgets.QWidget):
         self.refresh_button = QtWidgets.QPushButton("Refresh", self)
         self.refresh_button.clicked.connect(self.refresh_table)
         table_row.addWidget(self.refresh_button)
+        self.actions_button = self._build_actions_button()
+        self.actions_button.setToolTip(
+            "Apply an action to every import group in this table."
+        )
+        table_row.addWidget(self.actions_button)
         layout.addLayout(table_row)
 
         self.import_table = QtWidgets.QTableWidget(self)
@@ -127,19 +128,33 @@ class ImportTab(QtWidgets.QWidget):
         self.on_error_input = QtWidgets.QComboBox(self)
         self.on_error_input.addItems(["skip", "warn", "error"])
         runtime_row.addWidget(self.on_error_input)
-        self.open_yaml_button = QtWidgets.QPushButton("Import Parameters…", self)
-        self.open_yaml_button.clicked.connect(self.open_import_parameters)
-        runtime_row.addWidget(self.open_yaml_button)
-        self.actions_button = self._build_actions_button()
-        runtime_row.addWidget(self.actions_button)
+        runtime_row.addWidget(QtWidgets.QLabel("Output CRS:"))
+        self.output_crs_input = QtWidgets.QLineEdit("EPSG:4326", self)
+        self.output_crs_input.setMaximumWidth(150)
+        self.output_crs_input.setToolTip(
+            "Coordinate reference system for imports and new tables. "
+            "Must match the selected table's geometry CRS."
+        )
+        runtime_row.addWidget(self.output_crs_input)
+        runtime_row.addStretch()
+        layout.addLayout(runtime_row)
+
+        import_row = QtWidgets.QHBoxLayout()
+        self.open_json_button = QtWidgets.QPushButton("Import Parameters…", self)
+        self.open_json_button.clicked.connect(self.open_import_parameters)
+        import_row.addWidget(self.open_json_button)
+        self.add_button = QtWidgets.QPushButton("Add", self)
+        self.add_button.setToolTip("Add new images using the saved Import Parameters.")
+        self.add_button.clicked.connect(self.run_add)
+        import_row.addWidget(self.add_button)
         self.progress_bar = QtWidgets.QProgressBar(self)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
-        runtime_row.addWidget(self.progress_bar, 1)
+        import_row.addWidget(self.progress_bar, 1)
         self.cancel_button = QtWidgets.QPushButton("Cancel", self)
         self.cancel_button.clicked.connect(self._cancel_active_import)
-        runtime_row.addWidget(self.cancel_button)
-        layout.addLayout(runtime_row)
+        import_row.addWidget(self.cancel_button)
+        layout.addLayout(import_row)
 
         self._refresh_table_choices()
         self.load_records([])
@@ -196,10 +211,9 @@ class ImportTab(QtWidgets.QWidget):
         if not dialog.exec_() or not dialog.table_name():
             return
         table_name = dialog.table_name()
-        schema_name = (
-            self.connection_values.get("schema", "public").strip() or "public"
-        )
+        schema_name = self.connection_values.get("schema", "public").strip() or "public"
         try:
+            output_crs = self._output_crs()
             with psycopg2.connect(
                 **connection_kwargs(self.connection_values)
             ) as connection:
@@ -207,17 +221,21 @@ class ImportTab(QtWidgets.QWidget):
                     cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis")
                     cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis_raster")
                     cursor.execute(
-                        sql.SQL("""CREATE TABLE {}.{} (
+                        sql.SQL(
+                            """CREATE TABLE {}.{} (
                                 image_url text NOT NULL,
                                 name text NOT NULL,
-                                geometry geometry(Geometry, 4326) NOT NULL,
+                                geometry geometry(Geometry, {}) NOT NULL,
                                 metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
                                 thumbnail raster,
                                 fingerprint text,
                                 input_sha text NOT NULL,
                                 import_params text NOT NULL
-                            )""").format(
-                            sql.Identifier(schema_name), sql.Identifier(table_name)
+                            )"""
+                        ).format(
+                            sql.Identifier(schema_name),
+                            sql.Identifier(table_name),
+                            sql.Literal(output_crs.postgisSrid()),
                         )
                     )
                     cursor.execute(
@@ -323,9 +341,7 @@ class ImportTab(QtWidgets.QWidget):
             file_glob = self._file_glob_from_import_params(import_params)
             file_glob_item = QtWidgets.QTableWidgetItem(file_glob)
             file_glob_item.setToolTip(file_glob)
-            self.import_table.setItem(
-                row_index, self.FILE_GLOB_COLUMN, file_glob_item
-            )
+            self.import_table.setItem(row_index, self.FILE_GLOB_COLUMN, file_glob_item)
             self.import_table.setCellWidget(
                 row_index,
                 self.IMPORT_PARAMS_COLUMN,
@@ -338,6 +354,7 @@ class ImportTab(QtWidgets.QWidget):
             )
         if self.import_table.rowCount():
             self.import_table.selectRow(0)
+        self.actions_button.setEnabled(bool(records) and not self._import_active)
         QtCore.QTimer.singleShot(0, self._resize_import_columns)
 
     @staticmethod
@@ -345,10 +362,10 @@ class ImportTab(QtWidgets.QWidget):
         if not import_params:
             return ""
         try:
-            parameters = import_yaml_to_function_params(import_params)
+            parameters = parse_import_json(import_params)
         except Exception:
             return ""
-        return str(parameters.get("source_file_glob") or "")
+        return str(parameters.get("file_glob") or "")
 
     def _resize_import_columns(self):
         """Give file_glob spare width while retaining content-size minima."""
@@ -397,23 +414,22 @@ class ImportTab(QtWidgets.QWidget):
         return row[0] if row else None
 
     def open_import_parameters(self, *_args):
-        example = load_example_import_yaml()
-        yaml_text = load_import_parameters(example)
-        self._show_import_parameters(yaml_text)
+        example = load_example_import_json()
+        json_text = load_import_parameters(example)
+        self._show_import_parameters(json_text)
 
-    def _show_import_parameters(self, yaml_text):
-        dialog = ImportYamlDialog(
-            yaml_text,
-            normalize_import_yaml,
-            presets=load_import_presets(),
+    def _show_import_parameters(self, json_text):
+        dialog = ImportJsonDialog(
+            json_text,
+            normalize_import_json,
             parent=self,
         )
         if dialog.exec_():
-            save_import_parameters(dialog.yaml_text())
+            save_import_parameters(dialog.json_text())
             self._show_message("Import parameters saved.", Qgis.Info)
 
     def _build_import_params_button(self, input_sha):
-        button = QtWidgets.QPushButton("View YAML", self)
+        button = QtWidgets.QPushButton("View JSON", self)
         button.clicked.connect(
             lambda checked=False, sha=input_sha: self.open_group_import_parameters(sha)
         )
@@ -426,36 +442,39 @@ class ImportTab(QtWidgets.QWidget):
 
     def open_group_import_parameters(self, input_sha):
         try:
-            yaml_text = self._fetch_first_import_params(input_sha)
+            json_text = self._fetch_first_import_params(input_sha)
         except Exception as exc:
             self._show_message(
                 "Could not load import parameters: {}".format(exc), Qgis.Critical
             )
             return
-        if not yaml_text:
+        if not json_text:
             self._show_message(
                 "This import group has no stored import parameters.", Qgis.Warning
             )
             return
-        self._show_import_parameters(yaml_text)
+        self._show_import_parameters(json_text)
 
-    def _build_actions_button(self, input_sha=None, yaml_text=None):
-        button = QtWidgets.QToolButton(self)
-        button.setText("Actions")
-        button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+    def _build_actions_button(self, input_sha=None, json_text=None):
+        if input_sha:
+            button = QtWidgets.QToolButton(self)
+            button.setText("Actions")
+            button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        else:
+            button = QtWidgets.QPushButton("Actions", self)
         menu = QtWidgets.QMenu(button)
         if input_sha:
             callbacks = (
-                ("Update", lambda: self.run_row_updates(input_sha, yaml_text, False)),
+                ("Update", lambda: self.run_row_updates(input_sha, json_text, False)),
                 (
                     "Update New",
-                    lambda: self.run_row_updates(input_sha, yaml_text, True),
+                    lambda: self.run_row_updates(input_sha, json_text, True),
                 ),
-                ("Drop Old", lambda: self.run_row_drop_old(input_sha, yaml_text)),
-                ("Drop All", lambda: self.run_row_drop_all(input_sha, yaml_text)),
+                ("Drop Old", lambda: self.run_row_drop_old(input_sha, json_text)),
+                ("Drop All", lambda: self.run_row_drop_all(input_sha, json_text)),
                 (
                     "Sync (Drop Old/Update)",
-                    lambda: self.run_row_sync(input_sha, yaml_text),
+                    lambda: self.run_row_sync(input_sha, json_text),
                 ),
                 (
                     "Fetch Metadata Structure",
@@ -480,8 +499,8 @@ class ImportTab(QtWidgets.QWidget):
         return button
 
     def _saved_config(self):
-        yaml_text = load_import_parameters(load_example_import_yaml())
-        return calculate_input_sha(yaml_text), yaml_text
+        json_text = load_import_parameters(load_example_import_json())
+        return calculate_input_sha(json_text), json_text
 
     def _row_configs(self):
         configs = []
@@ -490,22 +509,32 @@ class ImportTab(QtWidgets.QWidget):
             if item is None:
                 continue
             input_sha = item.data(QtCore.Qt.UserRole)
-            yaml_text = item.data(QtCore.Qt.UserRole + 1)
-            if input_sha and not yaml_text:
-                yaml_text = self._fetch_first_import_params(input_sha)
-            if input_sha and yaml_text:
-                configs.append((input_sha, yaml_text))
+            json_text = item.data(QtCore.Qt.UserRole + 1)
+            if input_sha and not json_text:
+                json_text = self._fetch_first_import_params(input_sha)
+            if input_sha and json_text:
+                configs.append((input_sha, json_text))
         return configs
 
-    def _update_configs(self):
-        configs = self._row_configs()
-        if has_saved_import_parameters() or not configs:
-            saved = self._saved_config()
-            if saved[0] not in {input_sha for input_sha, _yaml in configs}:
-                configs.append(saved)
-        return configs
+    def _output_crs(self):
+        crs = QgsCoordinateReferenceSystem(self.output_crs_input.text().strip())
+        if not crs.isValid() or crs.postgisSrid() <= 0:
+            raise ValueError(
+                "Enter a valid output CRS with a PostGIS SRID, such as EPSG:4326."
+            )
+        return crs
 
-    def _run_updates(self, configs, skip_existing):
+    def run_add(self):
+        try:
+            config = self._saved_config()
+        except Exception as exc:
+            self._show_message(
+                "Invalid Import Parameters: {}".format(exc), Qgis.Critical
+            )
+            return
+        self._run_updates([config], skip_existing=True, add_only=True)
+
+    def _run_updates(self, configs, skip_existing, add_only=False):
         table_name = self.current_table_name()
         if not table_name:
             self._show_message("Choose or create a table first.", Qgis.Critical)
@@ -514,15 +543,29 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message("No import parameters are available.", Qgis.Warning)
             return
         try:
+            output_crs = self._output_crs()
             db = self._database(table_name, select_table=True)
+            geometry_column = db.selected_table.c.get("geometry")
+            table_srid = (
+                getattr(geometry_column.type, "srid", 0)
+                if geometry_column is not None
+                else 0
+            )
+            if table_srid > 0 and table_srid != output_crs.postgisSrid():
+                raise ValueError(
+                    "Output CRS must match the selected table's geometry SRID ({}).".format(
+                        table_srid
+                    )
+                )
             self._cancel_import_event.clear()
             self._set_import_active(True)
             wrote = False
-            for _input_sha, yaml_text in configs:
-                function_params = import_yaml_to_function_params(yaml_text)
+            for input_sha, json_text in configs:
+                config = parse_import_json(json_text)
                 try:
                     batches = import_local_images(
-                        **function_params,
+                        config,
+                        output_crs=output_crs.authid() or output_crs.toWkt(),
                         max_workers=self.thread_count_input.value(),
                         batch_size=self.batch_size_input.value(),
                         return_as_yield=True,
@@ -533,7 +576,12 @@ class ImportTab(QtWidgets.QWidget):
                         cancel_event=self._cancel_import_event,
                     )
                     for images in batches:
-                        db.upsert_images(images, table_name, conflict="update")
+                        db.upsert_images(
+                            images,
+                            table_name,
+                            conflict="nothing" if add_only else "update",
+                            input_sha=None if add_only else input_sha,
+                        )
                         wrote = True
                 except ValueError as exc:
                     if skip_existing and "No new files match" in str(exc):
@@ -542,7 +590,10 @@ class ImportTab(QtWidgets.QWidget):
             if not wrote:
                 self._show_message("No new images were found.", Qgis.Info)
             else:
-                self._show_message("Import update completed.", Qgis.Info)
+                self._show_message(
+                    "Import add completed." if add_only else "Import update completed.",
+                    Qgis.Info,
+                )
         except ImportCancelledError:
             self._show_message("Import cancelled.", Qgis.Warning)
         except Exception as exc:
@@ -554,23 +605,23 @@ class ImportTab(QtWidgets.QWidget):
     def _run_drop_old(self, configs):
         deleted = 0
         db = self._database(self.current_table_name(), True)
-        for input_sha, yaml_text in configs:
-            parameters = import_yaml_to_function_params(yaml_text)
-            paths = discover_image_paths(parameters["source_file_glob"])
+        for input_sha, json_text in configs:
+            parameters = parse_import_json(json_text)
+            paths = discover_image_paths(parameters["file_glob"])
             deleted += db.remove_unmatched_for_input(input_sha, paths)
         return deleted
 
     def _run_drop_all(self, configs):
         db = self._database(self.current_table_name(), True)
-        return sum(db.remove_all_for_input(input_sha) for input_sha, _yaml in configs)
+        return sum(db.remove_all_for_input(input_sha) for input_sha, _json in configs)
 
     def run_all_updates(self, skip_existing=False):
-        self._run_updates(self._update_configs(), skip_existing)
+        self._run_updates(self._row_configs(), skip_existing)
 
-    def run_row_updates(self, input_sha, yaml_text, skip_existing=False):
-        if not yaml_text:
-            yaml_text = self._fetch_first_import_params(input_sha)
-        self._run_updates([(input_sha, yaml_text)], skip_existing)
+    def run_row_updates(self, input_sha, json_text, skip_existing=False):
+        if not json_text:
+            json_text = self._fetch_first_import_params(input_sha)
+        self._run_updates([(input_sha, json_text)], skip_existing)
 
     def run_all_drop_old(self):
         try:
@@ -581,11 +632,11 @@ class ImportTab(QtWidgets.QWidget):
         self._show_message("Removed {} stale row(s).".format(deleted), Qgis.Info)
         self.refresh_table()
 
-    def run_row_drop_old(self, input_sha, yaml_text):
+    def run_row_drop_old(self, input_sha, json_text):
         try:
-            if not yaml_text:
-                yaml_text = self._fetch_first_import_params(input_sha)
-            deleted = self._run_drop_old([(input_sha, yaml_text)])
+            if not json_text:
+                json_text = self._fetch_first_import_params(input_sha)
+            deleted = self._run_drop_old([(input_sha, json_text)])
         except Exception as exc:
             self._show_message("Drop Old failed: {}".format(exc), Qgis.Critical)
             return
@@ -611,7 +662,7 @@ class ImportTab(QtWidgets.QWidget):
         self._show_message("Removed {} row(s).".format(deleted), Qgis.Info)
         self.refresh_table()
 
-    def run_row_drop_all(self, input_sha, yaml_text):
+    def run_row_drop_all(self, input_sha, json_text):
         if (
             QtWidgets.QMessageBox.question(
                 self, "Drop Import Group", "Delete every row in this import group?"
@@ -620,7 +671,7 @@ class ImportTab(QtWidgets.QWidget):
         ):
             return
         try:
-            deleted = self._run_drop_all([(input_sha, yaml_text)])
+            deleted = self._run_drop_all([(input_sha, json_text)])
         except Exception as exc:
             self._show_message("Drop All failed: {}".format(exc), Qgis.Critical)
             return
@@ -628,7 +679,7 @@ class ImportTab(QtWidgets.QWidget):
         self.refresh_table()
 
     def run_all_sync(self):
-        configs = self._update_configs()
+        configs = self._row_configs()
         try:
             self._run_drop_old(configs)
         except Exception as exc:
@@ -636,15 +687,15 @@ class ImportTab(QtWidgets.QWidget):
             return
         self._run_updates(configs, False)
 
-    def run_row_sync(self, input_sha, yaml_text):
-        if not yaml_text:
-            yaml_text = self._fetch_first_import_params(input_sha)
+    def run_row_sync(self, input_sha, json_text):
+        if not json_text:
+            json_text = self._fetch_first_import_params(input_sha)
         try:
-            self._run_drop_old([(input_sha, yaml_text)])
+            self._run_drop_old([(input_sha, json_text)])
         except Exception as exc:
             self._show_message("Sync failed: {}".format(exc), Qgis.Critical)
             return
-        self._run_updates([(input_sha, yaml_text)], False)
+        self._run_updates([(input_sha, json_text)], False)
 
     def fetch_metadata(self, input_sha):
         """Fetch one metadata row per input SHA and save the parameter tree."""
@@ -714,7 +765,21 @@ class ImportTab(QtWidgets.QWidget):
     def _set_import_active(self, active):
         self._import_active = bool(active)
         self.cancel_button.setEnabled(self._import_active)
-        self.open_yaml_button.setEnabled(not self._import_active)
+        for widget in (
+            self.table_button,
+            self.refresh_button,
+            self.import_table,
+            self.thread_count_input,
+            self.batch_size_input,
+            self.on_error_input,
+            self.output_crs_input,
+            self.open_json_button,
+            self.add_button,
+        ):
+            widget.setEnabled(not self._import_active)
+        self.actions_button.setEnabled(
+            bool(self.import_table.rowCount()) and not self._import_active
+        )
 
     def _cancel_active_import(self):
         if self._import_active:

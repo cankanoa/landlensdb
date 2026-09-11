@@ -168,10 +168,11 @@ def prepare_data_for_db(images, create_thumbnails=True):
 
 def test_local_images():
     print("\nTesting local image loading...")
-    local_images = import_local_images(
-        source_file_glob=str(Path("test_data/local").resolve() / "**/*.jpg"),
-        thumbnail_enabled=False,
-    )
+    local_images = import_local_images({
+        "file_glob": str(Path("test_data/local").resolve() / "**/*.jpg"),
+        "name": "file.name", "image_url": "file.path", "geometry": "point_from_exif",
+        "thumbnail": {"enabled": False},
+    })
     print(f"Loaded {len(local_images)} local images")
     print("Sample data:")
     print(pd.DataFrame(local_images).head().to_string())

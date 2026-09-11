@@ -7,7 +7,7 @@
  ***************************************************************************/
 """
 
-from qgis.PyQt import QtWidgets
+from qgis.PyQt import QtCore, QtWidgets
 from qgis.PyQt.QtGui import QIcon
 
 import os
@@ -22,6 +22,7 @@ from .tabs.view_tab import ViewTab
 class LandlensdbDialog(QtWidgets.QDialog):
     def __init__(self, iface, parent=None):
         super(LandlensdbDialog, self).__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_WindowPropagation)
         self.iface = iface
         self.setWindowTitle('Landlensdb')
         self.setWindowIcon(
@@ -63,6 +64,10 @@ class LandlensdbDialog(QtWidgets.QDialog):
     def hideEvent(self, event):
         self.view_tab.set_active(False)
         super(LandlensdbDialog, self).hideEvent(event)
+
+    def closeEvent(self, event):
+        self.query_tab._finish_bbox_selection(show_window=False)
+        super(LandlensdbDialog, self).closeEvent(event)
 
     def showEvent(self, event):
         super(LandlensdbDialog, self).showEvent(event)

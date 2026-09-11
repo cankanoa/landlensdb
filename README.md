@@ -1,170 +1,53 @@
-# landlensdb: Geospatial Image Handling and Management
+# landlensdb
 
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/landlensdb/landlensdb/HEAD?urlpath=%2Fdoc%2Ftree%2Fexamples%2Fgetting-started.ipynb)
-[![PyPI](https://img.shields.io/pypi/v/landlensdb.svg)](https://pypi.org/project/landlensdb/)
-[![Docker Pulls](https://img.shields.io/docker/pulls/iosefa/landlensdb?logo=docker&label=pulls)](https://hub.docker.com/r/landlensdb/landlensdb)
-[![Contributors](https://img.shields.io/github/contributors/landlensdb/landlensdb.svg?label=contributors)](https://github.com/landlensdb/landlensdb/graphs/contributors)
-[![Downloads](https://pepy.tech/badge/landlensdb)](https://pepy.tech/project/landlensdb)
-[![Tests](https://img.shields.io/github/actions/workflow/status/landlensdb/landlensdb/main.yml?branch=main)](https://github.com/landlensdb/landlensdb/actions/workflows/main.yml)
-[![DOI](https://zenodo.org/badge/892907796.svg)](https://doi.org/10.5281/zenodo.15206060)
+Import geolocated photos and rasters, manage them in PostGIS, and query them from QGIS. The Python library also supports Mapillary imagery and road-network alignment.
 
-**Streamlined geospatial image handling and database management**
+[PyPI](https://pypi.org/project/landlensdb/) · [Documentation](docs/index.md) · [Examples](docs/examples/getting-started.ipynb)
 
-## Overview
+## Install
 
-landlensdb helps you manage geolocated images and integrate them with other spatial data sources. The library supports:
-- Image downloading and storage
-- EXIF/geotag extraction
-- Road-network alignment
-- PostgreSQL integration
-
-This workflow is designed for geo-data scientists, map enthusiasts, and anyone needing to process large sets of georeferenced images.
-
-## Features
-- **GeoImageFrame Management**: Download, map, and convert geolocated images into a GeoDataFrame-like structure. 
-- **Mapillary API Integration**: Fetch and analyze images with geospatial metadata.
-- **EXIF Data Processing**: Extract geolocation, timestamps, and orientation from image metadata.
-- **Database Operations**: Store image records in PostgreSQL; retrieve them by location or time.
-- **Road Network Alignment**: Snap image captures to road networks for precise route mapping.
-- **QGIS Plugin Workflow**: Import local images into PostGIS, skip already ingested files, and remove stale DB rows that no longer exist on disk.
-
-## Installation
-
-Install the latest release from PyPI:
-
-```
+```sh
 pip install landlensdb
 ```
 
-### Dependencies
+Requires Python 3.10+ and GDAL 3.5+. Database features require PostgreSQL 14+ with PostGIS 3.5+ and `postgis_raster`. See [installation](docs/installation.md).
 
-> [!IMPORTANT] 
-> You **MUST** have both GDAL and PostgreSQL with PostGIS installed to use `landlensdb`.  
-> - See [GDAL Docs](https://gdal.org/en/stable/) for instructions on installing GDAL.  
-> - See [PostGIS](https://postgis.net/documentation/getting_started/) for installing PostGIS on top of PostgreSQL.
-
-**Minimum Requirements**:
-
-- **GDAL ≥ 3.5** (ensure command-line tools work, e.g., `gdalinfo --version`)
-- **PostgreSQL ≥ 14**  
-- **PostGIS ≥ 3.5**
-  - Enable PostGIS: `CREATE EXTENSION postgis_raster;`
-  - Enable GDAL drivers: `ALTER DATABASE landlens_test SET postgis.gdal_enabled_drivers = 'ENABLE_ALL';`
-- **Python ≥ 3.10**
-
-## Quick Start
-
-Below is a minimal example creating a GeoImageFrame:
+## Import images
 
 ```python
-from landlensdb.geoclasses import GeoImageFrame
-from shapely.geometry import Point
+from landlensdb import import_local_images, load_import_presets, parse_import_json
 
-# Create a simple GeoImageFrame from scratch
-geo_frame = GeoImageFrame(
-	{
-		"image_url": ["https://example.com/image1.jpg"],
-		"name": ["SampleImage"],
-		"geometry": [Point(-120.5, 35.2)]
-	}
-)
-
-print(geo_frame.head())
+config = parse_import_json(load_import_presets()["geotagged_photos.json"])
+config["file_glob"] = "/data/photos/**/*.@(jpg|jpeg|png|JPG|JPEG|PNG)"
+images = import_local_images(config, output_crs="EPSG:4326", on_error="warn")
 ```
 
-For additional usage examples, see our documentation.
+[JSON templates](landlensdb/examples) cover geotagged photos, georeferenced rasters, and WorldView-3 imagery. Each configuration requires `file_glob`, `name`, `image_url`, and `geometry`.
 
-## Local Import and Database Writes
+- Values such as `file.name`, `exif.Model`, and `sidecar.product.numColumns` resolve metadata paths; other values are literals. Dotted paths can index arrays.
+- Geometry uses `point_from_exif`, `bounds_from_image`, or four named corners containing WGS84 `[longitude, latitude]` values or metadata paths. See the [WorldView template](landlensdb/examples/worldview3.json).
+- Optional `sidecar_glob` substitutes `{parent}` and `{base}` and must match one JSON, GeoJSON, YAML, or WorldView IMD file.
+- Fingerprinting is off by default; enable it with `"fingerprint": {"enabled": true}`. Output CRS, workers, batch size, and error handling are runtime arguments.
 
-`import_local_images(...)` exposes file, geometry, metadata, thumbnail, and
-fingerprint behavior as explicit Python parameters. The QGIS YAML editor is a
-configuration front end: it converts nested keys to underscore-separated
-function arguments and passes `metadata` as the only nested mapping.
+Imports return a `GeoImageFrame` with geometry, metadata, thumbnails, and the configuration plus its hash. Use `Postgres.upsert_images` for database writes and updates.
 
-Every imported row stores canonical, comment-free `import_params` YAML and its
-SHA-256 `input_sha`. Runtime controls such as workers, batch size, skip-existing
-behavior, cancellation, and error handling are not included in that identity.
+## QGIS plugin
 
-`source.file_glob` is one complete path pattern passed directly to `wcmatch`,
-for example `/data/photos/**/*.@(jpg|jpeg)`. A `source.sidecar_glob` uses the
-same matcher after substituting `{parent}` and `{base}` for each input image.
+Build with `make qgis-build`, then install `qgis_plugin_landlensdb.zip` through QGIS **Install from ZIP**.
 
-The commented starting template is available at
-`landlensdb/examples/import_params.yaml`.
-The editor includes Defaults plus quick presets for EXIF-geotagged photos,
-georeferenced rasters, and WorldView-3 TIL imagery with IMD metadata.
+- **Import Parameters** edits Search Glob; **Advanced settings** opens the full JSON. Settings are saved in QGIS.
+- **Apply Template** loads a JSON file from the template folder. The list refreshes whenever the popup opens; editing settings does not edit templates.
+- **Add** imports new images. The top **Actions** menu applies to the whole table; each row's menu applies to that import group.
+- Set threads, batch size, error handling, and output CRS below the table. CRS must match the destination table.
+- **File Spatial Query** uses a vector file; **Select Bbox Query** lets you draw a rectangle on the map.
 
-Sidecars are deliberately limited to formats converted into a JSON-like
-mapping before source expressions are evaluated: `.json`, `.geojson`,
-`.yaml`, `.yml`, and WorldView `.imd`. When configured, a sidecar glob must
-resolve to exactly one file per imported image. WorldView IMD values are exposed under
-`sidecar.product`, `sidecar.image`, and `sidecar.bounds`.
+## Development
 
-`Postgres.upsert_images` is the main database write entry point and supports:
-- `if_exists="fail"`, `"replace"`, and `"append"` for GeoPandas-backed writes
-- `if_exists="upsert"` with `conflict="update"` or `"nothing"` for incremental sync
-- `filter_existing_rows(...)` to keep only paths not already in the selected table
-- `remove_unmatched_for_input(...)` to delete unmatched rows within one `input_sha` group
-
-
-## Documentation
-
-Full documentation (including tutorials and advanced usage) is available in this repository's docs/ folder.
-You can build the docs locally by installing the optional [docs] extras:
-
-```
-pip install -e '.[docs]'
+```sh
+pip install -e '.[dev,docs]'
+pre-commit install
+pytest tests
 mkdocs serve
 ```
 
-Then open http://127.0.0.1:8000/ in your browser.
-
-## Developer Guides
-
-Local Development
-	1.	Clone this repository.
-	2.	Install in editable mode with dev extras:
-        ```
-        pip install --upgrade pip
-        pip install -e .[dev]
-        ```
-	3.	Make changes as needed and contribute via Pull Requests.
-
-## Testing
-
-We use pytest for testing. Tests requires the following test database. Create if does not exist:
-
-```bash
-createdb landlens_test && psql landlens_test -c "create extension postgis" 
-```
-
-Then, we can run the tests:
-
-```bash
-pytest tests
-```
-
-You can also run specific test files or functions, for example:
-
-```
-pytest tests/test_geoimageframe.py
-```
-
-## Code Formatting & Pre-commit
-
-landlensdb uses Black for formatting. Once you’ve installed [dev] extras:
-
-```
-pre-commit install
-pre-commit run --all-files
-```
-
-This enforces linting and formatting on each commit.
-
-## Contributing
-
-We welcome contributions! Please see CONTRIBUTING.md for guidelines on how to open issues, submit pull requests, and follow our code of conduct.
-
-## License
-
-This project is licensed under the MIT License. See LICENSE.md for details.
+Database tests need a local `landlens_test` database with PostGIS enabled. See [contributing](CONTRIBUTING.md). Licensed under [MIT](LICENSE.md).

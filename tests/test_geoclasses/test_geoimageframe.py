@@ -49,8 +49,13 @@ def test_geoimageframe_accepts_metadata_column():
 
 def test_geotagged_image_loads_metadata_and_thumbnail_columns():
     images = import_local_images(
-        source_file_glob=str(Path("test_data/local").resolve() / "**/*.jpg"),
-        thumbnail_enabled=False,
+        {
+            "file_glob": str(Path("test_data/local").resolve() / "**/*.jpg"),
+            "name": "file.name",
+            "image_url": "file.path",
+            "geometry": "point_from_exif",
+            "thumbnail": {"enabled": False},
+        }
     )
 
     assert "metadata" in images.columns
@@ -61,17 +66,14 @@ def test_geotagged_image_loads_metadata_and_thumbnail_columns():
 
 def test_import_images_builds_user_defined_metadata():
     images = import_local_images(
-        source_file_glob=str(Path("test_data/local").resolve() / "**/*.jpg"),
-        metadata={
-            "camera": {
-                "model": {
-                    "source": "exif.Model",
-                    "required": False,
-                    "default": None,
-                }
-            }
-        },
-        thumbnail_enabled=False,
+        {
+            "file_glob": str(Path("test_data/local").resolve() / "**/*.jpg"),
+            "name": "file.name",
+            "image_url": "file.path",
+            "geometry": "point_from_exif",
+            "metadata": {"camera": {"model": "exif.Model"}},
+            "thumbnail": {"enabled": False},
+        }
     )
 
     assert len(images) > 0
