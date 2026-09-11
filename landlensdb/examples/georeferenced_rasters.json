@@ -1,5 +1,5 @@
 {
-  "file_glob": "/path/to/rasters/**/*.@(tif|tiff|vrt|img|jp2|TIF|TIFF|VRT|IMG|JP2)",
+  "file_glob": "/path/to/rasters/**/*.@(tif|TIF|tiff|TIFF|vrt|VRT|img|IMG|jp2|JP2)",
   "name": "file.name",
   "image_url": "file.path",
   "geometry": "bounds_from_image",

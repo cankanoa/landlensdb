@@ -17,6 +17,47 @@ if TYPE_CHECKING:
     from ..geoclasses.geoimageframe import GeoImageFrame
 
 
+IMPORT_TABLE_COLUMNS = {
+    "image_url": "text",
+    "name": "text",
+    "geometry": "geometry",
+    "metadata": "jsonb",
+    "thumbnail": "raster",
+    "fingerprint": "text",
+    "input_sha": "text",
+    "import_params": "text",
+}
+
+
+def validate_table(cursor, table_name, required_columns, schema="public"):
+    """Check required PostgreSQL column names and types without changing the table."""
+    cursor.execute(
+        "SELECT column_name, udt_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s",
+        (schema, table_name),
+    )
+    columns = dict(cursor.fetchall())
+    if not columns:
+        raise ValueError(
+            "Table {}.{} does not exist or is not accessible.".format(
+                schema, table_name
+            )
+        )
+    errors = []
+    for name, expected_type in required_columns.items():
+        actual_type = columns.get(name)
+        if actual_type is None:
+            errors.append("missing {} ({})".format(name, expected_type))
+        elif actual_type != expected_type:
+            errors.append(
+                "{} is {}; expected {}".format(name, actual_type, expected_type)
+            )
+    if errors:
+        raise ValueError(
+            "Invalid table {}.{}: {}.".format(schema, table_name, "; ".join(errors))
+        )
+
+
 class Postgres:
     """
     A class for managing image-related postgres database operations.
@@ -308,9 +349,11 @@ class Postgres:
 
     @staticmethod
     def _qualified_table_name(table):
+        table_name = table.name.replace('"', '""')
         if table.schema:
-            return '"{}"."{}"'.format(table.schema, table.name)
-        return '"{}"'.format(table.name)
+            schema_name = table.schema.replace('"', '""')
+            return '"{}"."{}"'.format(schema_name, table_name)
+        return '"{}"'.format(table_name)
 
     @staticmethod
     def _thumbnail_to_gdal_raster(thumbnail_dataset):
@@ -439,14 +482,15 @@ class Postgres:
                 if "metadata" in gdf_to_write.columns:
                     conn.execute(
                         text(
-                            f'ALTER TABLE "{table.name}" '
+                            f"ALTER TABLE {self._qualified_table_name(table)} "
                             f'ALTER COLUMN "metadata" TYPE jsonb USING "metadata"::jsonb'
                         )
                     )
 
                 for col in gif.required_columns:
                     stmt = text(
-                        f"ALTER TABLE {table.name} ALTER COLUMN {col} SET NOT NULL"
+                        f"ALTER TABLE {self._qualified_table_name(table)} "
+                        f"ALTER COLUMN {col} SET NOT NULL"
                     )
                     conn.execute(stmt)
 
@@ -464,13 +508,13 @@ class Postgres:
                 if "thumbnail" in gif.columns:
                     conn.execute(
                         text(
-                            f"ALTER TABLE {table.name} "
+                            f"ALTER TABLE {self._qualified_table_name(table)} "
                             f"ADD COLUMN IF NOT EXISTS thumbnail raster"
                         )
                     )
 
                     update_stmt = text(
-                        f"UPDATE {table.name} "
+                        f"UPDATE {self._qualified_table_name(table)} "
                         f"SET thumbnail = ST_FromGDALRaster(:thumbnail_raster) "
                         f"WHERE image_url = :image_url"
                     )
@@ -607,7 +651,7 @@ class Postgres:
 
             if thumbnail_updates and "thumbnail" in table.columns:
                 update_stmt = text(
-                    f"UPDATE {table.name} "
+                    f"UPDATE {self._qualified_table_name(table)} "
                     f"SET thumbnail = ST_FromGDALRaster(:thumbnail_raster) "
                     f"WHERE image_url = :image_url"
                 )

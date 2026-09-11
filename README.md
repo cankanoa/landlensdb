@@ -18,9 +18,11 @@ Requires Python 3.10+ and GDAL 3.5+. Database features require PostgreSQL 14+ wi
 from landlensdb import import_local_images, load_import_presets, parse_import_json
 
 config = parse_import_json(load_import_presets()["geotagged_photos.json"])
-config["file_glob"] = "/data/photos/**/*.@(jpg|jpeg|png|JPG|JPEG|PNG)"
+config["file_glob"] = "/data/photos/**/*.@(jpg|JPG|png|PNG|jpeg|JPEG)"
 images = import_local_images(config, output_crs="EPSG:4326", on_error="warn")
 ```
+
+Paste a normal Windows path into **Search Glob**. In JSON source, backslashes must be doubled, for example `"file_glob": "C:\\Photos\\*.@(jpg|JPG|png|PNG|jpeg|JPEG)"`; JSON decoding restores the original string. The importer only quotes Windows backslashes for wcmatch, without detecting or rewriting paths. Forward slashes also work; add `**/` before `*` to include subfolders.
 
 [JSON templates](landlensdb/examples) cover geotagged photos, georeferenced rasters, and WorldView-3 imagery. Each configuration requires `file_glob`, `name`, `image_url`, and `geometry`.
 
@@ -35,9 +37,11 @@ Imports return a `GeoImageFrame` with geometry, metadata, thumbnails, and the co
 
 Build with `make qgis-build`, then install `qgis_plugin_landlensdb.zip` through QGIS **Install from ZIP**.
 
-- **Import Parameters** edits Search Glob; **Advanced settings** opens the full JSON. Settings are saved in QGIS.
+- **Import Parameters** edits Search Glob; **Select** builds it from a folder, extension checkboxes, and optional **Recursive** search. **Advanced settings** opens the full JSON. Settings are saved in QGIS.
+- Each row's **View JSON** opens a wrapping editor. **Copy** copies its text; **Update Import Text** saves it as the current QGIS Import Parameters.
 - **Apply Template** loads a JSON file from the template folder. The list refreshes whenever the popup opens; editing settings does not edit templates.
 - **Add** imports new images. The top **Actions** menu applies to the whole table; each row's menu applies to that import group.
+- Selecting a table checks its required column names and types. Invalid tables cannot be imported into until their schema is corrected.
 - Set threads, batch size, error handling, and output CRS below the table. CRS must match the destination table.
 - **File Spatial Query** uses a vector file; **Select Bbox Query** lets you draw a rectangle on the map.
 

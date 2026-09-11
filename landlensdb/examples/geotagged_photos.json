@@ -1,5 +1,5 @@
 {
-  "file_glob": "/path/to/photos/**/*.@(jpg|jpeg|png|JPG|JPEG|PNG)",
+  "file_glob": "/path/to/photos/**/*.@(jpg|JPG|png|PNG|jpeg|JPEG)",
   "name": "file.name",
   "image_url": "file.path",
   "geometry": "point_from_exif",

@@ -19,6 +19,7 @@ from ..landlensdb import (
     normalize_import_json,
 )
 from ..landlensdb.handlers.importer import discover_image_paths
+from ..landlensdb.handlers.db import IMPORT_TABLE_COLUMNS, validate_table
 from ..landlensdb.handlers.local import ImportCancelledError
 from ..shared.connection_utils import (
     connection_kwargs,
@@ -31,7 +32,7 @@ from ..shared.import_settings import (
     save_import_parameters,
 )
 from ..shared.metadata_settings import fetch_metadata_tree
-from ..shared.json_editor import ImportJsonDialog
+from ..shared.json_editor import ImportGroupJsonDialog, ImportJsonDialog
 
 
 class AddTableDialog(QtWidgets.QDialog):
@@ -71,6 +72,7 @@ class ImportTab(QtWidgets.QWidget):
         self.iface = iface
         self.connection_values = load_connection_settings()
         self._selected_table = None
+        self._table_valid = False
         self._cancel_import_event = threading.Event()
         self._import_active = False
 
@@ -156,9 +158,9 @@ class ImportTab(QtWidgets.QWidget):
         import_row.addWidget(self.cancel_button)
         layout.addLayout(import_row)
 
-        self._refresh_table_choices()
         self.load_records([])
         self._set_import_active(False)
+        self._refresh_table_choices()
 
     def showEvent(self, event):
         super(ImportTab, self).showEvent(event)
@@ -195,11 +197,11 @@ class ImportTab(QtWidgets.QWidget):
                 )
         menu.addAction("Add Table…", self.add_table)
         self.table_button.setMenu(menu)
-        self.table_button.setText(self._selected_table or "Choose Table")
+        self._select_table(self._selected_table)
 
     def _select_table(self, table_name):
         self._selected_table = table_name
-        self.table_button.setText(table_name)
+        self.table_button.setText(table_name or "Choose Table")
         self.refresh_table()
 
     def add_table(self):
@@ -259,7 +261,6 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message("Could not create table: {}".format(exc), Qgis.Critical)
             return
         self._refresh_table_choices(table_name)
-        self.load_records([])
 
     def drop_selected_table(self, table_name=None):
         table_name = table_name or self.current_table_name()
@@ -289,12 +290,13 @@ class ImportTab(QtWidgets.QWidget):
             return
         self._selected_table = None
         self._refresh_table_choices()
-        self.load_records([])
 
     def refresh_table(self):
+        self._table_valid = False
+        self.load_records([])
+        self.add_button.setEnabled(False)
         table_name = self.current_table_name()
         if not table_name:
-            self.load_records([])
             return
         schema_name = self.connection_values.get("schema", "public").strip() or "public"
         try:
@@ -302,6 +304,9 @@ class ImportTab(QtWidgets.QWidget):
                 **connection_kwargs(self.connection_values)
             ) as connection:
                 with connection.cursor() as cursor:
+                    validate_table(
+                        cursor, table_name, IMPORT_TABLE_COLUMNS, schema=schema_name
+                    )
                     cursor.execute(
                         sql.SQL(
                             "SELECT input_sha, COUNT(*), MIN(import_params) "
@@ -320,12 +325,17 @@ class ImportTab(QtWidgets.QWidget):
                         for row in cursor.fetchall()
                     ]
                 connection.commit()
+        except ValueError as exc:
+            self._show_message(str(exc), Qgis.Critical)
+            return
         except Exception as exc:
             self._show_message(
                 "Could not load import groups: {}".format(exc), Qgis.Critical
             )
             return
+        self._table_valid = True
         self.load_records(records)
+        self.add_button.setEnabled(not self._import_active)
 
     def load_records(self, records):
         self.import_table.setRowCount(len(records or []))
@@ -354,7 +364,9 @@ class ImportTab(QtWidgets.QWidget):
             )
         if self.import_table.rowCount():
             self.import_table.selectRow(0)
-        self.actions_button.setEnabled(bool(records) and not self._import_active)
+        self.actions_button.setEnabled(
+            bool(records) and self._table_valid and not self._import_active
+        )
         QtCore.QTimer.singleShot(0, self._resize_import_columns)
 
     @staticmethod
@@ -428,6 +440,21 @@ class ImportTab(QtWidgets.QWidget):
             save_import_parameters(dialog.json_text())
             self._show_message("Import parameters saved.", Qgis.Info)
 
+    def _show_group_import_parameters(self, json_text):
+        dialog = ImportGroupJsonDialog(json_text, normalize_import_json, parent=self)
+
+        def update_import_text(text):
+            try:
+                save_import_parameters(text)
+            except Exception as exc:
+                dialog.show_error("Could not save Import Parameters: {}".format(exc))
+                return
+            dialog.accept()
+
+        dialog.update_requested.connect(update_import_text)
+        if dialog.exec_():
+            self._show_message("Import parameters saved.", Qgis.Info)
+
     def _build_import_params_button(self, input_sha):
         button = QtWidgets.QPushButton("View JSON", self)
         button.clicked.connect(
@@ -453,7 +480,7 @@ class ImportTab(QtWidgets.QWidget):
                 "This import group has no stored import parameters.", Qgis.Warning
             )
             return
-        self._show_import_parameters(json_text)
+        self._show_group_import_parameters(json_text)
 
     def _build_actions_button(self, input_sha=None, json_text=None):
         if input_sha:
@@ -538,6 +565,12 @@ class ImportTab(QtWidgets.QWidget):
         table_name = self.current_table_name()
         if not table_name:
             self._show_message("Choose or create a table first.", Qgis.Critical)
+            return
+        if not self._table_valid:
+            self._show_message(
+                "The selected table failed validation. Fix its schema and click Refresh.",
+                Qgis.Critical,
+            )
             return
         if not configs:
             self._show_message("No import parameters are available.", Qgis.Warning)
@@ -778,8 +811,11 @@ class ImportTab(QtWidgets.QWidget):
         ):
             widget.setEnabled(not self._import_active)
         self.actions_button.setEnabled(
-            bool(self.import_table.rowCount()) and not self._import_active
+            bool(self.import_table.rowCount())
+            and self._table_valid
+            and not self._import_active
         )
+        self.add_button.setEnabled(self._table_valid and not self._import_active)
 
     def _cancel_active_import(self):
         if self._import_active:

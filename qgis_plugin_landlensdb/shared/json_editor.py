@@ -5,6 +5,7 @@ import json
 from qgis.PyQt import QtCore, QtGui, QtWidgets
 
 from ..landlensdb import import_config
+from .glob_builder import GlobExtensionsDialog, build_file_glob
 from .import_settings import save_import_parameters
 
 
@@ -38,6 +39,63 @@ class JsonHighlighter(QtGui.QSyntaxHighlighter):
                     match.capturedLength(),
                     text_format,
                 )
+
+
+class ImportGroupJsonDialog(QtWidgets.QDialog):
+    """View a group's JSON and optionally use it as the current import settings."""
+
+    update_requested = QtCore.pyqtSignal(str)
+
+    def __init__(self, json_text, normalizer, parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_WindowPropagation)
+        self.setWindowTitle("View JSON")
+        self.resize(880, 600)
+        self.normalizer = normalizer
+        layout = QtWidgets.QVBoxLayout(self)
+        self.editor = QtWidgets.QPlainTextEdit(self)
+        self.editor.setFont(
+            QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        )
+        self.editor.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        self.editor.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.editor.setPlainText(json_text)
+        self.highlighter = JsonHighlighter(self.editor.document())
+        layout.addWidget(self.editor, 1)
+        self.validation_label = QtWidgets.QLabel(self)
+        self.validation_label.setWordWrap(True)
+        self.validation_label.hide()
+        layout.addWidget(self.validation_label)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch()
+        self.close_button = QtWidgets.QPushButton("Close", self)
+        self.copy_button = QtWidgets.QPushButton("Copy", self)
+        self.update_button = QtWidgets.QPushButton("Update Import Text", self)
+        buttons.addWidget(self.close_button)
+        buttons.addWidget(self.copy_button)
+        buttons.addWidget(self.update_button)
+        layout.addLayout(buttons)
+        self.close_button.clicked.connect(self.reject)
+        self.copy_button.clicked.connect(self.copy_json)
+        self.update_button.clicked.connect(self.request_update)
+
+    def json_text(self):
+        return self.editor.toPlainText()
+
+    def copy_json(self):
+        QtWidgets.QApplication.clipboard().setText(self.json_text())
+
+    def request_update(self):
+        try:
+            self.normalizer(self.json_text())
+        except (ValueError, TypeError) as exc:
+            self.show_error(str(exc))
+            return
+        self.update_requested.emit(self.json_text())
+
+    def show_error(self, message):
+        self.validation_label.setText(message)
+        self.validation_label.show()
 
 
 class ImportJsonDialog(QtWidgets.QDialog):
@@ -78,8 +136,10 @@ class ImportJsonDialog(QtWidgets.QDialog):
         self.file_glob_input = QtWidgets.QLineEdit(self)
         glob_label.setBuddy(self.file_glob_input)
         glob_row.addWidget(self.file_glob_input, 1)
+        self.create_glob_button = QtWidgets.QPushButton("Select", self)
+        self.create_glob_button.clicked.connect(self.create_file_glob)
+        glob_row.addWidget(self.create_glob_button)
         simple_layout.addLayout(glob_row)
-        simple_layout.addStretch()
         self.mode_stack.addWidget(self.simple_page)
         self.editor = QtWidgets.QPlainTextEdit(self)
         self.editor.setPlainText(json_text)
@@ -96,6 +156,7 @@ class ImportJsonDialog(QtWidgets.QDialog):
 
         self.validation_label = QtWidgets.QLabel(self)
         self.validation_label.setWordWrap(True)
+        self.validation_label.hide()
         layout.addWidget(self.validation_label)
 
         buttons = QtWidgets.QHBoxLayout()
@@ -138,6 +199,7 @@ class ImportJsonDialog(QtWidgets.QDialog):
         if name in self.presets:
             self.editor.setPlainText(self.presets[name])
             self.validation_label.clear()
+            self.validation_label.hide()
             self.set_advanced_settings(self.advanced_settings_checkbox.isChecked())
 
     def set_advanced_settings(self, advanced):
@@ -156,10 +218,33 @@ class ImportJsonDialog(QtWidgets.QDialog):
         self.mode_stack.setCurrentWidget(self.editor if advanced else self.simple_page)
         self.settings_hint.setText(
             "Save keeps the current configuration for future imports. Template files are unchanged."
-            if advanced
-            else "Search Glob changes are saved automatically. Template files are unchanged."
         )
-        self.resize(self.width(), 720 if advanced else 240)
+        self.settings_hint.setVisible(advanced)
+        if advanced:
+            self.mode_stack.setMinimumHeight(0)
+            self.mode_stack.setMaximumHeight(16777215)
+            self.resize(self.width(), 720)
+        else:
+            self.mode_stack.setFixedHeight(self.simple_page.sizeHint().height())
+            self._resize_simple_mode()
+
+    def _resize_simple_mode(self):
+        if not self.advanced_settings_checkbox.isChecked():
+            self.layout().activate()
+            self.resize(self.width(), self.layout().sizeHint().height())
+
+    def create_file_glob(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose Image Folder")
+        if not folder:
+            return
+        dialog = GlobExtensionsDialog(self)
+        if not dialog.exec_():
+            return
+        file_glob = build_file_glob(
+            folder, dialog.selected_extensions(), dialog.recursive_checkbox.isChecked()
+        )
+        self.file_glob_input.setText(file_glob)
+        self.update_file_glob(file_glob)
 
     def update_file_glob(self, file_glob):
         """Change only the glob in the loaded configuration and persist valid edits."""
@@ -174,6 +259,8 @@ class ImportJsonDialog(QtWidgets.QDialog):
             return
         save_import_parameters(json_text)
         self.validation_label.clear()
+        self.validation_label.hide()
+        self._resize_simple_mode()
 
     def open_template_folder(self):
         url = QtCore.QUrl.fromLocalFile(str(import_config.IMPORT_TEMPLATE_DIRECTORY))
@@ -185,6 +272,8 @@ class ImportJsonDialog(QtWidgets.QDialog):
         QtWidgets.QApplication.clipboard().setText(self.json_text())
         self.validation_label.setStyleSheet("color: #15803d;")
         self.validation_label.setText("Import parameter JSON copied.")
+        self.validation_label.show()
+        self._resize_simple_mode()
 
     def validate_editor(self):
         try:
@@ -203,3 +292,5 @@ class ImportJsonDialog(QtWidgets.QDialog):
     def _show_error(self, message):
         self.validation_label.setStyleSheet("color: #b91c1c;")
         self.validation_label.setText(message)
+        self.validation_label.show()
+        self._resize_simple_mode()
