@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,11 +74,16 @@ WORLDVIEW_BOUND_KEYS = (
 )
 
 
+def _escape_glob_separators(pattern: str) -> str:
+    """Quote literal Windows backslashes for wcmatch without parsing the path."""
+    return pattern.replace("\\", "\\\\") if sys.platform == "win32" else pattern
+
+
 def discover_image_paths(file_glob: str) -> list[Path]:
     """Return unique files from one full-path wcmatch pattern."""
     if not isinstance(file_glob, str) or not file_glob.strip():
         raise ValueError("`file_glob` must be a non-empty string.")
-    matches = wcglob.glob(file_glob, flags=WCMATCH_FLAGS)
+    matches = wcglob.glob(_escape_glob_separators(file_glob), flags=WCMATCH_FLAGS)
     return sorted({Path(match).resolve() for match in matches if Path(match).is_file()})
 
 
@@ -178,8 +184,10 @@ def resolve_sidecar(image_path: Path, pattern: str | None) -> dict[str, Any]:
     """Load one explicitly supported sidecar as a JSON-like mapping."""
     if not pattern:
         return {}
-    substituted = pattern.replace("{parent}", str(image_path.parent)).replace(
-        "{base}", image_path.stem
+    substituted = (
+        _escape_glob_separators(pattern)
+        .replace("{parent}", wcglob.escape(str(image_path.parent)))
+        .replace("{base}", wcglob.escape(image_path.stem))
     )
     matches = wcglob.glob(substituted, flags=WCMATCH_FLAGS)
     paths = sorted(
@@ -547,6 +555,8 @@ def import_local_images(
     import_params = normalize_import_json(config)
     input_sha = calculate_input_sha(config)
     paths = discover_image_paths(config["file_glob"])
+    if not paths:
+        raise ValueError("No files match `file_glob`: {}".format(config["file_glob"]))
     if skip_existing and skip_images_in_postgresql is not None:
         paths = [
             Path(path) for path in skip_images_in_postgresql.filter_existing_rows(paths)
