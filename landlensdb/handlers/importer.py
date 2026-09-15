@@ -98,7 +98,8 @@ def discover_image_paths(file_glob: str, *, cancel_event=None) -> list[Path]:
         _check_cancelled(cancel_event)
         path = Path(match)
         if path.is_file():
-            paths.add(path.resolve())
+            # Preserve mapped drives and symlink paths used by the search glob.
+            paths.add(path.absolute())
     _check_cancelled(cancel_event)
     return sorted(paths)
 

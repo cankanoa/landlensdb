@@ -101,7 +101,12 @@ class ImageTile(QtWidgets.QFrame):
         )
         self.status_label.setWordWrap(True)
         self.status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        layout.addWidget(self.status_label)
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(self.status_label, 1)
+        self.selection_checkbox = QtWidgets.QCheckBox(self)
+        self.selection_checkbox.setToolTip("Select this image to add to the map")
+        header.addWidget(self.selection_checkbox, 0, QtCore.Qt.AlignTop)
+        layout.addLayout(header)
 
         self.canvas = ImageCanvas(self)
         layout.addWidget(self.canvas, 1)
@@ -124,6 +129,7 @@ class LayerSelectionComboBox(QtWidgets.QComboBox):
 
 class ViewTab(QtWidgets.QWidget):
     ACTIVE_LAYER_VALUE = "__active_layer__"
+    addImagesRequested = QtCore.pyqtSignal(str, list, bool, bool)
 
     def __init__(self, iface, parent=None):
         super(ViewTab, self).__init__(parent)
@@ -136,6 +142,8 @@ class ViewTab(QtWidgets.QWidget):
         self._watched_layer = None
         self._watch_connected = False
         self._current_geoimageframe = None
+        self._source_query = ""
+        self._checked_image_urls = set()
         self._last_grid_rows = 0
         self._last_grid_columns = 0
         self._organize_path = None
@@ -157,6 +165,28 @@ class ViewTab(QtWidgets.QWidget):
         self.path_action.triggered.connect(lambda: self._set_source_mode("path"))
         self.source_button.setMenu(self.source_menu)
         header_row.addWidget(self.source_button)
+
+        self.add_button = QtWidgets.QPushButton("Add", self)
+        add_menu = QtWidgets.QMenu(self.add_button)
+        self._add_actions = []
+        for label, thumbnail, geometry in (
+            ("Add Both", True, True),
+            ("Add Geometry", False, True),
+            ("Add Thumbnail", True, False),
+        ):
+            action = add_menu.addAction(label)
+            self._add_actions.append(action)
+            action.triggered.connect(
+                lambda _checked=False, t=thumbnail, g=geometry: self._add_checked_images(
+                    t, g
+                )
+            )
+        add_menu.addSeparator()
+        self.select_all_action = add_menu.addAction("Select all")
+        self.select_all_action.triggered.connect(self._select_all_images)
+        self.add_button.setMenu(add_menu)
+        self._update_selection_actions()
+        header_row.addWidget(self.add_button)
 
         header_row.addWidget(QtWidgets.QLabel("Update from selection:", self))
         self.update_from_selection_toggle = QtWidgets.QCheckBox(self)
@@ -262,9 +292,52 @@ class ViewTab(QtWidgets.QWidget):
         if self._sync_enabled():
             self._load_selected_features()
 
-    def set_geoimageframe(self, geoimageframe):
+    def set_geoimageframe(self, geoimageframe, *, source_query=""):
+        if source_query != self._source_query:
+            self._checked_image_urls.clear()
+        self._source_query = source_query
         self._current_geoimageframe = geoimageframe
         self._render_geoimageframe()
+
+    def _set_image_checked(self, image_url, checked):
+        if checked:
+            self._checked_image_urls.add(image_url)
+        else:
+            self._checked_image_urls.discard(image_url)
+        self._update_selection_actions()
+
+    def _update_selection_actions(self):
+        for action in self._add_actions:
+            action.setEnabled(bool(self._checked_image_urls))
+        self.select_all_action.setEnabled(
+            self._current_geoimageframe is not None
+            and len(self._current_geoimageframe) > 0
+        )
+
+    def _select_all_images(self):
+        for index in range(self.grid_layout.count()):
+            checkbox = self.grid_layout.itemAt(index).widget().selection_checkbox
+            if checkbox.isEnabled():
+                checkbox.setChecked(True)
+
+    def _add_checked_images(self, add_thumbnail, add_geometry):
+        if not self._checked_image_urls or self._current_geoimageframe is None:
+            return
+        if not self._source_query:
+            self.status_label.setText(
+                "Choose images from a Landlensdb query layer to add them."
+            )
+            return
+        image_urls = list(
+            dict.fromkeys(
+                str(url)
+                for url in self._current_geoimageframe["image_url"]
+                if str(url) in self._checked_image_urls
+            )
+        )
+        self.addImagesRequested.emit(
+            self._source_query, image_urls, add_thumbnail, add_geometry
+        )
 
     def _set_source_mode(self, mode):
         self._source_mode = mode
@@ -423,7 +496,10 @@ class ViewTab(QtWidgets.QWidget):
                 len(geoimageframe), "" if len(geoimageframe) == 1 else "s"
             )
         )
-        self.set_geoimageframe(geoimageframe)
+        self.set_geoimageframe(
+            geoimageframe,
+            source_query=layer.customProperty("landlensdb/query_text", ""),
+        )
         self._update_navigation_buttons()
 
     def _fetch_geoimageframe_for_image_urls(self, layer, image_urls):
@@ -508,17 +584,30 @@ class ViewTab(QtWidgets.QWidget):
 
         geoimageframe = self._current_geoimageframe
         if geoimageframe is None or len(geoimageframe) == 0:
+            self._checked_image_urls.clear()
+            self._update_selection_actions()
             self._last_grid_rows = 1
             self._last_grid_columns = 1
             self.grid_layout.setColumnStretch(0, 1)
             self.grid_layout.setRowStretch(0, 1)
             return
 
+        self._checked_image_urls.intersection_update(
+            str(url) for url in geoimageframe["image_url"] if url
+        )
+        self._update_selection_actions()
         rows, columns = self._compute_grid_size(len(geoimageframe))
         for index, (_, row) in enumerate(geoimageframe.iterrows()):
             tile = ImageTile(self.grid_host)
             pixmap, status = self._build_tile_content(row)
             tile.set_content(pixmap, status)
+            image_url = str(row.get("image_url") or "")
+            tile.selection_checkbox.setAccessibleName("Select {}".format(image_url))
+            tile.selection_checkbox.setEnabled(bool(image_url))
+            tile.selection_checkbox.setChecked(image_url in self._checked_image_urls)
+            tile.selection_checkbox.toggled.connect(
+                lambda checked, url=image_url: self._set_image_checked(url, checked)
+            )
             self.grid_layout.addWidget(tile, index // columns, index % columns)
 
         for column in range(columns):

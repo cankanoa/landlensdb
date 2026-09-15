@@ -24,6 +24,8 @@ images = import_local_images(config, output_crs="EPSG:4326", on_error="warn")
 
 Paste a normal Windows path into **Search Glob**. In JSON source, backslashes must be doubled, for example `"file_glob": "C:\\Photos\\*.@(jpg|JPG|png|PNG|jpeg|JPEG)"`; JSON decoding restores the original string. The importer only quotes Windows backslashes for wcmatch, without detecting or rewriting paths. Forward slashes also work; add `**/` before `*` to include subfolders.
 
+Discovered files keep the path used by the glob: a search through `S:\Satellite_Imagery\…` stores that drive path in `image_url` and `metadata.image_url`. Relative matches become absolute without resolving mapped drives or symbolic links. Existing database URLs keep their stored values.
+
 [JSON templates](landlensdb/examples) cover geotagged photos, georeferenced rasters, and WorldView-3 imagery. Each configuration requires `file_glob`, `name`, `image_url`, and `geometry`.
 
 - Values such as `file.name`, `exif.Model`, and `sidecar.product.numColumns` resolve metadata paths; other values are literals. Dotted paths can index arrays.
@@ -75,6 +77,7 @@ Build with `make qgis-build`, then install `qgis_plugin_landlensdb.zip` through 
 - Selecting a table checks its required column names and types. Invalid tables cannot be imported into until their schema is corrected.
 - Set threads, batch size, error handling, and output CRS below the table. CRS must match the destination table.
 - **File Spatial Query** uses a vector file; **Select Bbox Query** lets you draw a rectangle on the map.
+- In **View**, check images beside their preview/path labels, or use **Add → Select all** to check every image in the viewer. **Add Both**, **Add Geometry**, and **Add Thumbnail** are greyed out until an image is checked. These actions create a query on the checked images' exact stored `image_url` values and add layers through the Query workflow. The query is available in the Query editor and history. Only checked images currently displayed are included; changing Preview/Path or North up keeps the checks.
 
 ## Development
 
