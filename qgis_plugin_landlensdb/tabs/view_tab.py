@@ -50,7 +50,7 @@ class ImageCanvas(QtWidgets.QGraphicsView):
             return
         step = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         target_scale = self._current_scale * step
-        target_scale = max(self._fit_scale, min(1.0, target_scale))
+        target_scale = max(self._fit_scale, target_scale)
         if abs(target_scale - self._current_scale) < 1e-9:
             return
         scale_factor = target_scale / self._current_scale
