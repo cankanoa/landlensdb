@@ -71,18 +71,10 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     SHARED_COMMENT_KEY = "landlensdb"
     SHARED_QUERY_KEY = "shared_queries"
     SHARED_TABLE_KEY = "Landlensdb/shared_query_table"
-    SIMPLE_SELECT_RE = re.compile(
-        r'^\s*SELECT\s+\*\s+FROM\s+(?:"(?P<schema_q>[^"]+)"|"?(?P<schema_u>[\w]+)"?)\.(?:"(?P<table_q>[^"]+)"|"?(?P<table_u>[\w]+)"?)'
-        r'(?:\s+(?:AS\s+)?(?:"?[\w]+"?))?'
-        r"(?:\s+WHERE\s+(?P<where>.+?))?"
-        r"\s*$",
-        re.IGNORECASE | re.DOTALL,
-    )
     SOURCE_TABLE_RE = re.compile(
-        r'\bFROM\s+(?:"(?P<schema_q>[^"]+)"|"?(?P<schema_u>[\w]+)"?)\.(?:"(?P<table_q>[^"]+)"|"?(?P<table_u>[\w]+)"?)'
-        r'(?:\s+(?:AS\s+)?(?:"?[\w]+"?))?'
-        r"(?P<tail>.*)$",
-        re.IGNORECASE | re.DOTALL,
+        r'\bFROM\s+(?:(?P<schema>"(?:[^"]|"")+"|[\w]+)\s*\.\s*)?'
+        r'(?P<table>"(?:[^"]|"")+"|[\w]+)',
+        re.IGNORECASE,
     )
     STATIC_ROW_ONE = [
         "SELECT",
@@ -142,7 +134,6 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.connection_values = {}
         self._metadata_loaded = False
         self._last_query_state = None
-        self._thumbnail_support_cache = {}
         self._staged_metadata_items = []
         self._bbox_tool = None
         self._additional_metadata_schema = load_metadata_tree()
@@ -1069,11 +1060,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         schema_name = self.connection_values.get("schema", "public").strip() or "public"
         query_name = "Query {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         live_query = self._build_live_query(sql_text)
-        raster_source = self._parse_simple_raster_source(sql_text)
         query_source = self._parse_query_source(sql_text)
         source_column_info = []
-        effective_raster_source = raster_source
-        effective_raster_columns = []
 
         try:
             with psycopg2.connect(**self._connection_kwargs()) as connection:
@@ -1089,27 +1077,11 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                         start_row,
                         end_row,
                     )
-                    effective_raster_columns = [
-                        column["name"]
-                        for column in column_info
-                        if column["udt_name"] == "raster"
-                    ]
                     if query_source:
                         source_query = self._build_source_query_from_source(
                             query_source
                         )
                         source_column_info = self._get_column_info(cursor, source_query)
-                        if effective_raster_source is None:
-                            effective_raster_source = query_source
-                        if not effective_raster_columns:
-                            effective_raster_columns = [
-                                column["name"]
-                                for column in source_column_info
-                                if column["udt_name"] == "raster"
-                            ]
-                    raster_key_columns = self._get_raster_key_columns(
-                        cursor, effective_raster_source
-                    )
         except Exception as exc:  # pragma: no cover - depends on external DB
             self._show_error("Query failed: {}".format(exc))
             return
@@ -1128,11 +1100,14 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             "query_source": query_source,
             "column_info": column_info,
             "column_names": [column["name"] for column in column_info],
-            "raster_source": effective_raster_source,
+            "raster_source": query_source,
             "vector_column": vector_column,
             "source_vector_column": source_vector_column,
-            "raster_columns": effective_raster_columns,
-            "raster_key_columns": raster_key_columns,
+            "raster_columns": [
+                column["name"]
+                for column in source_column_info
+                if column["udt_name"] == "raster"
+            ],
             "row_count": row_count,
         }
         self._update_add_buttons_state()
@@ -1445,6 +1420,9 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         raster_source = self._last_query_state.get("raster_source")
         raster_columns = self._last_query_state.get("raster_columns") or []
         if not raster_source or not raster_columns:
+            self._show_error(
+                "Could not identify a source table with thumbnails for this query."
+            )
             return added_layers
 
         supported_image_urls = self._get_thumbnail_image_urls(image_urls)
@@ -1463,8 +1441,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         return added_layers
 
     def _build_thumbnail_row_filter(self, image_url):
-        safe_image_url = image_url.replace("$lldb$", "")
-        return '"image_url" = $lldb${}$lldb$'.format(safe_image_url)
+        return '"image_url" = {}'.format(self._sql_literal(image_url))
 
     def _add_geometry_layers(self, group, entry):
         filtered_query = self._build_entry_layer_query(entry)
@@ -1616,44 +1593,29 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             sql=sql_text,
         )
 
-    def _parse_simple_raster_source(self, sql_text):
-        match = self.SIMPLE_SELECT_RE.match(sql_text.strip())
-        if not match:
-            return None
-        return {
-            "schema": match.group("schema_q") or match.group("schema_u") or "public",
-            "table": match.group("table_q") or match.group("table_u"),
-            "where": (match.group("where") or "").strip(),
-        }
-
     def _parse_query_source(self, sql_text):
-        match = self.SOURCE_TABLE_RE.search(sql_text.strip())
+        match = self.SOURCE_TABLE_RE.search(sql_text)
         if not match:
             return None
-
-        tail = match.group("tail") or ""
-        where_clause = ""
-        where_match = re.search(
-            r"\bWHERE\b(?P<where>.*?)(?=\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bOFFSET\b|$)",
-            tail,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if where_match:
-            where_clause = where_match.group("where").strip()
-
-        return {
-            "schema": match.group("schema_q") or match.group("schema_u") or "public",
-            "table": match.group("table_q") or match.group("table_u"),
-            "where": where_clause,
+        source = {
+            key: (
+                value[1:-1].replace('""', '"')
+                if value.startswith('"')
+                else value.lower()
+            )
+            for key, value in match.groupdict().items()
+            if value
         }
+        source.setdefault(
+            "schema", self.connection_values.get("schema", "public").strip() or "public"
+        )
+        return source
 
     def _build_source_query_from_source(self, query_source):
         base_query = 'SELECT * FROM "{}"."{}"'.format(
             query_source["schema"].replace('"', '""'),
             query_source["table"].replace('"', '""'),
         )
-        if query_source.get("where"):
-            base_query = "{} WHERE {}".format(base_query, query_source["where"])
         return self._build_live_query(base_query)
 
     def _build_source_query(self):
@@ -2088,50 +2050,6 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         )
         return cursor.fetchone()[0]
 
-    def _get_raster_key_columns(self, cursor, raster_source):
-        if not raster_source:
-            return []
-        cursor.execute(
-            """
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s AND column_name = 'image_url'
-            """,
-            (raster_source["schema"], raster_source["table"]),
-        )
-        if cursor.fetchone():
-            self._show_info(
-                'Using "image_url" as the raster row key for "{}"."{}".'.format(
-                    raster_source["schema"],
-                    raster_source["table"],
-                )
-            )
-            return ["image_url"]
-        cursor.execute(
-            """
-            SELECT a.attname
-            FROM pg_index i
-            JOIN pg_class c ON c.oid = i.indrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
-            WHERE i.indisprimary AND n.nspname = %s AND c.relname = %s
-            ORDER BY array_position(i.indkey, a.attnum)
-            """,
-            (raster_source["schema"], raster_source["table"]),
-        )
-        return [row[0] for row in cursor.fetchall()]
-
-    def _table_has_column(self, cursor, raster_source, column_name):
-        cursor.execute(
-            """
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s AND column_name = %s
-            """,
-            (raster_source["schema"], raster_source["table"], column_name),
-        )
-        return cursor.fetchone() is not None
-
     def _find_first_column(self, column_info, udt_names):
         for column in column_info:
             if column["udt_name"] in udt_names:
@@ -2140,11 +2058,13 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
     def _get_geometry_types(self, cursor, query_text, geometry_column):
         cursor.execute(
-            sql.SQL("""
+            sql.SQL(
+                """
                 SELECT DISTINCT ST_GeometryType(q.{geometry_column})
                 FROM ({query_text}) AS q
                 WHERE q.{geometry_column} IS NOT NULL
-                """).format(
+                """
+            ).format(
                 geometry_column=sql.Identifier(geometry_column),
                 query_text=sql.SQL(query_text),
             )
@@ -2153,7 +2073,8 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
     def _get_thumbnail_image_urls(self, image_urls):
         raster_source = self._last_query_state.get("raster_source")
-        if not raster_source or not image_urls:
+        raster_columns = self._last_query_state.get("raster_columns") or []
+        if not raster_source or not raster_columns or not image_urls:
             return []
 
         schema_name = self.connection_values.get("schema", "public").strip() or "public"
@@ -2163,16 +2084,22 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
                     if schema_name:
                         self._set_search_path(cursor, schema_name)
                     cursor.execute(
-                        sql.SQL("""
+                        sql.SQL(
+                            """
                             SELECT image_url
                             FROM {}.{}
                             WHERE image_url = ANY(%s)
-                              AND thumbnail IS NOT NULL
-                            """).format(
+                              AND ({})
+                            """
+                        ).format(
                             sql.Identifier(raster_source["schema"]),
                             sql.Identifier(raster_source["table"]),
+                            sql.SQL(" OR ").join(
+                                sql.SQL("{} IS NOT NULL").format(sql.Identifier(column))
+                                for column in raster_columns
+                            ),
                         ),
-                        (list(image_urls),),
+                        (list(dict.fromkeys(image_urls)),),
                     )
                     return [row[0] for row in cursor.fetchall() if row and row[0]]
         except Exception as exc:  # pragma: no cover - depends on external DB
@@ -2220,20 +2147,19 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         return uri
 
     def _build_postgres_raster_uri(self, raster_source, raster_column, row_filter):
-        base_uri = self._create_uri()
-        connection_info = base_uri.connectionInfo(False)
-        where_parts = []
-        if raster_source["where"]:
-            where_parts.append("({})".format(raster_source["where"]))
-        where_parts.append(row_filter)
-        where_clause = " AND ".join(where_parts).replace("'", "''")
-        return "PG: {} schema='{}' table='{}' column='{}' mode=1 where='{}'".format(
-            connection_info,
-            raster_source["schema"].replace("'", "''"),
-            raster_source["table"].replace("'", "''"),
-            raster_column.replace("'", "''"),
-            where_clause,
+        uri = self._create_uri()
+        # image_urls already come from the complete query, including its filters.
+        # Reapplying its WHERE here can refer to aliases absent from this table.
+        uri.setDataSource(
+            raster_source["schema"],
+            raster_source["table"],
+            raster_column,
+            "({}) AND {} IS NOT NULL".format(
+                row_filter, self._quote_identifier(raster_column)
+            ),
+            "image_url",
         )
+        return uri.uri(False)
 
     def _create_vector_layer(self, query_text, geometry_column, layer_name):
         uri = self._create_uri()
@@ -2282,7 +2208,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         layer = QgsRasterLayer(
             self._build_postgres_raster_uri(raster_source, raster_column, row_filter),
             layer_name,
-            "gdal",
+            "postgresraster",
         )
         if not layer.isValid():
             error_summary = (
@@ -2300,7 +2226,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
 
     def _ensure_query_group(self, query_name):
         root = QgsProject.instance().layerTreeRoot()
-        group = root.addGroup(query_name)
+        group = root.insertGroup(0, query_name)
         if isinstance(group, QgsLayerTreeGroup):
             group.setExpanded(False)
         return group if isinstance(group, QgsLayerTreeGroup) else root

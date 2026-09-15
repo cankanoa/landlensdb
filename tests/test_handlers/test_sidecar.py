@@ -230,9 +230,9 @@ def test_missing_sidecars_import_without_metadata_and_keep_progress(
     assert set(images["name"]) == {"present.jpg", "missing.jpg", "also_missing.jpg"}
     metadata = dict(zip(images["name"], images["metadata"]))
     assert metadata == {
-        "present.jpg": {"value": 42},
-        "missing.jpg": {"value": None},
-        "also_missing.jpg": {"value": None},
+        "present.jpg": {"value": 42, "import_params": config},
+        "missing.jpg": {"value": None, "import_params": config},
+        "also_missing.jpg": {"value": None, "import_params": config},
     }
     assert updates == [(0, 3), (1, 3), (2, 3), (3, 3)]
     forbidden.assert_not_called()
@@ -287,7 +287,7 @@ def test_empty_present_sidecar_does_not_skip_image(tmp_path, config, suffix, con
     config["metadata"]["sidecar_path"] = "./{base}." + suffix
     images = importer.import_local_images(config, on_error="error")
     assert len(images) == 1
-    assert images.iloc[0]["metadata"] == {"value": None}
+    assert images.iloc[0]["metadata"] == {"value": None, "import_params": config}
 
 
 @pytest.mark.parametrize(

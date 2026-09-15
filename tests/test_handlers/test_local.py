@@ -53,6 +53,7 @@ def test_all_built_in_presets_use_compact_json():
         assert "output_crs" not in config
         assert "required" not in value
         assert "default" not in value
+        assert not {"width", "height", "resampling"} & config["thumbnail"].keys()
     photos = parse_import_json(presets["geotagged_photos.json"])
     assert photos["file_glob"] == "/path/to/photos/**/*.@(jpg|JPG|png|PNG|jpeg|JPEG)"
     assert photos["metadata"]["camera"]["model"] == "exif.Model"
@@ -172,13 +173,27 @@ def test_import_stores_json_configuration_and_sha():
     config = _example_config()
     images = import_local_images(config)
     assert len(images) == 3
-    assert set(("input_sha", "import_params", "metadata", "thumbnail")) <= set(
-        images.columns
-    )
+    assert set(("input_sha", "metadata", "thumbnail")) <= set(images.columns)
     assert images["input_sha"].nunique() == 1
     assert images.iloc[0]["input_sha"] == calculate_input_sha(config)
-    assert json.loads(images.iloc[0]["import_params"]) == config
+    assert "import_params" not in images.columns
+    assert images.iloc[0]["metadata"]["import_params"] == config
     assert images.crs.to_epsg() == 4326
+
+
+def test_stored_import_parameters_are_independent_per_row():
+    config = _example_config()
+    images = import_local_images(config)
+    images.iloc[0]["metadata"]["import_params"]["metadata"]["new_key"] = "changed"
+    assert "new_key" not in config["metadata"]
+    assert "new_key" not in images.iloc[1]["metadata"]["import_params"]["metadata"]
+
+
+def test_import_params_metadata_key_is_reserved():
+    config = _example_config()
+    config["metadata"]["import_params"] = {"wrong": "configuration"}
+    with pytest.raises(ValueError, match="metadata.import_params.*reserved"):
+        import_local_images(config)
 
 
 def test_progress_and_output_crs_are_separate_runtime_controls():
@@ -200,7 +215,8 @@ def test_progress_and_output_crs_are_separate_runtime_controls():
     assert len(images) == 1
     assert updates == [(0, 1), (1, 1)]
     assert images.crs.to_epsg() == 3857
-    assert json.loads(images.iloc[0]["import_params"]) == config
+    assert "import_params" not in images.columns
+    assert images.iloc[0]["metadata"]["import_params"] == config
     assert images.iloc[0]["input_sha"] == calculate_input_sha(config)
 
 
@@ -395,9 +411,10 @@ def test_import_resolves_arbitrary_sidecar_corners_and_preserves_footprint(
     row = images.iloc[0]
     assert row.geometry.equals_exact(Polygon(corners), 1e-10)
     assert row.geometry.area < row.geometry.envelope.area
-    assert row["metadata"] == {"columns": 2}
+    assert row["metadata"] == {"columns": 2, "import_params": config}
     assert row["image_url"] == str(image)
-    assert json.loads(row["import_params"]) == config
+    assert "import_params" not in row.index
+    assert row["metadata"]["import_params"] == config
     assert row["input_sha"] == calculate_input_sha(config)
 
 

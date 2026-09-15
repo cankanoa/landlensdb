@@ -25,7 +25,11 @@ def open_database(url, connect_args, table_name):
 def read_import_groups(database):
     table = database.selected_table
     statement = (
-        select(table.c.input_sha, func.count(), func.min(table.c.import_params))
+        select(
+            table.c.input_sha,
+            func.count(),
+            func.min(table.c.metadata["import_params"].astext),
+        )
         .where(table.c.input_sha.is_not(None))
         .group_by(table.c.input_sha)
         .order_by(table.c.input_sha)
@@ -119,7 +123,7 @@ class ImportTask(QgsTask):
                     table = database.selected_table
                     with database.engine.connect() as connection:
                         text = connection.execute(
-                            select(table.c.import_params)
+                            select(table.c.metadata["import_params"].astext)
                             .where(table.c.input_sha == sha)
                             .limit(1)
                         ).scalar()
@@ -173,7 +177,6 @@ class ImportTask(QgsTask):
                         )
                         for images in batches:
                             self.check_cancelled()
-                            self.phase_changed.emit("Writing images…")
                             database.upsert_images(
                                 images,
                                 self.table_name,

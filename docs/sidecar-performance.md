@@ -25,8 +25,16 @@ Validation is cached by template in a bounded cache. File existence and parsed
 contents are checked afresh, so edits and newly created sidecars are visible.
 The old top-level `sidecar_glob` and `sidecar_path` options report a migration
 error pointing to `metadata.sidecar_path`. Thumbnail mode `"sidecar"` uses
-the same lookup and resizes the browse image without loading the source. Missing
+the same lookup and reads the browse image without loading the source. Missing
 browse files produce a null thumbnail; there is no source-image fallback.
+Both thumbnail modes use the full image by default. Resizing requires explicit
+`width`, `height`, and `resampling` settings. Browse images without georeferencing
+use the four configured geometry corners (for example, from WorldView IMD metadata)
+to warp onto a map grid in the selected Output CRS. This georeferencing step
+requires resampling at native preview resolution, without a default 256-pixel
+limit. Explicit resizing is applied in the same warp, avoiding a second pass.
+Already georeferenced images keep their native CRS and geotransform; without
+all three resize settings their pixels are read unchanged.
 
 ## Other work removed from the import loop
 

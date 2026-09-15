@@ -9,6 +9,7 @@ from pyproj import CRS
 from shapely.geometry import Point
 from sqlalchemy import Column, MetaData, Table, Text
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import JSONB
 
 from landlensdb.handlers import db as module
 
@@ -23,6 +24,7 @@ def writer(monkeypatch):
         Column("input_sha", Text),
         Column("fingerprint", Text),
         Column("thumbnail", Text),
+        Column("metadata", JSONB),
     )
     monkeypatch.setattr(module, "Table", lambda *args, **kwargs: table)
     engine = MagicMock()
@@ -99,3 +101,15 @@ def test_added_image_receives_thumbnail_when_insert_succeeds(writer):
     assert any(
         "ST_FromGDALRaster" in str(statement) for statement in statements(connection)
     )
+
+
+def test_upsert_keeps_import_parameters_as_nested_json_object(writer):
+    database, connection, frame, record = writer
+    record["metadata"] = {"sensor": "test", "import_params": {"file_glob": "./*.tif"}}
+    database.upsert_images(frame, "images")
+    insert = next(
+        item for item in statements(connection) if str(item).startswith("INSERT")
+    )
+    assert insert.params["metadata"] == record["metadata"]
+    assert isinstance(insert.params["metadata"]["import_params"], dict)
+    assert "import_params" not in insert.params

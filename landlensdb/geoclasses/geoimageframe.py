@@ -125,7 +125,6 @@ class GeoImageFrame(GeoDataFrame):
         "thumbnail": Dataset,
         "fingerprint": str,
         "input_sha": str,
-        "import_params": str,
     }
 
     def __init__(self, *args, **kwargs):
