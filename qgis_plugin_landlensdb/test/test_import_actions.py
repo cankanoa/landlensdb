@@ -11,9 +11,22 @@ from sqlalchemy import Column, MetaData, Table
 from ..landlensdb import calculate_input_sha
 from ..shared import import_settings
 from ..tabs import import_tab as module
+from ..shared import import_task as tasks
 from .utilities import get_qgis_app
 
 QGIS_APP = get_qgis_app()
+
+
+def wait_for_operation(tab):
+    loop = QtCore.QEventLoop()
+    timer = QtCore.QTimer()
+    timer.timeout.connect(lambda: loop.quit() if not tab._import_active else None)
+    timer.start(5)
+    QtCore.QTimer.singleShot(5000, loop.quit)
+    if tab._import_active:
+        loop.exec_()
+    timer.stop()
+    assert not tab._import_active, "Background operation did not finish"
 
 
 def configuration(folder):
@@ -61,6 +74,9 @@ def tab(table_cursor):
         ]
     )
     yield widget
+    if widget._import_active:
+        widget._cancel_active_import()
+        wait_for_operation(widget)
     widget.close()
     widget.deleteLater()
 
@@ -102,9 +118,10 @@ def test_selecting_invalid_table_clears_old_groups_and_blocks_imports(
     assert not tab.add_button.isEnabled()
     tab._set_import_active(False)
     assert not tab.add_button.isEnabled()
-    tab._database = Mock()
+    task_factory = Mock()
+    monkeypatch.setattr(module, "ImportTask", task_factory)
     tab._run_updates([configuration("new")], skip_existing=True, add_only=True)
-    tab._database.assert_not_called()
+    task_factory.assert_not_called()
 
 
 def test_refresh_reports_wrong_type_and_allows_retry_after_correction(
@@ -261,6 +278,7 @@ def test_menus_use_stored_groups_without_saved_import_parameters(
         side_effect=AssertionError("Only Add uses saved parameters")
     )
     tab._run_updates = Mock()
+    tab._start_operation = Mock()
     tab._run_drop_old = Mock(return_value=0)
     tab._run_drop_all = Mock(return_value=0)
     tab.fetch_metadata = Mock()
@@ -276,10 +294,12 @@ def test_menus_use_stored_groups_without_saved_import_parameters(
         button = tab.import_table.cellWidget(1, tab.ACTIONS_COLUMN)
         configs = configs[1:]
     next(item for item in button.menu().actions() if item.text() == action).trigger()
-    if action in ("Update", "Update New", "Sync (Drop Old/Update)"):
+    if action in ("Update", "Update New"):
         tab._run_updates.assert_called_once_with(configs, action == "Update New")
-    if action in ("Drop Old", "Sync (Drop Old/Update)"):
+    if action == "Drop Old":
         tab._run_drop_old.assert_called_once_with(configs)
+    if action == "Sync (Drop Old/Update)":
+        tab._start_operation.assert_called_once_with("sync", configs)
     if action == "Drop All":
         tab._run_drop_all.assert_called_once_with(configs)
     if action == "Fetch Metadata Structure":
@@ -290,12 +310,22 @@ def test_menus_use_stored_groups_without_saved_import_parameters(
 
 
 @pytest.fixture
-def database(tab):
+def database(tab, monkeypatch):
     db = Mock()
     db.selected_table = Table(
         "images", MetaData(), Column("geometry", Geometry(srid=3857))
     )
-    tab._database = Mock(return_value=db)
+    monkeypatch.setattr(tasks, "open_database", Mock(return_value=db))
+    monkeypatch.setattr(
+        tasks,
+        "read_import_groups",
+        Mock(
+            return_value=[
+                {"input_sha": sha, "row_count": 2, "import_params": text}
+                for sha, text in (configuration("first"), configuration("second"))
+            ]
+        ),
+    )
     tab.output_crs_input.setText("EPSG:3857")
     return db
 
@@ -312,12 +342,6 @@ def test_add_and_update_pass_runtime_controls_and_protect_other_groups(
     batch = object()
 
     def import_images(config, **kwargs):
-        assert not tab.add_button.isEnabled()
-        assert not tab.actions_button.isEnabled()
-        assert not tab.import_table.isEnabled()
-        assert not tab.table_button.isEnabled()
-        assert not tab.output_crs_input.isEnabled()
-        assert tab.cancel_button.isEnabled()
         assert kwargs["output_crs"] == "EPSG:3857"
         assert kwargs["max_workers"] == 3
         assert kwargs["batch_size"] == 25
@@ -330,7 +354,7 @@ def test_add_and_update_pass_runtime_controls_and_protect_other_groups(
         return iter([batch])
 
     importer = Mock(side_effect=import_images)
-    monkeypatch.setattr(module, "import_local_images", importer)
+    monkeypatch.setattr(tasks, "import_local_images", importer)
     if add_only:
         tab.add_button.click()
         configs = [saved]
@@ -338,6 +362,13 @@ def test_add_and_update_pass_runtime_controls_and_protect_other_groups(
         tab.run_all_updates()
         configs = [configuration("first"), configuration("second")]
         tab._saved_config.assert_not_called()
+    assert not tab.add_button.isEnabled()
+    assert not tab.actions_button.isEnabled()
+    assert not tab.import_table.isEnabled()
+    assert not tab.table_button.isEnabled()
+    assert not tab.output_crs_input.isEnabled()
+    assert tab.cancel_button.isEnabled()
+    wait_for_operation(tab)
     assert [call.args[0] for call in importer.call_args_list] == [
         json.loads(text) for _, text in configs
     ]
@@ -357,9 +388,10 @@ def test_add_and_update_pass_runtime_controls_and_protect_other_groups(
 @pytest.mark.parametrize("crs", ["invalid", "EPSG:4326"])
 def test_invalid_or_mismatched_crs_cannot_write(tab, database, monkeypatch, crs):
     importer = Mock()
-    monkeypatch.setattr(module, "import_local_images", importer)
+    monkeypatch.setattr(tasks, "import_local_images", importer)
     tab.output_crs_input.setText(crs)
     tab.run_all_updates()
+    wait_for_operation(tab)
     importer.assert_not_called()
     database.upsert_images.assert_not_called()
     assert "CRS" in tab._show_message.call_args.args[0]
@@ -387,8 +419,105 @@ def test_missing_files_are_reported_separately_from_already_imported_files(
     tab, database, monkeypatch, error, message
 ):
     monkeypatch.setattr(
-        module, "import_local_images", Mock(side_effect=ValueError(error))
+        tasks, "import_local_images", Mock(side_effect=ValueError(error))
     )
     tab._run_updates([configuration("photos")], skip_existing=True, add_only=True)
+    wait_for_operation(tab)
     assert message in tab._show_message.call_args.args[0]
     database.upsert_images.assert_not_called()
+
+
+def wait_until(condition):
+    loop = QtCore.QEventLoop()
+    timer = QtCore.QTimer()
+    timer.timeout.connect(lambda: loop.quit() if condition() else None)
+    timer.start(5)
+    QtCore.QTimer.singleShot(5000, loop.quit)
+    if not condition():
+        loop.exec_()
+    timer.stop()
+    assert condition(), "Timed out waiting for background task"
+
+
+@pytest.mark.parametrize("operation", ["update", "drop_old", "sync"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_glob_work_keeps_qt_responsive_and_cancellation_stops_writes(
+    tab, database, monkeypatch, operation, cancel
+):
+    import threading
+    from pathlib import Path
+
+    main_thread = threading.get_ident()
+    entered = threading.Event()
+    release = threading.Event()
+    threads = []
+    paths = [Path("scene.jpg")]
+
+    def discover(*args, **kwargs):
+        threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(5)
+        return paths
+
+    def load(config, **kwargs):
+        if kwargs["discovered_paths"] is None:
+            discover(config["file_glob"])
+        threads.append(threading.get_ident())
+        kwargs["progress_callback"](1, 1)
+        return iter([object()])
+
+    def refresh(db):
+        threads.append(threading.get_ident())
+        return []
+
+    monkeypatch.setattr(tasks, "discover_image_paths", Mock(side_effect=discover))
+    monkeypatch.setattr(tasks, "import_local_images", Mock(side_effect=load))
+    monkeypatch.setattr(tasks, "read_import_groups", refresh)
+    database.remove_unmatched_for_input.return_value = 0
+    tab._start_operation(operation, [configuration("photos")])
+    try:
+        assert tab._import_active
+        wait_until(entered.is_set)
+        ticks = []
+        QtCore.QTimer.singleShot(0, lambda: ticks.append(threading.get_ident()))
+        wait_until(lambda: bool(ticks))
+        assert ticks == [main_thread]
+        assert tab._import_active and not release.is_set()
+        # Starting again must not create a second writer while this task runs.
+        tab._start_operation(operation, [configuration("other")])
+        assert tasks.open_database.call_count == 1
+        if cancel:
+            tab.cancel_button.click()
+            assert tab._cancel_import_event.is_set()
+    finally:
+        release.set()
+        wait_for_operation(tab)
+    assert threads and all(thread != main_thread for thread in threads)
+    database.engine.dispose.assert_called_once()
+    if cancel:
+        database.upsert_images.assert_not_called()
+        database.remove_unmatched_for_input.assert_not_called()
+        assert "cancelled" in tab._show_message.call_args.args[0]
+    else:
+        if operation == "sync":
+            tasks.discover_image_paths.assert_called_once()
+            assert (
+                tasks.import_local_images.call_args.kwargs["discovered_paths"] is paths
+            )
+        assert database.upsert_images.call_count == int(operation != "drop_old")
+
+
+def test_task_cancellation_before_run_never_opens_database(monkeypatch):
+    open_database = Mock()
+    monkeypatch.setattr(tasks, "open_database", open_database)
+    task = tasks.ImportTask(
+        "update",
+        [configuration("photos")],
+        database_url="unused",
+        connect_args={},
+        table_name="images",
+    )
+    task.cancel()
+    assert not task.run()
+    assert isinstance(task.error, tasks.ImportCancelledError)
+    open_database.assert_not_called()

@@ -7,18 +7,14 @@ from urllib.parse import quote_plus
 import psycopg2
 from psycopg2 import sql
 from qgis.PyQt import QtCore, QtWidgets
-from qgis.core import Qgis, QgsCoordinateReferenceSystem
-from sqlalchemy import create_engine
+from qgis.core import Qgis, QgsApplication, QgsCoordinateReferenceSystem
 
 from ..landlensdb import (
-    Postgres,
     calculate_input_sha,
-    import_local_images,
     parse_import_json,
     load_example_import_json,
     normalize_import_json,
 )
-from ..landlensdb.handlers.importer import discover_image_paths
 from ..landlensdb.handlers.db import IMPORT_TABLE_COLUMNS, validate_table
 from ..landlensdb.handlers.local import ImportCancelledError
 from ..shared.connection_utils import (
@@ -31,6 +27,7 @@ from ..shared.import_settings import (
     load_import_parameters,
     save_import_parameters,
 )
+from ..shared.import_task import ImportTask
 from ..shared.metadata_settings import fetch_metadata_tree
 from ..shared.json_editor import ImportGroupJsonDialog, ImportJsonDialog
 
@@ -75,6 +72,9 @@ class ImportTab(QtWidgets.QWidget):
         self._table_valid = False
         self._cancel_import_event = threading.Event()
         self._import_active = False
+        self._task = None
+        self._pending_connection_values = None
+        self.destroyed.connect(self._cancel_import_event.set)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -164,9 +164,13 @@ class ImportTab(QtWidgets.QWidget):
 
     def showEvent(self, event):
         super(ImportTab, self).showEvent(event)
-        self._refresh_table_choices()
+        if not self._import_active:
+            self._refresh_table_choices()
 
     def reload_connection_settings(self, values=None):
+        if self._import_active:
+            self._pending_connection_values = dict(values or load_connection_settings())
+            return
         self.connection_values = dict(values or load_connection_settings())
         self._refresh_table_choices()
 
@@ -537,9 +541,7 @@ class ImportTab(QtWidgets.QWidget):
                 continue
             input_sha = item.data(QtCore.Qt.UserRole)
             json_text = item.data(QtCore.Qt.UserRole + 1)
-            if input_sha and not json_text:
-                json_text = self._fetch_first_import_params(input_sha)
-            if input_sha and json_text:
+            if input_sha:
                 configs.append((input_sha, json_text))
         return configs
 
@@ -561,7 +563,9 @@ class ImportTab(QtWidgets.QWidget):
             return
         self._run_updates([config], skip_existing=True, add_only=True)
 
-    def _run_updates(self, configs, skip_existing, add_only=False):
+    def _start_operation(self, operation, configs, skip_existing=False):
+        if self._import_active:
+            return
         table_name = self.current_table_name()
         if not table_name:
             self._show_message("Choose or create a table first.", Qgis.Critical)
@@ -576,105 +580,88 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message("No import parameters are available.", Qgis.Warning)
             return
         try:
-            output_crs = self._output_crs()
-            db = self._database(table_name, select_table=True)
-            geometry_column = db.selected_table.c.get("geometry")
-            table_srid = (
-                getattr(geometry_column.type, "srid", 0)
-                if geometry_column is not None
-                else 0
-            )
-            if table_srid > 0 and table_srid != output_crs.postgisSrid():
-                raise ValueError(
-                    "Output CRS must match the selected table's geometry SRID ({}).".format(
-                        table_srid
-                    )
-                )
+            crs = self._output_crs() if operation in {"add", "update", "sync"} else None
             self._cancel_import_event.clear()
+            # Snapshot widget values now; the task never accesses any widget.
+            task = ImportTask(
+                operation,
+                configs,
+                database_url=self._build_database_url(),
+                connect_args=self._engine_connect_args(),
+                table_name=table_name,
+                output_crs=(crs.authid() or crs.toWkt()) if crs else None,
+                output_srid=crs.postgisSrid() if crs else None,
+                max_workers=self.thread_count_input.value(),
+                batch_size=self.batch_size_input.value(),
+                on_error=self.on_error_input.currentText(),
+                skip_existing=bool(skip_existing),
+                cancel_event=self._cancel_import_event,
+            )
+            task.progress_updated.connect(
+                self._update_progress, QtCore.Qt.QueuedConnection
+            )
+            task.phase_changed.connect(self._update_phase, QtCore.Qt.QueuedConnection)
+            task.completed.connect(self._operation_finished, QtCore.Qt.QueuedConnection)
+            self._task = task
             self._set_import_active(True)
-            wrote = False
-            for input_sha, json_text in configs:
-                config = parse_import_json(json_text)
-                try:
-                    batches = import_local_images(
-                        config,
-                        output_crs=output_crs.authid() or output_crs.toWkt(),
-                        max_workers=self.thread_count_input.value(),
-                        batch_size=self.batch_size_input.value(),
-                        return_as_yield=True,
-                        progress_callback=self._update_progress,
-                        skip_images_in_postgresql=db,
-                        skip_existing=bool(skip_existing),
-                        on_error=self.on_error_input.currentText(),
-                        cancel_event=self._cancel_import_event,
-                    )
-                    for images in batches:
-                        db.upsert_images(
-                            images,
-                            table_name,
-                            conflict="nothing" if add_only else "update",
-                            input_sha=None if add_only else input_sha,
-                        )
-                        wrote = True
-                except ValueError as exc:
-                    if skip_existing and "No new files match" in str(exc):
-                        continue
-                    raise
-            if not wrote:
-                self._show_message("No new images were found.", Qgis.Info)
-            else:
-                self._show_message(
-                    "Import add completed." if add_only else "Import update completed.",
-                    Qgis.Info,
-                )
-        except ImportCancelledError:
-            self._show_message("Import cancelled.", Qgis.Warning)
+            self._update_phase("Starting…")
+            QgsApplication.taskManager().addTask(task)
         except Exception as exc:
-            self._show_message("Import failed: {}".format(exc), Qgis.Critical)
-        finally:
+            self._task = None
             self._set_import_active(False)
-            self.refresh_table()
+            self._show_message("Import failed: {}".format(exc), Qgis.Critical)
+
+    def _operation_finished(self, result, error):
+        self._task = None
+        if result is not None and "records" in result:
+            self.load_records(result["records"])
+        self._set_import_active(False)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1 if error is None else 0)
+        self.progress_bar.setFormat(
+            "Cancelled"
+            if isinstance(error, ImportCancelledError)
+            else "Failed" if error else "Completed"
+        )
+        if isinstance(error, ImportCancelledError):
+            self._show_message("Import cancelled.", Qgis.Warning)
+        elif error is not None:
+            self._show_message("Import failed: {}".format(error), Qgis.Critical)
+        elif result["operation"] in {"drop_old", "drop_all"}:
+            self._show_message(
+                "Removed {} row(s).".format(result["deleted"]), Qgis.Info
+            )
+        elif not result["wrote"] and result["operation"] != "sync":
+            self._show_message("No new images were found.", Qgis.Info)
+        else:
+            self._show_message(
+                "Import {} completed.".format(result["operation"]), Qgis.Info
+            )
+        if self._pending_connection_values is not None:
+            values = self._pending_connection_values
+            self._pending_connection_values = None
+            self.reload_connection_settings(values)
+
+    def _run_updates(self, configs, skip_existing, add_only=False):
+        self._start_operation("add" if add_only else "update", configs, skip_existing)
 
     def _run_drop_old(self, configs):
-        deleted = 0
-        db = self._database(self.current_table_name(), True)
-        for input_sha, json_text in configs:
-            parameters = parse_import_json(json_text)
-            paths = discover_image_paths(parameters["file_glob"])
-            deleted += db.remove_unmatched_for_input(input_sha, paths)
-        return deleted
+        self._start_operation("drop_old", configs)
 
     def _run_drop_all(self, configs):
-        db = self._database(self.current_table_name(), True)
-        return sum(db.remove_all_for_input(input_sha) for input_sha, _json in configs)
+        self._start_operation("drop_all", configs)
 
     def run_all_updates(self, skip_existing=False):
         self._run_updates(self._row_configs(), skip_existing)
 
     def run_row_updates(self, input_sha, json_text, skip_existing=False):
-        if not json_text:
-            json_text = self._fetch_first_import_params(input_sha)
         self._run_updates([(input_sha, json_text)], skip_existing)
 
     def run_all_drop_old(self):
-        try:
-            deleted = self._run_drop_old(self._row_configs())
-        except Exception as exc:
-            self._show_message("Drop Old failed: {}".format(exc), Qgis.Critical)
-            return
-        self._show_message("Removed {} stale row(s).".format(deleted), Qgis.Info)
-        self.refresh_table()
+        self._run_drop_old(self._row_configs())
 
     def run_row_drop_old(self, input_sha, json_text):
-        try:
-            if not json_text:
-                json_text = self._fetch_first_import_params(input_sha)
-            deleted = self._run_drop_old([(input_sha, json_text)])
-        except Exception as exc:
-            self._show_message("Drop Old failed: {}".format(exc), Qgis.Critical)
-            return
-        self._show_message("Removed {} stale row(s).".format(deleted), Qgis.Info)
-        self.refresh_table()
+        self._run_drop_old([(input_sha, json_text)])
 
     def run_all_drop_all(self):
         configs = self._row_configs()
@@ -684,51 +671,24 @@ class ImportTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.question(
                 self, "Drop All Imports", "Delete every imported row in this table?"
             )
-            != QtWidgets.QMessageBox.Yes
+            == QtWidgets.QMessageBox.Yes
         ):
-            return
-        try:
-            deleted = self._run_drop_all(configs)
-        except Exception as exc:
-            self._show_message("Drop All failed: {}".format(exc), Qgis.Critical)
-            return
-        self._show_message("Removed {} row(s).".format(deleted), Qgis.Info)
-        self.refresh_table()
+            self._run_drop_all(configs)
 
     def run_row_drop_all(self, input_sha, json_text):
         if (
             QtWidgets.QMessageBox.question(
                 self, "Drop Import Group", "Delete every row in this import group?"
             )
-            != QtWidgets.QMessageBox.Yes
+            == QtWidgets.QMessageBox.Yes
         ):
-            return
-        try:
-            deleted = self._run_drop_all([(input_sha, json_text)])
-        except Exception as exc:
-            self._show_message("Drop All failed: {}".format(exc), Qgis.Critical)
-            return
-        self._show_message("Removed {} row(s).".format(deleted), Qgis.Info)
-        self.refresh_table()
+            self._run_drop_all([(input_sha, json_text)])
 
     def run_all_sync(self):
-        configs = self._row_configs()
-        try:
-            self._run_drop_old(configs)
-        except Exception as exc:
-            self._show_message("Sync failed: {}".format(exc), Qgis.Critical)
-            return
-        self._run_updates(configs, False)
+        self._start_operation("sync", self._row_configs())
 
     def run_row_sync(self, input_sha, json_text):
-        if not json_text:
-            json_text = self._fetch_first_import_params(input_sha)
-        try:
-            self._run_drop_old([(input_sha, json_text)])
-        except Exception as exc:
-            self._show_message("Sync failed: {}".format(exc), Qgis.Critical)
-            return
-        self._run_updates([(input_sha, json_text)], False)
+        self._start_operation("sync", [(input_sha, json_text)])
 
     def fetch_metadata(self, input_sha):
         """Fetch one metadata row per input SHA and save the parameter tree."""
@@ -753,15 +713,6 @@ class ImportTab(QtWidgets.QWidget):
             return
         self._show_message("Metadata structure fetched.", Qgis.Info)
         return tree
-
-    def _database(self, table_name, select_table=False):
-        db = Postgres(self._build_database_url())
-        db.engine = create_engine(
-            self._build_database_url(), connect_args=self._engine_connect_args()
-        )
-        if select_table:
-            db.table(table_name)
-        return db
 
     def _build_database_url(self):
         values = self.connection_values
@@ -820,14 +771,19 @@ class ImportTab(QtWidgets.QWidget):
     def _cancel_active_import(self):
         if self._import_active:
             self._cancel_import_event.set()
+            if self._task is not None:
+                self._task.cancel()
+            self.cancel_button.setEnabled(False)
+            self._update_phase("Cancelling…")
+
+    def _update_phase(self, phase):
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat(phase)
 
     def _update_progress(self, processed, total):
         self.progress_bar.setRange(0, max(total, 1))
         self.progress_bar.setValue(processed)
         self.progress_bar.setFormat("{}/{}".format(processed, total))
-        application = QtWidgets.QApplication.instance()
-        if application is not None:
-            application.processEvents()
 
     def _show_message(self, message, level):
         if self.iface is not None:

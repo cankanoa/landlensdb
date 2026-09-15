@@ -2,10 +2,14 @@
 
 ## Path lookup
 
-Use `sidecar_path` relative to each discovered image's directory. The only
-placeholder is `{base}`, the image filename without its final extension.
+Use `metadata.sidecar_path` or `thumbnail.sidecar_path` relative to each discovered image's directory. The only
+placeholder is `{base}`, the image filename without its final extension. Paths
+must start with `./` or `../`; bare filenames and unprefixed subfolders are rejected.
+Use forward slashes for this required prefix on all platforms.
 Examples: `./{base}.json`, `./metadata.yaml`, `../metadata/{base}.json`, and
-`../../{base}.IMD`. The WorldView template uses `./{base}.IMD`.
+`../../{base}.IMD`. The WorldView template uses `./{base}.IMD` for metadata
+and `./{base}-BROWSE.JPG` for browse thumbnails. The metadata path is a reserved
+control, excluded from stored metadata.
 
 Each lookup substitutes `{base}`, joins the path, and performs one `is_file()`
 check. Only a present regular file is opened and parsed. There is no glob,
@@ -19,8 +23,10 @@ invalid sidecar contents follow the configured `on_error` policy.
 
 Validation is cached by template in a bounded cache. File existence and parsed
 contents are checked afresh, so edits and newly created sidecars are visible.
-The old `sidecar_glob` option reports a migration error with a `sidecar_path`
-example.
+The old top-level `sidecar_glob` and `sidecar_path` options report a migration
+error pointing to `metadata.sidecar_path`. Thumbnail mode `"sidecar"` uses
+the same lookup and resizes the browse image without loading the source. Missing
+browse files produce a null thumbnail; there is no source-image fallback.
 
 ## Other work removed from the import loop
 
@@ -37,9 +43,28 @@ example.
 Image discovery still uses `file_glob`. Enabled thumbnails still require image
 processing; robust fingerprints still read the complete file. These operations
 can dominate total import time for large imagery. Disable thumbnails and
-fingerprints for imports that need only metadata and footprints. Large imports
-also retain discovered paths and submitted batches in memory; this audit does
-not change their scheduling or output buffering.
+fingerprints for imports that need only metadata and footprints. Discovered paths are retained in memory, but only one batch per worker is queued.
+Completed futures are released as batches are consumed. Sync shares its discovered
+paths with the importer, avoiding a second glob pass.
+
+## QGIS responsiveness
+
+The former plugin ran discovery, waits for image batches, database writes, and
+result refreshes on the UI thread. Its image-level thread pool did not protect
+those phases, and calling `processEvents()` only at progress updates left QGIS
+unresponsive between updates.
+
+Add, Update, Drop Old, Drop All, and Sync now run as `QgsTask` background jobs.
+The task receives a snapshot of settings, creates and disposes its own database
+engine, and fetches refreshed import groups before completing. Qt signals deliver
+progress, status, errors, and final records to the widgets on the main thread.
+The task never accesses widgets. This follows the [QGIS task threading rules](https://docs.qgis.org/3.40/en/docs/pyqgis_developer_cookbook/tasks.html).
+
+Cancellation is checked before discovery, between glob matches, between images
+and batches, and before database mutations. Queued batches are canceled on exit.
+An in-progress filesystem call, a glob traversal before its next match, a GDAL
+operation, or a database statement must return before cancellation can take effect.
+Already committed batches are retained and reflected in the table after canceling.
 
 ## Local measurement
 
@@ -78,3 +103,48 @@ python -m pytest tests --ignore=tests/test_tutorial_core.py
 
 The excluded tutorial module also contains live PostgreSQL, Mapillary, and road
 network integration examples that need their external services.
+
+## Validation of background imports and thumbnail modes
+
+- 205 offline library tests pass, including required `./` and `../` prefixes,
+  real source/browse thumbnail reads, sidecar metadata selection, bounded batch
+  scheduling, and cancellation.
+- 45 QGIS action/editor tests pass using the real Qt event loop and QgsTask
+  manager with mocked database I/O. A blocked discovery test verifies that Qt
+  timers still fire and cancellation prevents subsequent writes.
+- The QGIS UI test runner replaces the unused timezone constructor because its
+  optional H3 wheel cannot load into the local signed QGIS Python executable.
+  Timezone behavior is covered by the separate unmocked library tests.
+- Live database and remote-service integration tests were not run.
+
+## Further import speed opportunities
+
+The following settings are available now:
+
+- Use browse-sidecar thumbnails for WorldView products, or disable thumbnails
+  when they are not needed. Keep fingerprints disabled unless content-based
+  duplicate detection is needed: robust fingerprinting reads the whole source.
+- Use Add/Update New to filter existing paths before image processing. Limit
+  `file_glob` to the relevant directory and avoid recursive matching when the
+  images are directly in that directory.
+- If lower-quality previews are acceptable, reduce thumbnail dimensions and
+  use `nearest` resampling. Nearest selects a source pixel instead of combining
+  multiple pixels; see [GDAL's resampling options](https://gdal.org/en/stable/programs/gdal_translate.html).
+- Measure a representative subset with different worker counts. Workers affect
+  image processing, while database writes remain sequential; additional workers
+  cannot remove the database bottleneck.
+
+Code inspection and an instrumented run identified these next implementation
+opportunities. They are findings, not changes included in the path-prefix update:
+
+| Opportunity | Observed current behavior | Expected benefit |
+| --- | --- | --- |
+| Bulk database upserts and thumbnail updates | A mocked 100-row batch performs 100 write executions without thumbnails, or 200 with thumbnails, plus one table reflection request. Fingerprints were disabled and all rows inserted successfully. | Fewer database round trips, especially for a remote database. |
+| Reuse table metadata across batches | `upsert_images()` requests table reflection on every call. | Fewer schema queries per import. Schema changes would need explicit invalidation. |
+| Share the source GDAL dataset | A real raster import requiring raster metadata and a source thumbnail opened the same image twice. | Avoid reopening the source and rereading its metadata. Browse-sidecar thumbnails already avoid the source thumbnail read. |
+
+The write counts were measured using mocked database I/O, so they are operation
+counts rather than database timing results. Bulk upserts must preserve the
+existing input-group and conflict rules. For large initial loads, a staging
+`COPY` followed by a scoped merge is another option; PostgreSQL documents why
+[COPY is more efficient for bulk loading](https://www.postgresql.org/docs/current/populate.html).

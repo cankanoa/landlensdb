@@ -8,7 +8,7 @@ import math
 import sys
 import threading
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
@@ -22,6 +22,7 @@ from wcmatch import glob as wcglob
 
 from ..geoclasses.geoimageframe import GeoImageFrame
 from ..import_config import (
+    DEFAULT_THUMBNAIL_SIDECAR_PATH,
     GEOMETRY_CORNERS,
     normalize_import_json,
     validate_import_config,
@@ -80,12 +81,25 @@ def _escape_glob_separators(pattern: str) -> str:
     return pattern.replace("\\", "\\\\") if sys.platform == "win32" else pattern
 
 
-def discover_image_paths(file_glob: str) -> list[Path]:
+def _check_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise ImportCancelledError("Image import cancelled.")
+
+
+def discover_image_paths(file_glob: str, *, cancel_event=None) -> list[Path]:
     """Return unique files from one full-path wcmatch pattern."""
     if not isinstance(file_glob, str) or not file_glob.strip():
         raise ValueError("`file_glob` must be a non-empty string.")
-    matches = wcglob.glob(_escape_glob_separators(file_glob), flags=WCMATCH_FLAGS)
-    return sorted({Path(match).resolve() for match in matches if Path(match).is_file()})
+    _check_cancelled(cancel_event)
+    matches = wcglob.iglob(_escape_glob_separators(file_glob), flags=WCMATCH_FLAGS)
+    paths = set()
+    for match in matches:
+        _check_cancelled(cancel_event)
+        path = Path(match)
+        if path.is_file():
+            paths.add(path.resolve())
+    _check_cancelled(cancel_event)
+    return sorted(paths)
 
 
 def _load_json_sidecar(path: Path) -> Any:
@@ -181,15 +195,23 @@ SIDECAR_LOADERS = {
 }
 
 
-def resolve_sidecar(image_path: Path, relative_path: str | None) -> dict[str, Any]:
-    """Load an exact relative path, leaving metadata empty when the file is absent."""
-    if relative_path is None:
-        return {}
+def find_sidecar_path(image_path: Path, relative_path: str) -> Path | None:
+    """Check one relative file, shared by metadata and thumbnail sidecars."""
     validate_sidecar_path(relative_path)
     sidecar_path = image_path.parent / relative_path.replace("{base}", image_path.stem)
     # One stat, no directory listing or realpath walk. The OS resolves ./ and ../,
     # including their correct meaning when a directory is a symlink.
     if not sidecar_path.is_file():
+        return None
+    return sidecar_path
+
+
+def resolve_sidecar(image_path: Path, relative_path: str | None) -> dict[str, Any]:
+    """Load an exact relative path, leaving metadata empty when the file is absent."""
+    if relative_path is None:
+        return {}
+    sidecar_path = find_sidecar_path(image_path, relative_path)
+    if sidecar_path is None:
         return {}
     suffix = sidecar_path.suffix.lower()
     loader = SIDECAR_LOADERS.get(suffix)
@@ -475,8 +497,11 @@ def _metadata_requirements(config: Mapping[str, Any]) -> set[str]:
                 }:
                     sources.add("file_stat")
 
-    for key in ("name", "image_url", "geometry", "metadata"):
+    for key in ("name", "image_url", "geometry"):
         visit(config.get(key))
+    for key, value in config.get("metadata", {}).items():
+        if key != "sidecar_path":
+            visit(value)
     if config["geometry"] == "point_from_exif":
         sources.add("exif")
     elif config["geometry"] == "bounds_from_image":
@@ -487,7 +512,8 @@ def _metadata_requirements(config: Mapping[str, Any]) -> set[str]:
 def _load_image_record(
     image_path, config, *, sources, output_crs, input_sha, import_params
 ):
-    sidecar = resolve_sidecar(image_path, config.get("sidecar_path"))
+    metadata_config = config.get("metadata", {})
+    sidecar = resolve_sidecar(image_path, metadata_config.get("sidecar_path"))
     exif = {}
     if "exif" in sources:
         try:
@@ -531,9 +557,16 @@ def _load_image_record(
 
     thumbnail_config = config.get("thumbnail", {})
     thumbnail = None
-    if thumbnail_config.get("enabled", True):
-        thumbnail = _create_thumbnail_dataset(
+    thumbnail_mode = thumbnail_config.get("enabled", "source")
+    thumbnail_path = image_path
+    if thumbnail_mode == "sidecar":
+        thumbnail_path = find_sidecar_path(
             image_path,
+            thumbnail_config.get("sidecar_path", DEFAULT_THUMBNAIL_SIDECAR_PATH),
+        )
+    if thumbnail_mode and thumbnail_path is not None:
+        thumbnail = _create_thumbnail_dataset(
+            thumbnail_path,
             size=(
                 thumbnail_config.get("width", 256),
                 thumbnail_config.get("height", 256),
@@ -545,7 +578,14 @@ def _load_image_record(
         "name": str(values["name"]),
         "image_url": str(values["image_url"]),
         "geometry": geometry,
-        "metadata": build_metadata(config.get("metadata", {}), **contexts),
+        "metadata": build_metadata(
+            {
+                key: value
+                for key, value in metadata_config.items()
+                if key != "sidecar_path"
+            },
+            **contexts,
+        ),
         "thumbnail": thumbnail,
         "fingerprint": calculate_file_fingerprint(
             image_path,
@@ -580,8 +620,13 @@ def import_local_images(
     skip_existing: bool = True,
     on_error: Literal["skip", "warn", "error"] = "skip",
     cancel_event: threading.Event | None = None,
+    discovered_paths: list[Path] | None = None,
 ):
-    """Import images from a parsed JSON config with separate runtime controls."""
+    """Import images from a parsed JSON config with separate runtime controls.
+
+    ``discovered_paths`` reuses files already found with this config's file glob
+    (for example, by Sync) without traversing the directories again.
+    """
     if max_workers < 1 or batch_size < 1:
         raise ValueError("`max_workers` and `batch_size` must be positive integers.")
     if on_error not in {"skip", "warn", "error"}:
@@ -590,72 +635,87 @@ def import_local_images(
     import_params = normalize_import_json(config)
     input_sha = hashlib.sha256(import_params.encode("utf-8")).hexdigest()
     sources = _metadata_requirements(config)
-    paths = discover_image_paths(config["file_glob"])
+    _check_cancelled(cancel_event)
+    paths = (
+        discover_image_paths(config["file_glob"], cancel_event=cancel_event)
+        if discovered_paths is None
+        else list(discovered_paths)
+    )
     if not paths:
         raise ValueError("No files match `file_glob`: {}".format(config["file_glob"]))
     if skip_existing and skip_images_in_postgresql is not None:
+        _check_cancelled(cancel_event)
         paths = [
             Path(path) for path in skip_images_in_postgresql.filter_existing_rows(paths)
         ]
     if not paths:
         raise ValueError("No new files match `file_glob`.")
+    _check_cancelled(cancel_event)
 
     def batches():
         processed = 0
         total = len(paths)
+        stop_event = threading.Event()
+        _check_cancelled(cancel_event)
         if progress_callback:
             progress_callback(0, total)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
 
-            def load_batch(batch):
-                records = []
-                for path in batch:
-                    try:
-                        record = _load_image_record(
-                            path,
-                            config,
-                            sources=sources,
-                            output_crs=output_crs,
-                            input_sha=input_sha,
-                            import_params=import_params,
-                        )
-                    except Exception as exc:
-                        if on_error == "error":
-                            raise
-                        if on_error == "warn":
-                            warnings.warn(
-                                "Skipped {}: {}".format(path, exc),
-                                stacklevel=2,
-                            )
-                        continue
-                    if record is not None:
-                        records.append(record)
-                return records
-
-            futures = {
-                executor.submit(load_batch, batch): batch
-                for batch in _chunked(paths, batch_size)
-            }
-            for future in as_completed(futures):
-                if cancel_event is not None and cancel_event.is_set():
-                    for pending in futures:
-                        pending.cancel()
-                    raise ImportCancelledError("Image import cancelled.")
-                batch = futures[future]
+        def load_batch(batch):
+            records = []
+            for path in batch:
+                _check_cancelled(cancel_event)
+                _check_cancelled(stop_event)
                 try:
-                    records = [
-                        record for record in future.result() if record is not None
-                    ]
+                    record = _load_image_record(
+                        path,
+                        config,
+                        sources=sources,
+                        output_crs=output_crs,
+                        input_sha=input_sha,
+                        import_params=import_params,
+                    )
+                except ImportCancelledError:
+                    raise
                 except Exception as exc:
                     if on_error == "error":
                         raise
-                    warnings.warn("Skipped import batch: {}".format(exc), stacklevel=2)
-                    records = []
-                processed += len(batch)
-                if progress_callback:
-                    progress_callback(processed, total)
-                if records:
-                    yield _frame(records, output_crs)
+                    if on_error == "warn":
+                        warnings.warn("Skipped {}: {}".format(path, exc), stacklevel=2)
+                    continue
+                if record is not None:
+                    records.append(record)
+            return records
+
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        remaining = iter(_chunked(paths, batch_size))
+        futures = {}
+
+        def submit_next():
+            batch = next(remaining, None)
+            if batch is not None:
+                futures[executor.submit(load_batch, batch)] = len(batch)
+
+        try:
+            # Keep only one batch per worker queued, and release completed batches.
+            for _ in range(max_workers):
+                submit_next()
+            while futures:
+                _check_cancelled(cancel_event)
+                done, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in done:
+                    _check_cancelled(cancel_event)
+                    batch_count = futures.pop(future)
+                    records = future.result()
+                    processed += batch_count
+                    if progress_callback:
+                        progress_callback(processed, total)
+                    if records:
+                        yield _frame(records, output_crs)
+                    _check_cancelled(cancel_event)
+                    submit_next()
+        finally:
+            stop_event.set()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     if return_as_yield:
         return batches()
