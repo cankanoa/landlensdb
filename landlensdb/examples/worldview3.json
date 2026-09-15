@@ -1,6 +1,6 @@
 {
   "file_glob": "/path/to/worldview3/**/*.@(til|TIL)",
-  "sidecar_glob": "{parent}/{base}.@(imd|IMD)",
+  "sidecar_path": "./{base}.IMD",
   "name": "file.name",
   "image_url": "file.path",
   "geometry": {

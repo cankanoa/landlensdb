@@ -21,7 +21,8 @@ class OverviewTab(QtWidgets.QWidget):
         content = QtWidgets.QTextBrowser(self)
         content.setOpenExternalLinks(True)
         content.setReadOnly(True)
-        content.setHtml("""
+        content.setHtml(
+            """
             <p>Landlensdb is a geospatial image workflow for storing image records, thumbnails, footprints, and metadata in PostgreSQL/PostGIS and then working with them directly in QGIS. It is useful for organizing local and remote imagery, keeping metadata queryable, and turning SQL results into QGIS layers without manual export steps.</p>
 
             <h3>Setup</h3>
@@ -33,7 +34,7 @@ class OverviewTab(QtWidgets.QWidget):
             <p><b>Add</b> imports new images using the saved <b>Import Parameters</b> and leaves existing images unchanged. <b>Actions</b> beside <b>Refresh</b> applies to every import group in the chosen table. Each row's <b>Actions</b> applies only to that group. Use these menus to update images, remove old or all rows, sync, or fetch metadata structure. <b>Update New</b> skips existing image paths.</p>
 
             <h3>Additional Metadata</h3>
-            <p>An optional sidecar glob must resolve exactly one supported file per image when configured. JSON, GeoJSON, YAML, and WorldView IMD files are converted to a JSON-like mapping before metadata expressions are evaluated. Metadata values can reference EXIF, raster, sidecar, file, geometry, or automatic EXIF time parsing. Other values are stored literally.</p>
+            <p>An optional <code>sidecar_path</code> names one file relative to each image's directory: <code>./{base}.json</code> is adjacent, <code>./metadata.json</code> uses a fixed name, and <code>../{base}.json</code> goes up one directory. Only <code>{base}</code> (the image filename without its final extension) is substituted; globs and other placeholders are unsupported. The WorldView template uses <code>./{base}.IMD</code>; filename case follows the filesystem. Missing sidecars leave sidecar metadata empty and the image import continues. JSON, GeoJSON, YAML, and WorldView IMD files are converted to a JSON-like mapping before metadata expressions are evaluated. Metadata values can reference EXIF, raster, sidecar, file, geometry, or automatic EXIF time parsing. Only required image metadata is read. Other values are stored literally.</p>
 
             <h3>Query</h3>
             <p>Use <b>Query</b> to preview SQL results and build spatial and metadata expressions. The query text is the source for previewing, viewing, grouping, and metadata copy actions.</p>
@@ -42,5 +43,6 @@ class OverviewTab(QtWidgets.QWidget):
 
             <h3>View And Copy</h3>
             <p>Query results can be viewed in QGIS as geometry and, where available, thumbnails. The <b>View</b> tab can display multiple selected Landlensdb images in a zoomable grid, switch between preview and path sources, navigate through the selected layer by an organized metadata field, and optionally rotate images to north-up. Staged metadata fields can also be copied from the current query into CSV output for the matching rows. If the query is grouped, each group is separated by a heading line before its CSV block, using a format like <code>Year=2024.Month=05</code> based on the grouping columns and values.</p>
-            """)
+            """
+        )
         layout.addWidget(content, 1)

@@ -4,13 +4,37 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from functools import lru_cache
+from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping
 
 IMPORT_TEMPLATE_DIRECTORY = Path(__file__).with_name("examples")
 REQUIRED_FIELDS = ("file_glob", "name", "image_url", "geometry")
 GEOMETRY_MODES = {"point_from_exif", "bounds_from_image"}
 GEOMETRY_CORNERS = ("upper_left", "upper_right", "lower_right", "lower_left")
+
+
+def validate_sidecar_path(value: str) -> None:
+    """Accept a relative filename with only the optional ``{base}`` token."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("`sidecar_path` must be a non-empty string.")
+    _validate_sidecar_path(value)
+
+
+@lru_cache(maxsize=128)
+def _validate_sidecar_path(value: str) -> None:
+    # Cache validation by template, never by image or file existence.
+    if Path(value).is_absolute() or PureWindowsPath(value).anchor:
+        raise ValueError("`sidecar_path` must be relative to the image's directory.")
+    literal = value.replace("{base}", "")
+    if any(character in literal for character in "{}"):
+        raise ValueError("`sidecar_path` only supports the {base} placeholder.")
+    if any(character in literal for character in "*?[]") or any(
+        token in literal for token in ("@(", "+(", "!(")
+    ):
+        raise ValueError("`sidecar_path` must be a literal path, not a glob.")
+    if "\x00" in value:
+        raise ValueError("`sidecar_path` must not contain a null character.")
 
 
 def load_example_import_json() -> str:
@@ -34,13 +58,18 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(config, Mapping):
         raise ValueError("Import configuration must be a JSON object.")
     allowed = set(REQUIRED_FIELDS) | {
-        "sidecar_glob",
+        "sidecar_path",
         "metadata",
         "thumbnail",
         "fingerprint",
     }
     unknown = set(config) - allowed
     if unknown:
+        if "sidecar_glob" in unknown:
+            raise ValueError(
+                "`sidecar_glob` is no longer supported; use `sidecar_path`, "
+                "for example './{base}.json'."
+            )
         raise ValueError(
             "Unknown import options: {}".format(", ".join(sorted(unknown)))
         )
@@ -75,16 +104,13 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 if (
                     isinstance(value, str)
                     and value.startswith("sidecar.")
-                    and not config.get("sidecar_glob")
+                    and not config.get("sidecar_path")
                 ):
-                    raise ValueError("Sidecar geometry paths require `sidecar_glob`.")
+                    raise ValueError("Sidecar geometry paths require `sidecar_path`.")
     elif not isinstance(geometry, str) or geometry not in GEOMETRY_MODES:
         raise ValueError("Unsupported geometry: {!r}.".format(geometry))
-    if "sidecar_glob" in config and (
-        not isinstance(config["sidecar_glob"], str)
-        or not config["sidecar_glob"].strip()
-    ):
-        raise ValueError("`sidecar_glob` must be a non-empty string.")
+    if "sidecar_path" in config:
+        validate_sidecar_path(config["sidecar_path"])
     for key in ("metadata", "thumbnail", "fingerprint"):
         if key in config and not isinstance(config[key], dict):
             raise ValueError("`{}` must be a JSON object.".format(key))

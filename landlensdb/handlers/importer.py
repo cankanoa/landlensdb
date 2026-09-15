@@ -23,9 +23,9 @@ from wcmatch import glob as wcglob
 from ..geoclasses.geoimageframe import GeoImageFrame
 from ..import_config import (
     GEOMETRY_CORNERS,
-    calculate_input_sha,
     normalize_import_json,
     validate_import_config,
+    validate_sidecar_path,
 )
 from .local import (
     ImportCancelledError,
@@ -61,6 +61,7 @@ def _wcmatch_flags() -> int:
 
 WCMATCH_FLAGS = _wcmatch_flags()
 SUPPORTED_SIDECAR_EXTENSIONS = (".json", ".geojson", ".yaml", ".yml", ".imd")
+_WORKER_LOCAL = threading.local()
 
 WORLDVIEW_BOUND_KEYS = (
     "ULLon",
@@ -180,33 +181,16 @@ SIDECAR_LOADERS = {
 }
 
 
-def resolve_sidecar(image_path: Path, pattern: str | None) -> dict[str, Any]:
-    """Load one explicitly supported sidecar as a JSON-like mapping."""
-    if not pattern:
+def resolve_sidecar(image_path: Path, relative_path: str | None) -> dict[str, Any]:
+    """Load an exact relative path, leaving metadata empty when the file is absent."""
+    if relative_path is None:
         return {}
-    substituted = (
-        _escape_glob_separators(pattern)
-        .replace("{parent}", wcglob.escape(str(image_path.parent)))
-        .replace("{base}", wcglob.escape(image_path.stem))
-    )
-    matches = wcglob.glob(substituted, flags=WCMATCH_FLAGS)
-    paths = sorted(
-        {Path(match).resolve() for match in matches if Path(match).is_file()}
-    )
-    if len(paths) != 1:
-        if not paths:
-            raise ValueError(
-                "`sidecar_glob` matched no file for {} using {!r}.".format(
-                    image_path, substituted
-                )
-            )
-        raise ValueError(
-            "`sidecar_glob` matched more than one file for {}: {}".format(
-                image_path,
-                ", ".join(str(path) for path in paths),
-            )
-        )
-    sidecar_path = paths[0]
+    validate_sidecar_path(relative_path)
+    sidecar_path = image_path.parent / relative_path.replace("{base}", image_path.stem)
+    # One stat, no directory listing or realpath walk. The OS resolves ./ and ../,
+    # including their correct meaning when a directory is a symlink.
+    if not sidecar_path.is_file():
+        return {}
     suffix = sidecar_path.suffix.lower()
     loader = SIDECAR_LOADERS.get(suffix)
     if loader is None:
@@ -216,7 +200,11 @@ def resolve_sidecar(image_path: Path, pattern: str | None) -> dict[str, Any]:
                 ", ".join(SUPPORTED_SIDECAR_EXTENSIONS),
             )
         )
-    value = loader(sidecar_path)
+    try:
+        value = loader(sidecar_path)
+    except FileNotFoundError:
+        # The file can disappear between the existence check and open.
+        return {}
     if value is None:
         return {}
     if not isinstance(value, dict):
@@ -240,17 +228,21 @@ def _lookup(mapping: Mapping[str, Any], path: str) -> Any:
     return value
 
 
-def _file_values(path: Path) -> dict[str, Any]:
-    stat = path.stat()
-    return {
+def _file_values(path: Path, *, include_stat: bool = True) -> dict[str, Any]:
+    values = {
         "path": str(path),
         "name": path.name,
         "stem": path.stem,
         "suffix": path.suffix.lower(),
-        "size": stat.st_size,
-        "created_at": datetime.fromtimestamp(stat.st_ctime).astimezone().isoformat(),
-        "modified_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(),
     }
+    if include_stat:
+        stat = path.stat()
+        values.update(
+            size=stat.st_size,
+            created_at=datetime.fromtimestamp(stat.st_ctime).astimezone().isoformat(),
+            modified_at=datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(),
+        )
+    return values
 
 
 def _geometry_values(geometry: Point | Polygon | None) -> dict[str, Any]:
@@ -286,7 +278,10 @@ def _parse_exif_time(value: Any, geometry: Point | Polygon | None) -> str | None
     if geometry is None:
         return parsed.isoformat()
     point = geometry if isinstance(geometry, Point) else geometry.centroid
-    timezone_name = TimezoneFinder().timezone_at(lat=point.y, lng=point.x)
+    finder = getattr(_WORKER_LOCAL, "timezone_finder", None)
+    if finder is None:
+        finder = _WORKER_LOCAL.timezone_finder = TimezoneFinder()
+    timezone_name = finder.timezone_at(lat=point.y, lng=point.x)
     if not timezone_name:
         return parsed.isoformat()
     return pytz.timezone(timezone_name).localize(parsed).isoformat()
@@ -437,12 +432,12 @@ def calculate_file_fingerprint(
     if mode not in {"robust", "quick"}:
         raise ValueError("`fingerprint_mode` must be 'robust' or 'quick'.")
     hasher = hashlib.sha256()
-    file_size = image_path.stat().st_size
     with image_path.open("rb") as handle:
         if mode == "robust":
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 hasher.update(chunk)
         else:
+            file_size = image_path.stat().st_size
             offsets = {
                 0,
                 max(file_size // 2 - sample_size // 2, 0),
@@ -455,18 +450,58 @@ def calculate_file_fingerprint(
     return hasher.hexdigest()
 
 
-def _load_image_record(image_path, config, *, output_crs, input_sha, import_params):
-    try:
-        with Image.open(image_path) as image:
-            exif = _normalize_metadata_value(_get_exif_data(image))
-    except Exception:
-        exif = {}
-    try:
-        raster = _get_raster_metadata(image_path)
-    except Exception:
-        raster = {}
-    sidecar = resolve_sidecar(image_path, config.get("sidecar_glob"))
-    file = _file_values(image_path)
+def _metadata_requirements(config: Mapping[str, Any]) -> set[str]:
+    """Determine image reads once per import, including nested metadata leaves."""
+    sources = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, str):
+            namespace, separator, field = value.partition(".")
+            if separator:
+                if namespace in {"exif", "exif_parse_time_to_timez"}:
+                    sources.add("exif")
+                elif namespace == "raster":
+                    sources.add("raster")
+                elif namespace == "file" and field in {
+                    "size",
+                    "created_at",
+                    "modified_at",
+                }:
+                    sources.add("file_stat")
+
+    for key in ("name", "image_url", "geometry", "metadata"):
+        visit(config.get(key))
+    if config["geometry"] == "point_from_exif":
+        sources.add("exif")
+    elif config["geometry"] == "bounds_from_image":
+        sources.add("raster")
+    return sources
+
+
+def _load_image_record(
+    image_path, config, *, sources, output_crs, input_sha, import_params
+):
+    sidecar = resolve_sidecar(image_path, config.get("sidecar_path"))
+    exif = {}
+    if "exif" in sources:
+        try:
+            with Image.open(image_path) as image:
+                exif = _normalize_metadata_value(_get_exif_data(image))
+        except Exception:
+            pass
+    raster = {}
+    if "raster" in sources:
+        try:
+            raster = _get_raster_metadata(image_path)
+        except Exception:
+            pass
+    file = _file_values(image_path, include_stat="file_stat" in sources)
     geometry = build_geometry(
         config["geometry"],
         exif=exif,
@@ -553,7 +588,8 @@ def import_local_images(
         raise ValueError("`on_error` must be 'skip', 'warn', or 'error'.")
     config = validate_import_config(config)
     import_params = normalize_import_json(config)
-    input_sha = calculate_input_sha(config)
+    input_sha = hashlib.sha256(import_params.encode("utf-8")).hexdigest()
+    sources = _metadata_requirements(config)
     paths = discover_image_paths(config["file_glob"])
     if not paths:
         raise ValueError("No files match `file_glob`: {}".format(config["file_glob"]))
@@ -578,6 +614,7 @@ def import_local_images(
                         record = _load_image_record(
                             path,
                             config,
+                            sources=sources,
                             output_crs=output_crs,
                             input_sha=input_sha,
                             import_params=import_params,

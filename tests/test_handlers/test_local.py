@@ -54,10 +54,10 @@ def test_all_built_in_presets_use_compact_json():
         assert "required" not in value
         assert "default" not in value
     photos = parse_import_json(presets["geotagged_photos.json"])
-    assert photos["file_glob"] == "/path/to/photos/**/*.@(jpg|jpeg|png|JPG|JPEG|PNG)"
+    assert photos["file_glob"] == "/path/to/photos/**/*.@(jpg|JPG|png|PNG|jpeg|JPEG)"
     assert photos["metadata"]["camera"]["model"] == "exif.Model"
     worldview = parse_import_json(presets["worldview3.json"])
-    assert worldview["sidecar_glob"] == "{parent}/{base}.@(imd|IMD)"
+    assert worldview["sidecar_path"] == "./{base}.IMD"
     assert worldview["geometry"] == {
         "upper_left": ["sidecar.bounds.ULLon", "sidecar.bounds.ULLat"],
         "upper_right": ["sidecar.bounds.URLon", "sidecar.bounds.URLat"],
@@ -279,30 +279,22 @@ def test_timestamp_timezone_is_independent_of_output_crs():
     assert metadata["captured_at"] == "2024-01-01T12:00:00-10:00"
 
 
-def test_sidecar_glob_rejects_more_than_one_file(tmp_path):
+def test_sidecar_path_selects_only_the_named_file(tmp_path):
     image = tmp_path / "photo.jpg"
     image.write_bytes(b"image")
     (tmp_path / "photo.yml").write_text("one: 1", encoding="utf-8")
     (tmp_path / "photo.yaml").write_text("two: 2", encoding="utf-8")
 
-    try:
-        resolve_sidecar(image, "{parent}/{base}.@(yml|yaml)")
-    except ValueError as exc:
-        assert "more than one file" in str(exc)
-    else:
-        raise AssertionError("Multiple sidecars should be rejected")
+    assert resolve_sidecar(image, "./{base}.yml") == {"one": 1}
+    assert resolve_sidecar(image, "./{base}.yaml") == {"two": 2}
 
 
-def test_sidecar_glob_requires_one_file_when_configured(tmp_path):
+def test_sidecar_path_returns_empty_metadata_when_configured_file_is_missing(tmp_path):
     image = tmp_path / "photo.jpg"
     image.write_bytes(b"image")
 
-    try:
-        resolve_sidecar(image, "{parent}/{base}.json")
-    except ValueError as exc:
-        assert "matched no file" in str(exc)
-    else:
-        raise AssertionError("A configured sidecar glob must match one file")
+    assert resolve_sidecar(image, "./{base}.json") == {}
+    assert resolve_sidecar(image, None) == {}
 
 
 def test_worldview_imd_sidecar_is_converted_to_json_notation(tmp_path):
@@ -329,7 +321,7 @@ END;
         encoding="utf-8",
     )
 
-    sidecar = resolve_sidecar(image, "{parent}/{base}.imd")
+    sidecar = resolve_sidecar(image, "./{base}.IMD")
 
     assert sidecar["product"]["generationTime"] == "2024-01-01T00:00:00Z"
     assert sidecar["image"]["satId"] == "WV03"
@@ -348,7 +340,7 @@ END;
 def _corner_config():
     return {
         "file_glob": "/path/to/images/*.jpg",
-        "sidecar_glob": "{parent}/{base}.json",
+        "sidecar_path": "./{base}.json",
         "name": "file.name",
         "image_url": "file.path",
         # Intentionally not in ring order: names determine the corner order.
@@ -393,7 +385,7 @@ def test_import_resolves_arbitrary_sidecar_corners_and_preserves_footprint(
     image.with_suffix("." + suffix).write_text(content, encoding="utf-8")
     config = _corner_config()
     config["file_glob"] = str(image)
-    config["sidecar_glob"] = "{parent}/{base}." + suffix
+    config["sidecar_path"] = "./{base}." + suffix
     # Canonical JSON sorts the corner keys; this must not change the footprint.
     config = parse_import_json(normalize_import_json(config))
     images = import_local_images(config, on_error="error")
@@ -409,7 +401,7 @@ def test_import_resolves_arbitrary_sidecar_corners_and_preserves_footprint(
 
 def test_literal_corners_need_no_sidecar_and_use_runtime_output_crs():
     config = _corner_config()
-    del config["sidecar_glob"]
+    del config["sidecar_path"]
     config["geometry"] = {
         "upper_left": [0, 1],
         "upper_right": [1, 1],
@@ -445,10 +437,10 @@ def test_geometry_rejects_malformed_corner_pairs(pair):
         parse_import_json(json.dumps(config))
 
 
-def test_sidecar_corner_paths_require_sidecar_glob():
+def test_sidecar_corner_paths_require_sidecar_path():
     config = _corner_config()
-    del config["sidecar_glob"]
-    with pytest.raises(ValueError, match="sidecar_glob"):
+    del config["sidecar_path"]
+    with pytest.raises(ValueError, match="sidecar_path"):
         parse_import_json(json.dumps(config))
 
 
@@ -492,10 +484,14 @@ def test_crossed_corners_are_rejected():
 
 
 @pytest.mark.parametrize("on_error", ["skip", "warn", "error"])
-def test_missing_corner_values_follow_import_error_policy(tmp_path, on_error):
+@pytest.mark.parametrize("sidecar_exists", [False, True])
+def test_missing_corner_values_follow_import_error_policy(
+    tmp_path, on_error, sidecar_exists
+):
     image = tmp_path / "scene.jpg"
     Image.new("RGB", (2, 2)).save(image)
-    image.with_suffix(".json").write_text("{}")
+    if sidecar_exists:
+        image.with_suffix(".json").write_text("{}")
     config = _corner_config()
     config["file_glob"] = str(image)
     batches = import_local_images(config, on_error=on_error, return_as_yield=True)
@@ -515,7 +511,7 @@ def test_unsupported_sidecar_format_is_rejected(tmp_path):
     (tmp_path / "photo.txt").write_text("not: accepted", encoding="utf-8")
 
     try:
-        resolve_sidecar(image, "{parent}/{base}.txt")
+        resolve_sidecar(image, "./{base}.txt")
     except ValueError as exc:
         assert "supported formats" in str(exc)
         assert ".imd" in str(exc)
