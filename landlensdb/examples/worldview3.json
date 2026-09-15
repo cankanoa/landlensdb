@@ -1,6 +1,5 @@
 {
   "file_glob": "/path/to/worldview3/**/*.@(til|TIL)",
-  "sidecar_path": "./{base}.IMD",
   "name": "file.name",
   "image_url": "file.path",
   "geometry": {
@@ -10,6 +9,7 @@
     "lower_left": ["sidecar.bounds.LLLon", "sidecar.bounds.LLLat"]
   },
   "metadata": {
+    "sidecar_path": "./{base}.IMD",
     "captured_at": "sidecar.image.firstLineTime",
     "platform": {
       "satellite_id": "sidecar.image.satId",
@@ -68,7 +68,8 @@
     }
   },
   "thumbnail": {
-    "enabled": true,
+    "enabled": "sidecar",
+    "sidecar_path": "./{base}-BROWSE.JPG",
     "width": 256,
     "height": 256,
     "resampling": "lanczos"

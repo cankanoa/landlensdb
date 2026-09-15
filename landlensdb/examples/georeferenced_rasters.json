@@ -14,7 +14,7 @@
     }
   },
   "thumbnail": {
-    "enabled": true,
+    "enabled": "source",
     "width": 256,
     "height": 256,
     "resampling": "lanczos"

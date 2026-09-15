@@ -57,7 +57,7 @@ def test_all_built_in_presets_use_compact_json():
     assert photos["file_glob"] == "/path/to/photos/**/*.@(jpg|JPG|png|PNG|jpeg|JPEG)"
     assert photos["metadata"]["camera"]["model"] == "exif.Model"
     worldview = parse_import_json(presets["worldview3.json"])
-    assert worldview["sidecar_path"] == "./{base}.IMD"
+    assert worldview["metadata"]["sidecar_path"] == "./{base}.IMD"
     assert worldview["geometry"] == {
         "upper_left": ["sidecar.bounds.ULLon", "sidecar.bounds.ULLat"],
         "upper_right": ["sidecar.bounds.URLon", "sidecar.bounds.URLat"],
@@ -340,7 +340,6 @@ END;
 def _corner_config():
     return {
         "file_glob": "/path/to/images/*.jpg",
-        "sidecar_path": "./{base}.json",
         "name": "file.name",
         "image_url": "file.path",
         # Intentionally not in ring order: names determine the corner order.
@@ -362,7 +361,10 @@ def _corner_config():
                 "sidecar.product.footprint.1.lat",
             ],
         },
-        "metadata": {"columns": "sidecar.product.numColumns"},
+        "metadata": {
+            "sidecar_path": "./{base}.json",
+            "columns": "sidecar.product.numColumns",
+        },
         "thumbnail": {"enabled": False},
         "fingerprint": {"enabled": False},
     }
@@ -385,7 +387,7 @@ def test_import_resolves_arbitrary_sidecar_corners_and_preserves_footprint(
     image.with_suffix("." + suffix).write_text(content, encoding="utf-8")
     config = _corner_config()
     config["file_glob"] = str(image)
-    config["sidecar_path"] = "./{base}." + suffix
+    config["metadata"]["sidecar_path"] = "./{base}." + suffix
     # Canonical JSON sorts the corner keys; this must not change the footprint.
     config = parse_import_json(normalize_import_json(config))
     images = import_local_images(config, on_error="error")
@@ -401,7 +403,7 @@ def test_import_resolves_arbitrary_sidecar_corners_and_preserves_footprint(
 
 def test_literal_corners_need_no_sidecar_and_use_runtime_output_crs():
     config = _corner_config()
-    del config["sidecar_path"]
+    del config["metadata"]["sidecar_path"]
     config["geometry"] = {
         "upper_left": [0, 1],
         "upper_right": [1, 1],
@@ -439,7 +441,7 @@ def test_geometry_rejects_malformed_corner_pairs(pair):
 
 def test_sidecar_corner_paths_require_sidecar_path():
     config = _corner_config()
-    del config["sidecar_path"]
+    del config["metadata"]["sidecar_path"]
     with pytest.raises(ValueError, match="sidecar_path"):
         parse_import_json(json.dumps(config))
 

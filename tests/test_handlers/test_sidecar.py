@@ -17,7 +17,6 @@ from landlensdb.import_config import validate_import_config
 def config(tmp_path):
     return {
         "file_glob": str(tmp_path / "*.jpg"),
-        "sidecar_path": "./{base}.json",
         "name": "file.name",
         "image_url": "file.path",
         "geometry": {
@@ -26,7 +25,7 @@ def config(tmp_path):
             "lower_right": [1, 0],
             "lower_left": [0, 0],
         },
-        "metadata": {"value": "sidecar.value"},
+        "metadata": {"sidecar_path": "./{base}.json", "value": "sidecar.value"},
         "thumbnail": {"enabled": False},
     }
 
@@ -35,7 +34,6 @@ def config(tmp_path):
     "relative_path, expected",
     [
         ("./{base}.json", "images/nested/photo.v1.json"),
-        ("{base}.json", "images/nested/photo.v1.json"),
         ("./metadata.json", "images/nested/metadata.json"),
         ("../metadata.json", "images/metadata.json"),
         ("../../metadata/{base}.json", "metadata/photo.v1.json"),
@@ -67,7 +65,7 @@ def test_parent_after_symlink_uses_filesystem_semantics(tmp_path):
     (image.parent / "linked").symlink_to(target, target_is_directory=True)
     (target.parent / "metadata.json").write_text('{"value": "correct"}')
     (image.parent / "metadata.json").write_text('{"value": "wrong"}')
-    assert importer.resolve_sidecar(image, "linked/../metadata.json") == {
+    assert importer.resolve_sidecar(image, "./linked/../metadata.json") == {
         "value": "correct"
     }
 
@@ -105,7 +103,7 @@ def test_base_substitution_preserves_literal_special_characters(tmp_path):
 def test_invalid_sidecar_paths_fail_before_discovery(
     config, monkeypatch, value, message
 ):
-    config["sidecar_path"] = value
+    config["metadata"]["sidecar_path"] = value
     discover = Mock(side_effect=AssertionError("must validate before discovery"))
     monkeypatch.setattr(importer, "discover_image_paths", discover)
     with pytest.raises(ValueError, match=message):
@@ -114,9 +112,41 @@ def test_invalid_sidecar_paths_fail_before_discovery(
 
 
 def test_old_sidecar_glob_has_migration_error(config):
-    config["sidecar_glob"] = config.pop("sidecar_path")
+    config["sidecar_glob"] = config["metadata"].pop("sidecar_path")
     with pytest.raises(ValueError, match="sidecar_glob.*sidecar_path"):
         validate_import_config(config)
+
+
+@pytest.mark.parametrize("section", ["metadata", "thumbnail"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "{base}.json",
+        "metadata.json",
+        "metadata/{base}.json",
+        ".",
+        "..",
+        ".hidden/file.json",
+        ".../file.json",
+    ],
+)
+def test_sidecar_paths_require_explicit_relative_prefix(config, section, path):
+    if section == "thumbnail":
+        config[section]["enabled"] = "sidecar"
+    config[section]["sidecar_path"] = path
+    with pytest.raises(ValueError, match="must start with './' or '../'"):
+        validate_import_config(config)
+
+
+@pytest.mark.parametrize("section", ["metadata", "thumbnail"])
+@pytest.mark.parametrize(
+    "path", ["./{base}.json", "../{base}.json", "../../metadata/{base}.json"]
+)
+def test_explicit_relative_prefixes_are_valid(config, section, path):
+    if section == "thumbnail":
+        config[section]["enabled"] = "sidecar"
+    config[section]["sidecar_path"] = path
+    assert validate_import_config(config)[section]["sidecar_path"] == path
 
 
 @pytest.mark.parametrize("state", ["missing", "directory", "present"])
@@ -254,7 +284,7 @@ def test_invalid_present_sidecar_obeys_error_policy(
 def test_empty_present_sidecar_does_not_skip_image(tmp_path, config, suffix, content):
     (tmp_path / "photo.jpg").touch()
     (tmp_path / ("photo." + suffix)).write_text(content)
-    config["sidecar_path"] = "./{base}." + suffix
+    config["metadata"]["sidecar_path"] = "./{base}." + suffix
     images = importer.import_local_images(config, on_error="error")
     assert len(images) == 1
     assert images.iloc[0]["metadata"] == {"value": None}

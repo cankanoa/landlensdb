@@ -12,10 +12,11 @@ IMPORT_TEMPLATE_DIRECTORY = Path(__file__).with_name("examples")
 REQUIRED_FIELDS = ("file_glob", "name", "image_url", "geometry")
 GEOMETRY_MODES = {"point_from_exif", "bounds_from_image"}
 GEOMETRY_CORNERS = ("upper_left", "upper_right", "lower_right", "lower_left")
+DEFAULT_THUMBNAIL_SIDECAR_PATH = "./{base}-BROWSE.JPG"
 
 
 def validate_sidecar_path(value: str) -> None:
-    """Accept a relative filename with only the optional ``{base}`` token."""
+    """Accept a ./ or ../ filename with only the optional ``{base}`` token."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError("`sidecar_path` must be a non-empty string.")
     _validate_sidecar_path(value)
@@ -35,6 +36,11 @@ def _validate_sidecar_path(value: str) -> None:
         raise ValueError("`sidecar_path` must be a literal path, not a glob.")
     if "\x00" in value:
         raise ValueError("`sidecar_path` must not contain a null character.")
+    if not value.startswith(("./", "../")):
+        raise ValueError(
+            "`sidecar_path` must start with './' or '../', "
+            "for example './{base}.json' or '../metadata/{base}.json'."
+        )
 
 
 def load_example_import_json() -> str:
@@ -58,17 +64,16 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(config, Mapping):
         raise ValueError("Import configuration must be a JSON object.")
     allowed = set(REQUIRED_FIELDS) | {
-        "sidecar_path",
         "metadata",
         "thumbnail",
         "fingerprint",
     }
     unknown = set(config) - allowed
     if unknown:
-        if "sidecar_glob" in unknown:
+        if unknown & {"sidecar_glob", "sidecar_path"}:
             raise ValueError(
-                "`sidecar_glob` is no longer supported; use `sidecar_path`, "
-                "for example './{base}.json'."
+                "Top-level `sidecar_glob` and `sidecar_path` are no longer supported; "
+                "use `metadata.sidecar_path`, for example './{base}.json'."
             )
         raise ValueError(
             "Unknown import options: {}".format(", ".join(sorted(unknown)))
@@ -76,6 +81,12 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("file_glob", "name", "image_url"):
         if not isinstance(config.get(key), str) or not config[key].strip():
             raise ValueError("`{}` must be a non-empty string.".format(key))
+    for key in ("metadata", "thumbnail", "fingerprint"):
+        if key in config and not isinstance(config[key], dict):
+            raise ValueError("`{}` must be a JSON object.".format(key))
+    metadata = config.get("metadata", {})
+    if "sidecar_path" in metadata:
+        validate_sidecar_path(metadata["sidecar_path"])
     geometry = config.get("geometry")
     if isinstance(geometry, dict):
         if set(geometry) != set(GEOMETRY_CORNERS):
@@ -104,26 +115,42 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 if (
                     isinstance(value, str)
                     and value.startswith("sidecar.")
-                    and not config.get("sidecar_path")
+                    and not metadata.get("sidecar_path")
                 ):
-                    raise ValueError("Sidecar geometry paths require `sidecar_path`.")
+                    raise ValueError(
+                        "Sidecar geometry paths require `metadata.sidecar_path`."
+                    )
     elif not isinstance(geometry, str) or geometry not in GEOMETRY_MODES:
         raise ValueError("Unsupported geometry: {!r}.".format(geometry))
-    if "sidecar_path" in config:
-        validate_sidecar_path(config["sidecar_path"])
-    for key in ("metadata", "thumbnail", "fingerprint"):
-        if key in config and not isinstance(config[key], dict):
-            raise ValueError("`{}` must be a JSON object.".format(key))
     for key, options in (
-        ("thumbnail", {"enabled", "width", "height", "resampling"}),
+        ("thumbnail", {"enabled", "sidecar_path", "width", "height", "resampling"}),
         ("fingerprint", {"enabled", "mode"}),
     ):
         section = config.get(key, {})
         if set(section) - options:
             raise ValueError("Unknown {} options.".format(key))
-        if "enabled" in section and not isinstance(section["enabled"], bool):
+        if (
+            key == "fingerprint"
+            and "enabled" in section
+            and not isinstance(section["enabled"], bool)
+        ):
             raise ValueError("`{}.enabled` must be a boolean.".format(key))
     thumbnail = config.get("thumbnail", {})
+    mode = thumbnail.get("enabled", "source")
+    if not (
+        isinstance(mode, bool)
+        or isinstance(mode, str)
+        and mode in {"source", "sidecar"}
+    ):
+        raise ValueError(
+            "`thumbnail.enabled` must be 'source', 'sidecar', or false (true also means 'source')."
+        )
+    if "sidecar_path" in thumbnail:
+        validate_sidecar_path(thumbnail["sidecar_path"])
+        if mode != "sidecar":
+            raise ValueError(
+                "`thumbnail.sidecar_path` requires `thumbnail.enabled` to be 'sidecar'."
+            )
     for key in ("width", "height"):
         if key in thumbnail and (type(thumbnail[key]) is not int or thumbnail[key] < 1):
             raise ValueError("`thumbnail.{}` must be a positive integer.".format(key))
