@@ -235,8 +235,7 @@ class ImportTab(QtWidgets.QWidget):
                                 metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
                                 thumbnail raster,
                                 fingerprint text,
-                                input_sha text NOT NULL,
-                                import_params text NOT NULL
+                                input_sha text NOT NULL
                             )"""
                         ).format(
                             sql.Identifier(schema_name),
@@ -313,7 +312,7 @@ class ImportTab(QtWidgets.QWidget):
                     )
                     cursor.execute(
                         sql.SQL(
-                            "SELECT input_sha, COUNT(*), MIN(import_params) "
+                            "SELECT input_sha, COUNT(*), MIN(metadata ->> 'import_params') "
                             "FROM {}.{} WHERE input_sha IS NOT NULL "
                             "GROUP BY input_sha ORDER BY input_sha"
                         ).format(
@@ -422,7 +421,7 @@ class ImportTab(QtWidgets.QWidget):
             with connection.cursor() as cursor:
                 cursor.execute(
                     sql.SQL(
-                        "SELECT import_params FROM {}.{} WHERE input_sha = %s ORDER BY image_url LIMIT 1"
+                        "SELECT metadata ->> 'import_params' FROM {}.{} WHERE input_sha = %s ORDER BY image_url LIMIT 1"
                     ).format(sql.Identifier(schema_name), sql.Identifier(table_name)),
                     (input_sha,),
                 )

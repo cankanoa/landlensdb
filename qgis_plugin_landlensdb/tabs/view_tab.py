@@ -1,5 +1,3 @@
-import math
-
 from qgis.PyQt import QtCore, QtGui, QtWidgets
 from qgis.core import QgsMapLayerType, QgsProject
 
@@ -31,7 +29,7 @@ class ImageCanvas(QtWidgets.QGraphicsView):
         self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
         self.setBackgroundBrush(QtGui.QColor("#111111"))
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.setMinimumSize(280, 220)
+        self.setMinimumSize(0, 220)
 
     def set_pixmap(self, pixmap):
         self._pixmap_item.setPixmap(pixmap)
@@ -98,6 +96,9 @@ class ImageTile(QtWidgets.QFrame):
         layout.setSpacing(6)
 
         self.status_label = QtWidgets.QLabel(self)
+        self.status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred
+        )
         self.status_label.setWordWrap(True)
         self.status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.status_label)
@@ -228,6 +229,7 @@ class ViewTab(QtWidgets.QWidget):
 
         self.scroll_area = ImageScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
         outer_layout.addWidget(self.scroll_area, 1)
 
@@ -788,8 +790,8 @@ class ViewTab(QtWidgets.QWidget):
     def _compute_grid_size(self, image_count):
         if image_count <= 0:
             return 1, 1
-        columns = int(math.ceil(math.sqrt(image_count)))
-        rows = int(math.ceil(float(image_count) / float(columns)))
+        columns = min(4, image_count)
+        rows = (image_count + columns - 1) // columns
         return rows, columns
 
     def _empty_geoimageframe(self):

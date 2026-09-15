@@ -85,6 +85,10 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if key in config and not isinstance(config[key], dict):
             raise ValueError("`{}` must be a JSON object.".format(key))
     metadata = config.get("metadata", {})
+    if "import_params" in metadata:
+        raise ValueError(
+            "`metadata.import_params` is reserved for the stored import configuration."
+        )
     if "sidecar_path" in metadata:
         validate_sidecar_path(metadata["sidecar_path"])
     geometry = config.get("geometry")

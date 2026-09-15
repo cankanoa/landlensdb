@@ -18,7 +18,7 @@ def test_valid_table_can_have_additional_columns():
 def test_all_missing_and_incompatible_columns_are_reported_together():
     columns = dict(IMPORT_TABLE_COLUMNS)
     del columns["input_sha"]
-    del columns["import_params"]
+    del columns["metadata"]
     columns["geometry"] = "text"
     cursor = Mock()
     cursor.fetchall.return_value = list(columns.items())
@@ -26,7 +26,7 @@ def test_all_missing_and_incompatible_columns_are_reported_together():
         validate_table(cursor, "old_images", IMPORT_TABLE_COLUMNS, schema="survey")
     assert "survey.old_images" in str(error.value)
     assert "missing input_sha (text)" in str(error.value)
-    assert "missing import_params (text)" in str(error.value)
+    assert "missing metadata (jsonb)" in str(error.value)
     assert "geometry is text; expected geometry" in str(error.value)
     assert cursor.execute.call_count == 1
     assert cursor.execute.call_args.args[0].startswith("SELECT ")

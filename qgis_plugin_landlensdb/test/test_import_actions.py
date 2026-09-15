@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from geoalchemy2 import Geometry
 from qgis.PyQt import QtCore, QtGui, QtWidgets
-from sqlalchemy import Column, MetaData, Table
+from sqlalchemy import Column, MetaData, Table, Text
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import JSONB
 
 from ..landlensdb import calculate_input_sha
 from ..shared import import_settings
@@ -86,7 +88,75 @@ def test_initial_selection_checks_schema_before_loading_groups(tab, table_cursor
     assert "information_schema.columns" in calls[0].args[0]
     assert calls[0].args[1] == ("public", "images")
     assert "SELECT input_sha" in str(calls[1].args[0])
+    assert "MIN(metadata ->> 'import_params')" in str(calls[1].args[0])
     assert tab._table_valid
+
+
+def test_new_table_stores_import_parameters_only_in_metadata(
+    tab, table_cursor, monkeypatch
+):
+    dialog = Mock()
+    dialog.exec_.return_value = True
+    dialog.table_name.return_value = "new_images"
+    monkeypatch.setattr(module, "AddTableDialog", lambda *args: dialog)
+    tab.add_table()
+    statement = next(
+        str(call.args[0])
+        for call in table_cursor.execute.call_args_list
+        if "CREATE TABLE" in str(call.args[0])
+    )
+    assert "metadata jsonb" in statement
+    assert "input_sha text NOT NULL" in statement
+    assert "import_params" not in statement
+
+
+def test_background_group_reads_extract_json_text_from_metadata():
+    database = Mock()
+    database.selected_table = Table(
+        "images", MetaData(), Column("input_sha", Text), Column("metadata", JSONB)
+    )
+    database.engine = MagicMock()
+    connection = database.engine.connect.return_value.__enter__.return_value
+    sha, config = configuration("stored")
+    connection.execute.return_value = [(sha, 2, config)]
+    assert tasks.read_import_groups(database) == [
+        {"input_sha": sha, "row_count": 2, "import_params": config}
+    ]
+    compiled = connection.execute.call_args.args[0].compile(
+        dialect=postgresql.dialect()
+    )
+    assert "min(images.metadata ->>" in str(compiled)
+    assert "images.import_params" not in str(compiled)
+    assert "import_params" in compiled.params.values()
+
+
+def test_background_missing_config_is_loaded_from_metadata(monkeypatch):
+    sha, config = configuration("stored")
+    database = Mock()
+    database.selected_table = Table(
+        "images", MetaData(), Column("input_sha", Text), Column("metadata", JSONB)
+    )
+    database.engine = MagicMock()
+    connection = database.engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value.scalar.return_value = config
+    database.remove_unmatched_for_input.return_value = 0
+    monkeypatch.setattr(tasks, "open_database", lambda *args: database)
+    monkeypatch.setattr(tasks, "discover_image_paths", lambda *args, **kwargs: [])
+    monkeypatch.setattr(tasks, "read_import_groups", lambda *args: [])
+    task = tasks.ImportTask(
+        "drop_old",
+        [(sha, None)],
+        database_url="unused",
+        connect_args={},
+        table_name="images",
+    )
+    assert task.run(), task.error
+    compiled = connection.execute.call_args.args[0].compile(
+        dialect=postgresql.dialect()
+    )
+    assert "images.metadata ->>" in str(compiled)
+    assert "images.import_params" not in str(compiled)
+    database.remove_unmatched_for_input.assert_called_once_with(sha, [])
 
 
 def test_selecting_invalid_table_clears_old_groups_and_blocks_imports(
@@ -104,14 +174,14 @@ def test_selecting_invalid_table_clears_old_groups_and_blocks_imports(
         ]
     )
     del table_cursor.table_columns["input_sha"]
-    del table_cursor.table_columns["import_params"]
+    del table_cursor.table_columns["metadata"]
     table_cursor.execute.reset_mock()
     tab.table_button.menu().actions()[1].trigger()
     assert tab.current_table_name() == "old_images"
     assert table_cursor.execute.call_count == 1
     assert table_cursor.execute.call_args.args[1] == ("public", "old_images")
     assert "missing input_sha" in tab._show_message.call_args.args[0]
-    assert "missing import_params" in tab._show_message.call_args.args[0]
+    assert "missing metadata" in tab._show_message.call_args.args[0]
     assert tab.import_table.rowCount() == 0
     assert not tab._table_valid
     assert not tab.actions_button.isEnabled()
@@ -127,13 +197,11 @@ def test_selecting_invalid_table_clears_old_groups_and_blocks_imports(
 def test_refresh_reports_wrong_type_and_allows_retry_after_correction(
     tab, table_cursor
 ):
-    table_cursor.table_columns["import_params"] = "jsonb"
+    table_cursor.table_columns["metadata"] = "text"
     tab.refresh_button.click()
-    assert (
-        "import_params is jsonb; expected text" in tab._show_message.call_args.args[0]
-    )
+    assert "metadata is text; expected jsonb" in tab._show_message.call_args.args[0]
     assert not tab.add_button.isEnabled()
-    table_cursor.table_columns["import_params"] = "text"
+    table_cursor.table_columns["metadata"] = "jsonb"
     sha, config = configuration("fixed")
     table_cursor.import_groups = [(sha, 3, config)]
     tab.refresh_button.click()
@@ -230,7 +298,9 @@ def test_view_json_buttons_only_update_qgis_settings_on_update(
     expected = edited if button_name == "update_button" else original
     assert import_settings.load_import_parameters("default") == expected
     table_cursor.execute.assert_called_once()
-    assert "SELECT import_params" in str(table_cursor.execute.call_args.args[0])
+    assert "SELECT metadata ->> 'import_params'" in str(
+        table_cursor.execute.call_args.args[0]
+    )
     reopened = module.ImportJsonDialog(expected, module.normalize_import_json)
     assert reopened.json_text() == expected
     reopened.close()
@@ -437,6 +507,63 @@ def wait_until(condition):
         loop.exec_()
     timer.stop()
     assert condition(), "Timed out waiting for background task"
+
+
+def test_worker_batch_counts_remain_visible_during_database_writes(
+    tab, database, tmp_path
+):
+    import threading
+
+    for index in range(3):
+        (tmp_path / f"{index}.jpg").touch()
+    text = json.dumps(
+        {
+            "file_glob": str(tmp_path / "*.jpg"),
+            "name": "file.name",
+            "image_url": "file.path",
+            "geometry": {
+                "upper_left": [0, 1],
+                "upper_right": [1, 1],
+                "lower_right": [1, 0],
+                "lower_left": [0, 0],
+            },
+            "thumbnail": {"enabled": False},
+        }
+    )
+    tab.batch_size_input.setValue(1)
+    tab.thread_count_input.setValue(2)
+    writing = [threading.Event() for _ in range(3)]
+    release = [threading.Event() for _ in range(3)]
+    writes = []
+
+    def write(images, *args, **kwargs):
+        index = len(writes)
+        writes.append(list(images["name"]))
+        writing[index].set()
+        assert release[index].wait(5)
+
+    database.upsert_images.side_effect = write
+    tab.run_row_updates(calculate_input_sha(text), text)
+    try:
+        for index in range(3):
+            wait_until(writing[index].is_set)
+            # Drain queued task signals while this database write is blocked.
+            QtWidgets.QApplication.processEvents()
+            assert tab._import_active
+            assert tab.progress_bar.maximum() == 3
+            assert tab.progress_bar.value() == index + 1
+            assert tab.progress_bar.text() == f"{index + 1}/3"
+            release[index].set()
+    finally:
+        for event in release:
+            event.set()
+        wait_for_operation(tab)
+    assert sorted(name for batch in writes for name in batch) == [
+        "0.jpg",
+        "1.jpg",
+        "2.jpg",
+    ]
+    assert tab.progress_bar.text() == "Completed"
 
 
 @pytest.mark.parametrize("operation", ["update", "drop_old", "sync"])

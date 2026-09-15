@@ -25,7 +25,6 @@ IMPORT_TABLE_COLUMNS = {
     "thumbnail": "raster",
     "fingerprint": "text",
     "input_sha": "text",
-    "import_params": "text",
 }
 
 

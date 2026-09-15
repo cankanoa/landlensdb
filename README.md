@@ -30,11 +30,21 @@ Paste a normal Windows path into **Search Glob**. In JSON source, backslashes mu
 - Geometry uses `point_from_exif`, `bounds_from_image`, or four named corners containing WGS84 `[longitude, latitude]` values or metadata paths. See the [WorldView template](landlensdb/examples/worldview3.json).
 - Optional `metadata.sidecar_path` names one JSON, GeoJSON, YAML, or WorldView IMD file relative to each found image's directory. `{base}` is the image filename without its final extension: `./{base}.json` is adjacent, `./metadata.json` is a fixed adjacent file, and `../metadata/{base}.yaml` or `../../{base}.json` goes up one or two directories. Paths must start with `./` or `../` (including `../../` for higher ancestors). Only `{base}` is substituted; absolute paths, other placeholders, and globs are rejected. Move the old top-level `sidecar_path` (or `sidecar_glob`) into `metadata.sidecar_path`; this reserved key controls loading and is excluded from stored metadata.
 - Sidecar lookup checks the exact path once, without scanning directories, and reads and parses only an existing file. A missing sidecar leaves sidecar metadata empty and the image import continues. Invalid sidecars or required geometry/name/URL values that cannot be resolved follow `on_error`. The WorldView template defaults to `metadata.sidecar_path: "./{base}.IMD"`; set `.imd` explicitly for lowercase filenames on case-sensitive filesystems.
-- Thumbnails use `"enabled": "source"` to resize the source image or `"enabled": "sidecar"` to resize a separate browse image. Sidecar thumbnails use the same relative-path rules and default to `"sidecar_path": "./{base}-BROWSE.JPG"`. Both modes accept `width`, `height`, and `resampling` (defaults: 256 × 256, lanczos). A missing browse file leaves the thumbnail null. `false` disables thumbnails; legacy `true` means `"source"`. The WorldView template uses browse thumbnails.
+- Thumbnails use `"enabled": "source"` for the source image or `"enabled": "sidecar"` for a separate browse image. Sidecar thumbnails use the same relative-path rules and default to `"sidecar_path": "./{base}-BROWSE.JPG"`. Both modes keep the full image resolution by default. Resizing only runs when all three options—`width`, `height`, and `resampling`—are explicitly set; dimensions preserve aspect ratio. Browse images without georeferencing use the four configured geometry corners to warp onto a map grid in the Output CRS (such as WorldView IMD corners). This requires resampling for georeferencing, even at full preview resolution. Images with an existing CRS and geotransform keep them. A missing browse file leaves the thumbnail null. `false` disables thumbnails; legacy `true` means `"source"`. The WorldView template uses browse thumbnails.
 - Imports read EXIF and raster metadata only when referenced by the configuration or required for geometry. Disable thumbnails and fingerprints when only metadata and footprints are needed; enabled robust fingerprints read the entire image.
 - Fingerprinting is off by default; enable it with `"fingerprint": {"enabled": true}`. Output CRS, workers, batch size, and error handling are runtime arguments.
 
-Imports return a `GeoImageFrame` with geometry, metadata, thumbnails, and the configuration plus its hash. Use `Postgres.upsert_images` for database writes and updates.
+Imports store the configuration as an object at `metadata.import_params`, alongside
+the resolved metadata fields, with its hash in `input_sha`. New tables have no
+separate `import_params` column. The metadata key is reserved for this configuration.
+Use `Postgres.upsert_images` for database writes and updates.
+
+Query's **Add Thumbnail** and **Add Both** use QGIS's native PostGIS raster provider
+to load the stored thumbnails for the image URLs returned by the query.
+If a browse thumbnail was previously imported with pixel coordinates instead of
+map coordinates, run **Update** for that import group to regenerate it, then
+remove and re-add its Query layers. Adding the layer again alone cannot repair
+georeferencing already missing from the stored raster.
 
 Example settings for WorldView metadata and browse thumbnails:
 
@@ -46,10 +56,7 @@ Example settings for WorldView metadata and browse thumbnails:
   },
   "thumbnail": {
     "enabled": "sidecar",
-    "sidecar_path": "./{base}-BROWSE.JPG",
-    "width": 256,
-    "height": 256,
-    "resampling": "lanczos"
+    "sidecar_path": "./{base}-BROWSE.JPG"
   }
 }
 ```

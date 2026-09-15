@@ -9,6 +9,8 @@
     "lower_left": ["sidecar.bounds.LLLon", "sidecar.bounds.LLLat"]
   },
   "metadata": {
+    "name": "file.name",
+    "image_url": "file.path",
     "sidecar_path": "./{base}.IMD",
     "captured_at": "sidecar.image.firstLineTime",
     "platform": {
@@ -69,10 +71,7 @@
   },
   "thumbnail": {
     "enabled": "sidecar",
-    "sidecar_path": "./{base}-BROWSE.JPG",
-    "width": 256,
-    "height": 256,
-    "resampling": "lanczos"
+    "sidecar_path": "./{base}-BROWSE.JPG"
   },
   "fingerprint": {
     "enabled": false,

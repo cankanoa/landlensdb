@@ -4,6 +4,8 @@
   "image_url": "file.path",
   "geometry": "point_from_exif",
   "metadata": {
+    "name": "file.name",
+    "image_url": "file.path",
     "captured_at": "exif_parse_time_to_timez.DateTimeOriginal",
     "camera": {
       "focal_length": "exif.FocalLength",
@@ -17,10 +19,7 @@
     }
   },
   "thumbnail": {
-    "enabled": "source",
-    "width": 256,
-    "height": 256,
-    "resampling": "lanczos"
+    "enabled": "source"
   },
   "fingerprint": {
     "enabled": false,

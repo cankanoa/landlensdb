@@ -3,7 +3,7 @@
 import numbers
 import warnings
 
-from osgeo import gdal
+from osgeo import gdal, osr
 from PIL.ExifTags import GPSTAGS, TAGS
 
 
@@ -14,7 +14,9 @@ class ImportCancelledError(Exception):
 def _normalize_metadata_value(value):
     """Convert metadata values into Python-native, JSON-friendly objects."""
     if isinstance(value, dict):
-        return {str(key): _normalize_metadata_value(item) for key, item in value.items()}
+        return {
+            str(key): _normalize_metadata_value(item) for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_normalize_metadata_value(item) for item in value]
     if isinstance(value, bytes):
@@ -65,8 +67,7 @@ def _get_exif_data(image):
             except Exception:
                 gps_items = ()
         values[tag_name] = {
-            GPSTAGS.get(gps_tag, gps_tag): gps_value
-            for gps_tag, gps_value in gps_items
+            GPSTAGS.get(gps_tag, gps_tag): gps_value for gps_tag, gps_value in gps_items
         }
     return values
 
@@ -97,8 +98,10 @@ def _fit_thumbnail_size(width, height, max_size):
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
-def _create_thumbnail_dataset(image_path, size=(256, 256), resampling="lanczos"):
-    """Create a low-resolution in-memory GDAL thumbnail dataset."""
+def _create_thumbnail_dataset(
+    image_path, size=None, resampling=None, *, corners=None, output_crs="EPSG:4326"
+):
+    """Georeference browse corners in ``output_crs``; resize only when requested."""
     dataset = gdal.Open(str(image_path))
     if dataset is None:
         warnings.warn(
@@ -106,21 +109,45 @@ def _create_thumbnail_dataset(image_path, size=(256, 256), resampling="lanczos")
             stacklevel=2,
         )
         return None
-    width, height = _fit_thumbnail_size(
-        dataset.RasterXSize,
-        dataset.RasterYSize,
-        size,
-    )
-    thumbnail = gdal.Translate(
-        "",
-        dataset,
-        options=gdal.TranslateOptions(
+    resize = {}
+    if size is not None and None not in size and resampling is not None:
+        width, height = _fit_thumbnail_size(
+            dataset.RasterXSize, dataset.RasterYSize, size
+        )
+        resize = {"width": width, "height": height, "resampleAlg": resampling}
+
+    if corners is not None and not (
+        dataset.GetProjectionRef()
+        and dataset.GetGeoTransform(can_return_null=True) is not None
+    ):
+        width, height = dataset.RasterXSize, dataset.RasterYSize
+        spatial_ref = osr.SpatialReference()
+        spatial_ref.SetFromUserInput(output_crs)
+        spatial_ref.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        gcps = [
+            gdal.GCP(x, y, 0.0, pixel, line)
+            for (x, y), (pixel, line) in zip(
+                corners, ((0, 0), (width, 0), (width, height), (0, height))
+            )
+        ]
+        # A VRT attaches real corner coordinates without changing the source file.
+        source = gdal.GetDriverByName("VRT").CreateCopy("", dataset)
+        source.SetGCPs(gcps, spatial_ref.ExportToWkt())
+        # Without resize settings, GDAL chooses a map grid at native resolution.
+        options = {"resampleAlg": "lanczos", **resize}
+        thumbnail = gdal.Warp(
+            "",
+            source,
             format="MEM",
-            width=width,
-            height=height,
-            resampleAlg=resampling,
-        ),
-    )
+            dstSRS=output_crs,
+            polynomialOrder=1,
+            transformerOptions=["SRC_METHOD=GCP_POLYNOMIAL"],
+            **options,
+        )
+    elif resize:
+        thumbnail = gdal.Translate("", dataset, format="MEM", **resize)
+    else:
+        return dataset
     if thumbnail is None:
         raise ValueError("Failed to create thumbnail for {}".format(image_path))
     return thumbnail

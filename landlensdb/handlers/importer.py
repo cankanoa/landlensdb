@@ -9,6 +9,7 @@ import sys
 import threading
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
@@ -509,9 +510,7 @@ def _metadata_requirements(config: Mapping[str, Any]) -> set[str]:
     return sources
 
 
-def _load_image_record(
-    image_path, config, *, sources, output_crs, input_sha, import_params
-):
+def _load_image_record(image_path, config, *, sources, output_crs, input_sha):
     metadata_config = config.get("metadata", {})
     sidecar = resolve_sidecar(image_path, metadata_config.get("sidecar_path"))
     exif = {}
@@ -568,24 +567,28 @@ def _load_image_record(
         thumbnail = _create_thumbnail_dataset(
             thumbnail_path,
             size=(
-                thumbnail_config.get("width", 256),
-                thumbnail_config.get("height", 256),
+                thumbnail_config.get("width"),
+                thumbnail_config.get("height"),
             ),
-            resampling=thumbnail_config.get("resampling", "lanczos"),
+            resampling=thumbnail_config.get("resampling"),
+            corners=(
+                list(geometry.exterior.coords)[:4]
+                if thumbnail_mode == "sidecar" and isinstance(config["geometry"], dict)
+                else None
+            ),
+            output_crs=output_crs,
         )
     fingerprint = config.get("fingerprint", {})
+    metadata = build_metadata(
+        {key: value for key, value in metadata_config.items() if key != "sidecar_path"},
+        **contexts,
+    )
+    metadata["import_params"] = deepcopy(config)
     return {
         "name": str(values["name"]),
         "image_url": str(values["image_url"]),
         "geometry": geometry,
-        "metadata": build_metadata(
-            {
-                key: value
-                for key, value in metadata_config.items()
-                if key != "sidecar_path"
-            },
-            **contexts,
-        ),
+        "metadata": metadata,
         "thumbnail": thumbnail,
         "fingerprint": calculate_file_fingerprint(
             image_path,
@@ -593,7 +596,6 @@ def _load_image_record(
             mode=fingerprint.get("mode", "robust"),
         ),
         "input_sha": input_sha,
-        "import_params": import_params,
     }
 
 
@@ -672,7 +674,6 @@ def import_local_images(
                         sources=sources,
                         output_crs=output_crs,
                         input_sha=input_sha,
-                        import_params=import_params,
                     )
                 except ImportCancelledError:
                     raise
