@@ -42,6 +42,7 @@ class LandlensdbDialog(QtWidgets.QDialog):
         self.query_tab = QueryTab(iface, self)
         self.view_tab = ViewTab(iface, self)
         self.view_tab.set_host_tab_widget(self.tab_widget)
+        self.view_tab.addImagesRequested.connect(self.query_tab.add_image_urls_to_map)
 
         self.tab_widget.addTab(self.overview_tab, 'Overview')
         self.tab_widget.addTab(self.setup_tab, 'Setup')

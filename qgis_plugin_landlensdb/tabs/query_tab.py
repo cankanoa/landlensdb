@@ -1118,6 +1118,30 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             )
         )
 
+    def add_image_urls_to_map(
+        self, source_query, image_urls, add_thumbnail=True, add_geometry=True
+    ):
+        """Run a query for checked View images through the normal Query workflow."""
+        if not image_urls:
+            self._show_error("Select at least one image to add.")
+            return
+        source = self._parse_query_source(source_query)
+        if not source:
+            self._show_error("Could not identify the source table for these images.")
+            return
+        base_query = "SELECT * FROM {}.{}".format(
+            self._quote_identifier(source["schema"]),
+            self._quote_identifier(source["table"]),
+        )
+        query = self._build_image_url_query(image_urls, base_query=base_query)
+        self.sql_input.setPlainText(query)
+        self._last_query_state = None
+        self._run_query_preview(add_to_history=True)
+        if self._last_query_state is not None:
+            self.add_last_query_to_map(
+                add_thumbnail=add_thumbnail, add_geometry=add_geometry
+            )
+
     def add_last_query_to_map(self, add_thumbnail=True, add_geometry=True):
         sql_text = self.sql_input.toPlainText().strip().rstrip(";")
         if not sql_text:
@@ -1546,14 +1570,11 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
             return base_query
         return "{} WHERE {}".format(base_query, " AND ".join(filters))
 
-    def _build_image_url_query(self, image_urls):
-        filters = [
-            "q.image_url = $lldb${}$lldb$".format(image_url.replace("$lldb$", ""))
-            for image_url in image_urls
-        ]
+    def _build_image_url_query(self, image_urls, *, base_query=None):
+        values = ", ".join(self._sql_literal(url) for url in dict.fromkeys(image_urls))
         return "SELECT * FROM ({}) AS q WHERE {}".format(
-            self._build_source_query(),
-            " OR ".join(filters),
+            base_query if base_query is not None else self._build_source_query(),
+            "q.image_url IN ({})".format(values) if values else "FALSE",
         )
 
     def _geometry_families(self, geometry_types):
