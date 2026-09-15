@@ -28,10 +28,14 @@ Paste a normal Windows path into **Search Glob**. In JSON source, backslashes mu
 
 - Values such as `file.name`, `exif.Model`, and `sidecar.product.numColumns` resolve metadata paths; other values are literals. Dotted paths can index arrays.
 - Geometry uses `point_from_exif`, `bounds_from_image`, or four named corners containing WGS84 `[longitude, latitude]` values or metadata paths. See the [WorldView template](landlensdb/examples/worldview3.json).
-- Optional `sidecar_glob` substitutes `{parent}` and `{base}` and must match one JSON, GeoJSON, YAML, or WorldView IMD file.
+- Optional `sidecar_path` names one JSON, GeoJSON, YAML, or WorldView IMD file relative to each found image's directory. `{base}` is the image filename without its final extension: `./{base}.json` is adjacent, `./metadata.json` is a fixed adjacent file, and `../metadata/{base}.yaml` or `../../{base}.json` goes up one or two directories. Only `{base}` is substituted; absolute paths, other placeholders, and globs are rejected. Replace the old `sidecar_glob` setting with `sidecar_path`.
+- Sidecar lookup checks the exact path once, without scanning directories, and reads and parses only an existing file. A missing sidecar leaves sidecar metadata empty and the image import continues. Invalid sidecars or required geometry/name/URL values that cannot be resolved follow `on_error`. The WorldView template defaults to `./{base}.IMD`; set `.imd` explicitly for lowercase filenames on case-sensitive filesystems.
+- Imports read EXIF and raster metadata only when referenced by the configuration or required for geometry. Disable thumbnails and fingerprints when only metadata and footprints are needed; enabled robust fingerprints read the entire image.
 - Fingerprinting is off by default; enable it with `"fingerprint": {"enabled": true}`. Output CRS, workers, batch size, and error handling are runtime arguments.
 
 Imports return a `GeoImageFrame` with geometry, metadata, thumbnails, and the configuration plus its hash. Use `Postgres.upsert_images` for database writes and updates.
+
+See the [sidecar performance audit](docs/sidecar-performance.md) for lookup measurements and remaining import costs.
 
 ## QGIS plugin
 
