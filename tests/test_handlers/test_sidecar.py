@@ -352,3 +352,32 @@ def test_timezone_finder_is_reused_within_worker(monkeypatch):
         )
     constructor.assert_called_once()
     assert constructor.return_value.timezone_at.call_count == 3
+
+
+def test_imd_keeps_arbitrary_nested_groups_without_required_coordinates(tmp_path):
+    from landlensdb.handlers.importer import resolve_sidecar
+
+    image = tmp_path / "sample.tif"
+    (tmp_path / "sample.imd").write_text(
+        'version = 2;\nBEGIN_GROUP = SENSOR;\nname = "Camera";\n'
+        "BEGIN_GROUP = CALIBRATION;\ngain = 1.5;\n"
+        "END_GROUP = CALIBRATION;\nEND_GROUP = SENSOR;\nEND;\n"
+    )
+    assert resolve_sidecar(image, "./{base}.imd") == {
+        "version": 2,
+        "SENSOR": {"name": "Camera", "CALIBRATION": {"gain": 1.5}},
+    }
+
+
+def test_json_metadata_selects_groups_using_explicit_patterns():
+    from landlensdb.handlers.importer import build_metadata
+
+    schema = {
+        "reading": "sidecar.sensor_*.reading",
+        "exact": "sidecar.sensor_b.reading",
+        "missing": "sidecar.other_*.reading",
+    }
+    assert build_metadata(
+        schema,
+        sidecar={"sensor_a": {"reading": 0}, "sensor_b": {"reading": 12}},
+    ) == {"reading": 0, "exact": 12, "missing": None}

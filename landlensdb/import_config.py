@@ -12,7 +12,6 @@ IMPORT_TEMPLATE_DIRECTORY = Path(__file__).with_name("examples")
 REQUIRED_FIELDS = ("file_glob", "name", "image_url", "geometry")
 GEOMETRY_MODES = {"point_from_exif", "bounds_from_image"}
 GEOMETRY_CORNERS = ("upper_left", "upper_right", "lower_right", "lower_left")
-DEFAULT_THUMBNAIL_SIDECAR_PATH = "./{base}-BROWSE.JPG"
 
 
 def validate_sidecar_path(value: str) -> None:
@@ -67,6 +66,7 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "metadata",
         "thumbnail",
         "fingerprint",
+        "anonymize",
     }
     unknown = set(config) - allowed
     if unknown:
@@ -81,7 +81,7 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("file_glob", "name", "image_url"):
         if not isinstance(config.get(key), str) or not config[key].strip():
             raise ValueError("`{}` must be a non-empty string.".format(key))
-    for key in ("metadata", "thumbnail", "fingerprint"):
+    for key in ("metadata", "thumbnail", "fingerprint", "anonymize"):
         if key in config and not isinstance(config[key], dict):
             raise ValueError("`{}` must be a JSON object.".format(key))
     metadata = config.get("metadata", {})
@@ -155,6 +155,10 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "`thumbnail.sidecar_path` requires `thumbnail.enabled` to be 'sidecar'."
             )
+    elif mode == "sidecar":
+        raise ValueError(
+            "Sidecar thumbnails require an explicit `thumbnail.sidecar_path`."
+        )
     for key in ("width", "height"):
         if key not in thumbnail:
             continue
@@ -172,6 +176,43 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("`thumbnail.resampling` must be a non-empty string.")
     if config.get("fingerprint", {}).get("mode", "robust") not in {"robust", "quick"}:
         raise ValueError("`fingerprint.mode` must be 'robust' or 'quick'.")
+    anonymize = config.get("anonymize", {})
+    if set(anonymize) - {
+        "enabled",
+        "source_dir",
+        "output_dir",
+        "overwrite",
+        "model_path",
+    }:
+        raise ValueError("Unknown anonymize options.")
+    for key in ("enabled", "overwrite"):
+        if key in anonymize and type(anonymize[key]) is not bool:
+            raise ValueError("`anonymize.{}` must be a boolean.".format(key))
+    for key in ("source_dir", "output_dir", "model_path"):
+        if key in anonymize and (
+            not isinstance(anonymize[key], str) or not anonymize[key].strip()
+        ):
+            raise ValueError("`anonymize.{}` must be a non-empty path.".format(key))
+    if anonymize.get("enabled", False):
+        if anonymize.get("overwrite", False):
+            if "output_dir" in anonymize:
+                raise ValueError(
+                    "Choose `anonymize.output_dir` or `overwrite`, not both."
+                )
+        elif not all(anonymize.get(key) for key in ("source_dir", "output_dir")):
+            raise ValueError(
+                "Anonymization requires `source_dir` and `output_dir`, "
+                "or explicit `overwrite: true`."
+            )
+        if geometry != "point_from_exif" or config["image_url"] != "file.path":
+            raise ValueError(
+                "Anonymization requires geotagged photos with "
+                "`geometry: point_from_exif` and `image_url: file.path`."
+            )
+        if mode == "sidecar":
+            raise ValueError(
+                "Anonymization requires source thumbnails or disabled thumbnails."
+            )
     # Snapshot the parsed JSON so callers cannot change a running import's config.
     normalized = json.loads(json.dumps(dict(config), allow_nan=False))
     for key in ("width", "height"):

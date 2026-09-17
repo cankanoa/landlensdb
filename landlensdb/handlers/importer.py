@@ -11,6 +11,7 @@ import warnings
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from datetime import datetime
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
@@ -23,7 +24,6 @@ from wcmatch import glob as wcglob
 
 from ..geoclasses.geoimageframe import GeoImageFrame
 from ..import_config import (
-    DEFAULT_THUMBNAIL_SIDECAR_PATH,
     GEOMETRY_CORNERS,
     normalize_import_json,
     validate_import_config,
@@ -65,17 +65,6 @@ WCMATCH_FLAGS = _wcmatch_flags()
 SUPPORTED_SIDECAR_EXTENSIONS = (".json", ".geojson", ".yaml", ".yml", ".imd")
 _WORKER_LOCAL = threading.local()
 
-WORLDVIEW_BOUND_KEYS = (
-    "ULLon",
-    "ULLat",
-    "URLon",
-    "URLat",
-    "LRLon",
-    "LRLat",
-    "LLLon",
-    "LLLat",
-)
-
 
 def _escape_glob_separators(pattern: str) -> str:
     """Quote literal Windows backslashes for wcmatch without parsing the path."""
@@ -104,6 +93,29 @@ def discover_image_paths(file_glob: str, *, cancel_event=None) -> list[Path]:
     return sorted(paths)
 
 
+def prepare_import_paths(config, paths):
+    """Pair source paths with stored URLs, excluding generated anonymized copies."""
+    options = config.get("anonymize", {})
+    if not options.get("enabled", False) or options.get("overwrite", False):
+        return paths, paths
+    source_dir = Path(options["source_dir"]).absolute()
+    output_dir = Path(options["output_dir"]).absolute()
+    if source_dir.is_relative_to(output_dir):
+        raise ValueError("Anonymization output must not contain the source directory.")
+    sources, outputs = [], []
+    for path in paths:
+        path = Path(path).absolute()
+        if path.is_relative_to(output_dir):
+            continue
+        try:
+            relative = path.relative_to(source_dir)
+        except ValueError:
+            raise ValueError("Image is outside `anonymize.source_dir`: {}".format(path))
+        sources.append(path)
+        outputs.append(output_dir / relative)
+    return sources, outputs
+
+
 def _load_json_sidecar(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -115,7 +127,7 @@ def _load_yaml_sidecar(path: Path) -> Any:
 
 
 def _parse_imd_scalar(value: str) -> Any:
-    """Convert a WorldView IMD scalar to a JSON-compatible value."""
+    """Convert an IMD scalar to a JSON-compatible value."""
     value = value.strip().rstrip(";")
     if len(value) >= 2 and value[0] == value[-1] == '"':
         return value[1:-1]
@@ -129,63 +141,36 @@ def _parse_imd_scalar(value: str) -> Any:
         return value
 
 
-def _load_worldview_imd_sidecar(path: Path) -> dict[str, Any]:
-    """Convert a WorldView IMD file to the product/image/bounds mapping."""
-    product: dict[str, Any] = {}
-    image: dict[str, Any] = {}
-    first_band: dict[str, Any] | None = None
-    current_group: str | None = None
-    group_values: dict[str, Any] = {}
-
+def _load_imd_sidecar(path: Path) -> dict[str, Any]:
+    """Read key/value groups without interpreting field names or deriving metadata."""
+    root: dict[str, Any] = {}
+    groups = [(None, root)]
     with path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
-            if not line or line.startswith("#"):
+            if not line or line.startswith("#") or line == "END;":
                 continue
-            if line.startswith("BEGIN_GROUP") and "=" in line:
-                current_group = line.split("=", 1)[1].strip().rstrip(";")
-                group_values = {}
-                continue
-            if line.startswith("END_GROUP"):
-                if current_group == "IMAGE_1":
-                    image = dict(group_values)
-                elif (
-                    current_group
-                    and current_group.startswith("BAND_")
-                    and first_band is None
-                ):
-                    first_band = dict(group_values)
-                current_group = None
-                group_values = {}
-                continue
-            if line == "END;" or "=" not in line:
+            if "=" not in line:
                 continue
             key, raw_value = line.split("=", 1)
             key = key.strip()
-            parsed_value = _parse_imd_scalar(raw_value)
-            if current_group is None:
-                product[key] = parsed_value
+            value = _parse_imd_scalar(raw_value)
+            if key == "BEGIN_GROUP":
+                group = {}
+                parent = groups[-1][1]
+                if value in parent:
+                    raise ValueError("Duplicate IMD group: {}".format(value))
+                parent[value] = group
+                groups.append((value, group))
+            elif key == "END_GROUP":
+                if len(groups) == 1 or groups[-1][0] != value:
+                    raise ValueError("Mismatched IMD group: {}".format(value))
+                groups.pop()
             else:
-                group_values[key] = parsed_value
-
-    missing = [key for key in WORLDVIEW_BOUND_KEYS if key not in (first_band or {})]
-    if missing:
-        raise ValueError(
-            "Missing WorldView bounds in {}: {}".format(path, ", ".join(missing))
-        )
-    bounds = {
-        key: float(first_band[key])  # type: ignore[index]
-        for key in WORLDVIEW_BOUND_KEYS
-    }
-    longitude_values = [bounds[key] for key in ("ULLon", "URLon", "LRLon", "LLLon")]
-    latitude_values = [bounds[key] for key in ("ULLat", "URLat", "LRLat", "LLLat")]
-    bounds.update(
-        min_x=min(longitude_values),
-        min_y=min(latitude_values),
-        max_x=max(longitude_values),
-        max_y=max(latitude_values),
-    )
-    return {"product": product, "image": image, "bounds": bounds}
+                groups[-1][1][key] = value
+    if len(groups) != 1:
+        raise ValueError("Unclosed IMD group: {}".format(groups[-1][0]))
+    return root
 
 
 SIDECAR_LOADERS = {
@@ -193,7 +178,7 @@ SIDECAR_LOADERS = {
     ".geojson": _load_json_sidecar,
     ".yaml": _load_yaml_sidecar,
     ".yml": _load_yaml_sidecar,
-    ".imd": _load_worldview_imd_sidecar,
+    ".imd": _load_imd_sidecar,
 }
 
 
@@ -238,8 +223,17 @@ def resolve_sidecar(image_path: Path, relative_path: str | None) -> dict[str, An
 
 def _lookup(mapping: Mapping[str, Any], path: str) -> Any:
     value: Any = mapping
-    for component in path.split(".") if path else ():
+    components = path.split(".") if path else ()
+    for index, component in enumerate(components):
         if isinstance(value, Mapping):
+            if component not in value and any(char in component for char in "*?["):
+                remaining = ".".join(components[index + 1 :])
+                for key, candidate in value.items():
+                    if fnmatchcase(str(key), component):
+                        match = _lookup(candidate, remaining)
+                        if match is not None:
+                            return match
+                return None
             value = value.get(component)
         elif (
             isinstance(value, list)
@@ -511,7 +505,9 @@ def _metadata_requirements(config: Mapping[str, Any]) -> set[str]:
     return sources
 
 
-def _load_image_record(image_path, config, *, sources, output_crs, input_sha):
+def _load_image_record(
+    image_path, config, *, sources, output_crs, input_sha, transform_image=None
+):
     metadata_config = config.get("metadata", {})
     sidecar = resolve_sidecar(image_path, metadata_config.get("sidecar_path"))
     exif = {}
@@ -539,6 +535,10 @@ def _load_image_record(image_path, config, *, sources, output_crs, input_sha):
     if geometry is None or geometry.is_empty:
         raise ValueError("Required geometry could not be resolved.")
 
+    if transform_image is not None:
+        image_path = transform_image(image_path)
+        file = _file_values(image_path, include_stat="file_stat" in sources)
+
     contexts = dict(
         exif=exif,
         raster=raster,
@@ -562,7 +562,7 @@ def _load_image_record(image_path, config, *, sources, output_crs, input_sha):
     if thumbnail_mode == "sidecar":
         thumbnail_path = find_sidecar_path(
             image_path,
-            thumbnail_config.get("sidecar_path", DEFAULT_THUMBNAIL_SIDECAR_PATH),
+            thumbnail_config["sidecar_path"],
         )
     if thumbnail_mode and thumbnail_path is not None:
         thumbnail = _create_thumbnail_dataset(
@@ -646,11 +646,18 @@ def import_local_images(
     )
     if not paths:
         raise ValueError("No files match `file_glob`: {}".format(config["file_glob"]))
+    paths, image_urls = prepare_import_paths(config, paths)
+    anonymize_options = config.get("anonymize", {})
+    anonymize_enabled = anonymize_options.get("enabled", False)
+    output_paths = dict(zip(paths, image_urls)) if anonymize_enabled else {}
     if skip_existing and skip_images_in_postgresql is not None:
         _check_cancelled(cancel_event)
-        paths = [
-            Path(path) for path in skip_images_in_postgresql.filter_existing_rows(paths)
-        ]
+        missing = skip_images_in_postgresql.filter_existing_rows(image_urls)
+        if anonymize_enabled:
+            missing = {str(path) for path in missing}
+            paths = [path for path in paths if str(output_paths[path]) in missing]
+        else:
+            paths = [Path(path) for path in missing]
     if not paths:
         raise ValueError("No new files match `file_glob`.")
     _check_cancelled(cancel_event)
@@ -662,6 +669,26 @@ def import_local_images(
         _check_cancelled(cancel_event)
         if progress_callback:
             progress_callback(0, total)
+
+        anonymizer = None
+        anonymize_lock = threading.Lock()
+
+        def anonymize_image(path):
+            nonlocal anonymizer
+            # Reuse one model per import; inference on it must be serialized.
+            with anonymize_lock:
+                _check_cancelled(cancel_event)
+                _check_cancelled(stop_event)
+                if anonymizer is None:
+                    from ..process.anonymize import Anonymizer
+
+                    anonymizer = Anonymizer(
+                        model_path=anonymize_options.get("model_path")
+                    )
+                output = output_paths[path]
+                anonymizer.anonymize_image(str(path), str(output))
+                _check_cancelled(cancel_event)
+                return output
 
         def load_batch(batch):
             records = []
@@ -675,6 +702,7 @@ def import_local_images(
                         sources=sources,
                         output_crs=output_crs,
                         input_sha=input_sha,
+                        transform_image=anonymize_image if anonymize_enabled else None,
                     )
                 except ImportCancelledError:
                     raise

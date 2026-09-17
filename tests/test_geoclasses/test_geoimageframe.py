@@ -60,6 +60,34 @@ def test_explicit_incomplete_construction_still_fails():
         GeoImageFrame({"name": ["Sample"], "geometry": [Point(0, 0)]})
 
 
+def test_mapping_uses_current_metadata_heading_and_upstream_colors(tmp_path):
+    import base64
+    from PIL import Image
+
+    image = tmp_path / "photo.jpg"
+    Image.new("RGB", (600, 300), "red").save(image)
+    frame = GeoImageFrame(
+        {
+            "name": ["Photo"],
+            "image_url": [str(image)],
+            "geometry": [Point(1, 2)],
+            "metadata": [{"sensor": {"compass_angle": 45}}],
+        },
+        index=[7],
+        crs="EPSG:4326",
+    )
+    html = (
+        frame.map(marker_color="#123456", additional_properties=["absent_column"])
+        .get_root()
+        .render()
+    )
+    expected = base64.b64encode(
+        _generate_arrow_svg(45, color="#123456").encode()
+    ).decode()
+    assert expected in html
+    assert "data:image/jpeg;base64," in frame._popup_html(7, str(image), [])
+
+
 def test_to_dict_records(sample_geoimageframe):
     records = sample_geoimageframe.to_dict_records()
     assert isinstance(records, list), "Should return a list"

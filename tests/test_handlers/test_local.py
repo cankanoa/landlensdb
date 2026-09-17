@@ -127,10 +127,10 @@ def test_all_built_in_presets_use_compact_json():
     assert not {"width", "height", "resampling"} & worldview["thumbnail"].keys()
     assert worldview["metadata"]["sidecar_path"] == "./{base}.IMD"
     assert worldview["geometry"] == {
-        "upper_left": ["sidecar.bounds.ULLon", "sidecar.bounds.ULLat"],
-        "upper_right": ["sidecar.bounds.URLon", "sidecar.bounds.URLat"],
-        "lower_right": ["sidecar.bounds.LRLon", "sidecar.bounds.LRLat"],
-        "lower_left": ["sidecar.bounds.LLLon", "sidecar.bounds.LLLat"],
+        "upper_left": ["sidecar.BAND_*.ULLon", "sidecar.BAND_*.ULLat"],
+        "upper_right": ["sidecar.BAND_*.URLon", "sidecar.BAND_*.URLat"],
+        "lower_right": ["sidecar.BAND_*.LRLon", "sidecar.BAND_*.LRLat"],
+        "lower_left": ["sidecar.BAND_*.LLLon", "sidecar.BAND_*.LLLat"],
     }
 
 
@@ -380,7 +380,7 @@ def test_sidecar_path_returns_empty_metadata_when_configured_file_is_missing(tmp
     assert resolve_sidecar(image, None) == {}
 
 
-def test_worldview_imd_sidecar_is_converted_to_json_notation(tmp_path):
+def test_imd_preserves_source_groups_for_template_geometry(tmp_path):
     image = tmp_path / "scene.TIL"
     image.write_bytes(b"image")
     (tmp_path / "scene.IMD").write_text(
@@ -406,10 +406,10 @@ END;
 
     sidecar = resolve_sidecar(image, "./{base}.IMD")
 
-    assert sidecar["product"]["generationTime"] == "2024-01-01T00:00:00Z"
-    assert sidecar["image"]["satId"] == "WV03"
-    assert sidecar["bounds"]["min_x"] == -158.2
-    assert sidecar["bounds"]["max_y"] == 21.7
+    assert sidecar["generationTime"] == "2024-01-01T00:00:00Z"
+    assert sidecar["IMAGE_1"]["satId"] == "WV03"
+    assert sidecar["BAND_P"]["ULLon"] == -158.2
+    assert set(sidecar) == {"generationTime", "IMAGE_1", "BAND_P"}
     geometry = build_geometry(
         parse_import_json(load_import_presets()["worldview3.json"])["geometry"],
         exif={},

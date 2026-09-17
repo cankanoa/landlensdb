@@ -24,8 +24,10 @@ invalid sidecar contents follow the configured `on_error` policy.
 Validation is cached by template in a bounded cache. File existence and parsed
 contents are checked afresh, so edits and newly created sidecars are visible.
 The old top-level `sidecar_glob` and `sidecar_path` options report a migration
-error pointing to `metadata.sidecar_path`. Thumbnail mode `"sidecar"` uses
-the same lookup and reads the browse image without loading the source. Missing
+error pointing to `metadata.sidecar_path`. Thumbnail mode `"sidecar"` requires an
+explicit `thumbnail.sidecar_path`, uses the same lookup, and reads the browse
+image without loading the source. IMD parsing preserves raw keys and nested
+groups; metadata paths and corner selection are defined entirely in JSON. Missing
 browse files produce a null thumbnail; there is no source-image fallback.
 Both thumbnail modes use the full image by default. Resizing requires explicit
 `width`, `height`, and `resampling` settings. Browse images without georeferencing

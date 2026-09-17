@@ -7,7 +7,7 @@ from qgis.core import QgsTask
 from sqlalchemy import create_engine, func, select
 
 from ..landlensdb import Postgres, import_local_images, parse_import_json
-from ..landlensdb.handlers.importer import discover_image_paths
+from ..landlensdb.handlers.importer import discover_image_paths, prepare_import_paths
 from ..landlensdb.handlers.local import ImportCancelledError
 
 
@@ -153,7 +153,10 @@ class ImportTask(QgsTask):
                     )
                     self.check_cancelled()
                     self.phase_changed.emit("Removing stale rows…")
-                    deleted += database.remove_unmatched_for_input(input_sha, paths)
+                    paths, image_urls = prepare_import_paths(config, paths)
+                    deleted += database.remove_unmatched_for_input(
+                        input_sha, image_urls
+                    )
                 elif self.operation == "drop_all":
                     self.phase_changed.emit("Removing rows…")
                     deleted += database.remove_all_for_input(input_sha)

@@ -40,6 +40,8 @@ def config(tmp_path):
 @pytest.mark.parametrize("mode", ["source", True, False, "sidecar"])
 def test_thumbnail_modes_read_the_selected_file(config, tmp_path, mode):
     config["thumbnail"]["enabled"] = mode
+    if mode == "sidecar":
+        config["thumbnail"]["sidecar_path"] = "./{base}-BROWSE.JPG"
     Image.new("RGB", (16, 32), "blue").save(tmp_path / "scene-BROWSE.JPG")
     row = importer.import_local_images(config, on_error="error").iloc[0]
     assert row["metadata"] == {"value": None, "import_params": config}
@@ -248,7 +250,7 @@ def test_thumbnail_sidecar_uses_same_relative_solver(config, tmp_path, monkeypat
 
 
 def test_missing_browse_does_not_read_source_or_metadata_parser(config, monkeypatch):
-    config["thumbnail"]["enabled"] = "sidecar"
+    config["thumbnail"].update(enabled="sidecar", sidecar_path="./{base}-BROWSE.JPG")
     forbidden = Mock(side_effect=AssertionError("missing browse must not be read"))
     monkeypatch.setattr(importer, "_create_thumbnail_dataset", forbidden)
     monkeypatch.setitem(importer.SIDECAR_LOADERS, ".json", forbidden)
@@ -262,6 +264,12 @@ def test_missing_browse_does_not_read_source_or_metadata_parser(config, monkeypa
 def test_invalid_thumbnail_modes_are_rejected(config, value):
     config["thumbnail"]["enabled"] = value
     with pytest.raises(ValueError, match="thumbnail.enabled"):
+        validate_import_config(config)
+
+
+def test_sidecar_thumbnail_requires_a_filename_in_json(config):
+    config["thumbnail"]["enabled"] = "sidecar"
+    with pytest.raises(ValueError, match="explicit.*thumbnail.sidecar_path"):
         validate_import_config(config)
 
 

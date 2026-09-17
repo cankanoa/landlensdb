@@ -1,6 +1,6 @@
 # landlensdb
 
-Import geolocated photos and rasters, manage them in PostGIS, and query them from QGIS. The Python library also supports Mapillary imagery and road-network alignment.
+Import geolocated photos and rasters, manage them in PostGIS, and query them from QGIS. The Python library also supports Mapillary imagery road-network alignment, and image anonymization.
 
 [PyPI](https://pypi.org/project/landlensdb/) · [Documentation](docs/index.md) · [Examples](docs/examples/getting-started.ipynb)
 
@@ -28,13 +28,15 @@ Discovered files keep the path used by the glob: a search through `S:\Satellite_
 
 [JSON templates](landlensdb/examples) cover geotagged photos, georeferenced rasters, and WorldView-3 imagery. Each configuration requires `file_glob`, `name`, `image_url`, and `geometry`.
 
-- Values such as `file.name`, `exif.Model`, and `sidecar.product.numColumns` resolve metadata paths; other values are literals. Dotted paths can index arrays.
+- Values such as `file.name`, `exif.Model`, and `sidecar.numColumns` resolve metadata paths; other values are literals. Dotted paths can index arrays. A mapping component such as `sidecar.sensor_*.value` selects the first matching non-null value in file order; matching is case-sensitive.
 - Geometry uses `point_from_exif`, `bounds_from_image`, or four named corners containing WGS84 `[longitude, latitude]` values or metadata paths. See the [WorldView template](landlensdb/examples/worldview3.json).
-- Optional `metadata.sidecar_path` names one JSON, GeoJSON, YAML, or WorldView IMD file relative to each found image's directory. `{base}` is the image filename without its final extension: `./{base}.json` is adjacent, `./metadata.json` is a fixed adjacent file, and `../metadata/{base}.yaml` or `../../{base}.json` goes up one or two directories. Paths must start with `./` or `../` (including `../../` for higher ancestors). Only `{base}` is substituted; absolute paths, other placeholders, and globs are rejected. Move the old top-level `sidecar_path` (or `sidecar_glob`) into `metadata.sidecar_path`; this reserved key controls loading and is excluded from stored metadata.
+- Optional `metadata.sidecar_path` names one JSON, GeoJSON, YAML, or IMD file relative to each found image's directory. `{base}` is the image filename without its final extension: `./{base}.json` is adjacent, `./metadata.json` is a fixed adjacent file, and `../metadata/{base}.yaml` or `../../{base}.json` goes up one or two directories. Paths must start with `./` or `../` (including `../../` for higher ancestors). Only `{base}` is substituted; absolute paths, other placeholders, and globs are rejected. Move the old top-level `sidecar_path` (or `sidecar_glob`) into `metadata.sidecar_path`; this reserved key controls loading and is excluded from stored metadata.
 - Sidecar lookup checks the exact path once, without scanning directories, and reads and parses only an existing file. A missing sidecar leaves sidecar metadata empty and the image import continues. Invalid sidecars or required geometry/name/URL values that cannot be resolved follow `on_error`. The WorldView template defaults to `metadata.sidecar_path: "./{base}.IMD"`; set `.imd` explicitly for lowercase filenames on case-sensitive filesystems.
-- Thumbnails use `"enabled": "source"` for the source image or `"enabled": "sidecar"` for a separate browse image. Sidecar thumbnails use the same relative-path rules and default to `"sidecar_path": "./{base}-BROWSE.JPG"`. Both modes keep the full image resolution when resize settings are omitted. Resizing only runs when all three options—`width`, `height`, and `resampling`—are explicitly set; dimensions preserve aspect ratio. The georeferenced raster and geotagged photo templates set these to 256 × 256 with Lanczos resampling. Browse images without georeferencing use the four configured geometry corners to warp onto a map grid in the Output CRS (such as WorldView IMD corners). This requires resampling for georeferencing, even at full preview resolution. Images with an existing CRS and geotransform keep them. A missing browse file leaves the thumbnail null. `false` disables thumbnails; legacy `true` means `"source"`. The WorldView template uses browse thumbnails.
+- Thumbnails use `"enabled": "source"` for the source image or `"enabled": "sidecar"` for a separate browse image. Sidecar thumbnails require an explicit `thumbnail.sidecar_path` in JSON, using the same relative-path rules. Both modes keep the full image resolution when resize settings are omitted. Resizing only runs when all three options—`width`, `height`, and `resampling`—are explicitly set; dimensions preserve aspect ratio. The georeferenced raster and geotagged photo templates set these to 256 × 256 with Lanczos resampling. Browse images without georeferencing use the four configured geometry corners to warp onto a map grid in the Output CRS (such as WorldView IMD corners). This requires resampling for georeferencing, even at full preview resolution. Images with an existing CRS and geotransform keep them. A missing browse file leaves the thumbnail null. `false` disables thumbnails; legacy `true` means `"source"`. The WorldView template uses browse thumbnails.
 - Imports read EXIF and raster metadata only when referenced by the configuration or required for geometry. Disable thumbnails and fingerprints when only metadata and footprints are needed; enabled robust fingerprints read the entire image.
 - Fingerprinting is off by default; enable it with `"fingerprint": {"enabled": true}`. Output CRS, workers, batch size, and error handling are runtime arguments.
+
+IMD sidecars preserve their original keys and nested groups. All field selection lives in JSON: the satellite template reads `sidecar.IMAGE_1.*`, root product fields, and `sidecar.BAND_*.ULLon` (and the other configured corners). The loader does not invent `product`, `image`, or `bounds` aliases, require particular coordinate names, or derive satellite bounds. Reapply the updated template to saved configurations that use the old aliases.
 
 Imports store the configuration as an object at `metadata.import_params`, alongside
 the resolved metadata fields, with its hash in `input_sha`. New tables have no
@@ -54,7 +56,7 @@ Example settings for WorldView metadata and browse thumbnails:
 {
   "metadata": {
     "sidecar_path": "./{base}.IMD",
-    "captured_at": "sidecar.image.firstLineTime"
+    "captured_at": "sidecar.IMAGE_1.firstLineTime"
   },
   "thumbnail": {
     "enabled": "sidecar",
@@ -64,6 +66,23 @@ Example settings for WorldView metadata and browse thumbnails:
 ```
 
 See the [sidecar performance audit](docs/sidecar-performance.md) for lookup measurements and remaining import costs.
+
+## Image anonymization
+
+To blur faces and license plates during a geotagged-photo import, add an optional section to the photo configuration:
+
+```python
+config["anonymize"] = {
+    "enabled": True,
+    "source_dir": "/data/photos",
+    "output_dir": "/data/anonymized",
+}
+images = import_local_images(config, on_error="error")
+```
+
+Relative folders beneath `source_dir` are preserved in `output_dir`. The stored `image_url`, metadata path, and thumbnails use the processed image; GPS/EXIF metadata is retained. Add and Sync compare these output URLs to existing rows and exclude generated copies from discovery results. For explicit in-place processing, use `{"enabled": true, "overwrite": true}` instead of source/output directories. `model_path` optionally selects a detector; otherwise the upstream model discovery/download behavior applies.
+
+Anonymization is off unless enabled. It supports `point_from_exif` photos with `image_url: file.path` and source thumbnails (or disabled thumbnails). The model is loaded only when a new valid image needs processing, and inference is serialized while metadata work can run concurrently. Processing errors follow `on_error` and do not import an unprocessed fallback. The standalone `landlensdb.process.Anonymizer` and `anonymize_images` APIs are also available.
 
 ## QGIS plugin
 

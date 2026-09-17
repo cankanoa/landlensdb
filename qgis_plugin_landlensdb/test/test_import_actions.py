@@ -159,6 +159,41 @@ def test_background_missing_config_is_loaded_from_metadata(monkeypatch):
     database.remove_unmatched_for_input.assert_called_once_with(sha, [])
 
 
+def test_drop_old_matches_anonymized_urls_without_processing_images(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "photos"
+    output = source / "processed"
+    config = json.loads(configuration("photos")[1])
+    config["anonymize"] = {
+        "enabled": True,
+        "source_dir": str(source),
+        "output_dir": str(output),
+    }
+    text = json.dumps(config)
+    sha = calculate_input_sha(text)
+    paths = [source / "flight/scene.JPG", output / "flight/scene.JPG"]
+    database = Mock()
+    database.remove_unmatched_for_input.return_value = 0
+    monkeypatch.setattr(tasks, "open_database", lambda *args: database)
+    monkeypatch.setattr(tasks, "discover_image_paths", lambda *args, **kwargs: paths)
+    monkeypatch.setattr(tasks, "read_import_groups", lambda *args: [])
+    forbidden = Mock(side_effect=AssertionError("Drop old must not process images"))
+    monkeypatch.setattr(tasks, "import_local_images", forbidden)
+    task = tasks.ImportTask(
+        "drop_old",
+        [(sha, text)],
+        database_url="unused",
+        connect_args={},
+        table_name="images",
+    )
+    assert task.run(), task.error
+    database.remove_unmatched_for_input.assert_called_once_with(
+        sha, [output / "flight/scene.JPG"]
+    )
+    forbidden.assert_not_called()
+
+
 def test_selecting_invalid_table_clears_old_groups_and_blocks_imports(
     tab, table_cursor, monkeypatch
 ):

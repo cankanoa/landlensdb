@@ -300,7 +300,9 @@ class GeoImageFrame(GeoDataFrame):
         table_ident = table_name.replace('"', '""')
         constraint_ident = constraint_name.replace('"', '""')
         column_ident = column_name.replace('"', '""')
-        conn.execute(text(f"""
+        conn.execute(
+            text(
+                f"""
                 DO $$
                 BEGIN
                     IF NOT EXISTS (
@@ -314,7 +316,9 @@ class GeoImageFrame(GeoDataFrame):
                     END IF;
                 END
                 $$;
-                """))
+                """
+            )
+        )
 
     @staticmethod
     def _download_image_from_url(
@@ -477,7 +481,7 @@ class GeoImageFrame(GeoDataFrame):
 
         for prop in additional_properties:
             table_rows += self._create_table_row(
-                prop.capitalize(), self.get(prop, [None])[row]
+                prop.capitalize(), self.at[row, prop] if prop in self.columns else None
             )
 
         if os.path.exists(image_url):
@@ -544,8 +548,8 @@ class GeoImageFrame(GeoDataFrame):
         if additional_geometries is None:
             additional_geometries = []
 
-        x = self.geometry[0].xy[0][0]
-        y = self.geometry[0].xy[1][0]
+        x = self.geometry.iloc[0].xy[0][0]
+        y = self.geometry.iloc[0].xy[1][0]
 
         map_obj = folium.Map(
             location=[y, x], tiles=tiles, zoom_start=zoom_start, max_zoom=max_zoom
@@ -572,7 +576,12 @@ class GeoImageFrame(GeoDataFrame):
                     if angle_col in self.columns:
                         compass_angle = self[angle_col][i]
                     else:
-                        compass_angle = getattr(self, angle_col)[i]
+                        metadata = self.at[i, "metadata"] if "metadata" in self else {}
+                        compass_angle = (
+                            (metadata or {}).get("sensor", {}).get(angle_col)
+                        )
+                    if compass_angle is None or pd.isna(compass_angle):
+                        compass_angle = 0
                     icon = _generate_arrow_icon(compass_angle, color=color)
 
                     marker = folium.Marker(location=coordinates, popup=popup, icon=icon)
