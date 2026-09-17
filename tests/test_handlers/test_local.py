@@ -40,6 +40,66 @@ def test_json_hash_ignores_formatting_and_key_order():
     assert calculate_input_sha(config) != calculate_input_sha(first)
 
 
+def test_whole_number_thumbnail_dimensions_normalize_without_changing_input():
+    config = _example_config()
+    expected_json = normalize_import_json(config)
+    expected_sha = calculate_input_sha(config)
+    config["thumbnail"].update(width=256.0, height=256.0)
+
+    normalized = import_config.validate_import_config(config)
+
+    for key in ("width", "height"):
+        assert type(normalized["thumbnail"][key]) is int
+        assert normalized["thumbnail"][key] == 256
+        assert type(config["thumbnail"][key]) is float
+    assert normalize_import_json(json.dumps(config)) == expected_json
+    assert calculate_input_sha(config) == expected_sha
+
+
+@pytest.mark.parametrize("key", ["width", "height"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        -1,
+        0.0,
+        -1.0,
+        256.5,
+        True,
+        False,
+        "256",
+        None,
+        [],
+        {},
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
+def test_thumbnail_dimensions_reject_values_that_are_not_positive_whole_numbers(
+    key, value
+):
+    config = _example_config()
+    config["thumbnail"][key] = value
+    with pytest.raises(ValueError, match=r"thumbnail\." + key):
+        import_config.validate_import_config(config)
+
+
+def test_import_geotagged_photos_with_decimal_thumbnail_dimensions():
+    config = _example_config()
+    config["file_glob"] = str(Path("test_data/local").resolve() / "*.JPG")
+    config["thumbnail"].update(enabled="source", width=256.0, height=256.0)
+
+    images = import_local_images(config, on_error="error")
+
+    assert len(images) == 3
+    for _, row in images.iterrows():
+        thumbnail = row["thumbnail"]
+        assert max(thumbnail.RasterXSize, thumbnail.RasterYSize) == 256
+        for key in ("width", "height"):
+            assert type(row["metadata"]["import_params"]["thumbnail"][key]) is int
+
+
 def test_all_built_in_presets_use_compact_json():
     presets = load_import_presets()
     assert list(presets) == [

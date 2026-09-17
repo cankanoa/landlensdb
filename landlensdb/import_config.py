@@ -156,7 +156,14 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 "`thumbnail.sidecar_path` requires `thumbnail.enabled` to be 'sidecar'."
             )
     for key in ("width", "height"):
-        if key in thumbnail and (type(thumbnail[key]) is not int or thumbnail[key] < 1):
+        if key not in thumbnail:
+            continue
+        value = thumbnail[key]
+        if (
+            type(value) not in (int, float)
+            or value < 1
+            or (type(value) is float and not value.is_integer())
+        ):
             raise ValueError("`thumbnail.{}` must be a positive integer.".format(key))
     if "resampling" in thumbnail and (
         not isinstance(thumbnail["resampling"], str)
@@ -166,7 +173,11 @@ def validate_import_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if config.get("fingerprint", {}).get("mode", "robust") not in {"robust", "quick"}:
         raise ValueError("`fingerprint.mode` must be 'robust' or 'quick'.")
     # Snapshot the parsed JSON so callers cannot change a running import's config.
-    return json.loads(json.dumps(dict(config), allow_nan=False))
+    normalized = json.loads(json.dumps(dict(config), allow_nan=False))
+    for key in ("width", "height"):
+        if key in thumbnail:
+            normalized["thumbnail"][key] = int(thumbnail[key])
+    return normalized
 
 
 def parse_import_json(text: str) -> dict[str, Any]:
