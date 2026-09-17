@@ -53,11 +53,18 @@ def test_all_built_in_presets_use_compact_json():
         assert "output_crs" not in config
         assert "required" not in value
         assert "default" not in value
-        assert not {"width", "height", "resampling"} & config["thumbnail"].keys()
+    for name in ("georeferenced_rasters.json", "geotagged_photos.json"):
+        assert parse_import_json(presets[name])["thumbnail"] == {
+            "enabled": "source",
+            "width": 256,
+            "height": 256,
+            "resampling": "lanczos",
+        }
     photos = parse_import_json(presets["geotagged_photos.json"])
     assert photos["file_glob"] == "/path/to/photos/**/*.@(jpg|JPG|png|PNG|jpeg|JPEG)"
     assert photos["metadata"]["camera"]["model"] == "exif.Model"
     worldview = parse_import_json(presets["worldview3.json"])
+    assert not {"width", "height", "resampling"} & worldview["thumbnail"].keys()
     assert worldview["metadata"]["sidecar_path"] == "./{base}.IMD"
     assert worldview["geometry"] == {
         "upper_left": ["sidecar.bounds.ULLon", "sidecar.bounds.ULLat"],
