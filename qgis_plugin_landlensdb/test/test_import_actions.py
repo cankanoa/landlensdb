@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 
 from ..landlensdb import calculate_input_sha
-from ..shared import import_settings
+from ..shared import glob_builder, import_settings
 from ..tabs import import_tab as module
 from ..shared import import_task as tasks
 from .utilities import get_qgis_app
@@ -372,7 +372,6 @@ def test_view_json_invalid_text_and_save_failure_keep_viewer_open(tab, monkeypat
         "Update New",
         "Drop Old",
         "Drop All",
-        "Sync (Drop Old/Update)",
         "Fetch Metadata Structure",
     ],
 )
@@ -403,8 +402,6 @@ def test_menus_use_stored_groups_without_saved_import_parameters(
         tab._run_updates.assert_called_once_with(configs, action == "Update New")
     if action == "Drop Old":
         tab._run_drop_old.assert_called_once_with(configs)
-    if action == "Sync (Drop Old/Update)":
-        tab._start_operation.assert_called_once_with("sync", configs)
     if action == "Drop All":
         tab._run_drop_all.assert_called_once_with(configs)
     if action == "Fetch Metadata Structure":
@@ -488,6 +485,275 @@ def test_add_and_update_pass_runtime_controls_and_protect_other_groups(
     assert tab.actions_button.isEnabled()
     assert tab.output_crs_input.isEnabled()
     assert not tab.cancel_button.isEnabled()
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+@pytest.mark.parametrize(
+    "skip_existing, all_existing", [(False, False), (True, False), (True, True)]
+)
+def test_update_folder_limits_discovery_and_keeps_group_parameters(
+    tab, database, monkeypatch, tmp_path, recursive, skip_existing, all_existing
+):
+    from ..landlensdb.handlers import importer
+
+    folder = tmp_path / "selected"
+    folder.mkdir()
+    nested = folder / "nested"
+    nested.mkdir()
+    existing = folder / "scene_existing.jpg"
+    fresh = folder / "scene_fresh.JPG"
+    nested_image = nested / "scene_nested.jpg"
+    for path in (
+        existing,
+        fresh,
+        nested_image,
+        folder / "excluded.png",
+        folder / "wrong_name.jpg",
+        folder / "scene_excluded.jpg",
+        tmp_path / "outside.jpg",
+    ):
+        path.touch()
+    config = {
+        "file_glob": (
+            str(
+                tmp_path
+                / ("**/scene_*.@(jpg|JPG)" if recursive else "*/scene_*.@(jpg|JPG)")
+            )
+            + "|!"
+            + str(tmp_path / "**/scene_excluded.jpg")
+        ),
+        "name": "file.name",
+        "image_url": "file.path",
+        "geometry": {
+            "upper_left": [0, 1],
+            "upper_right": [1, 1],
+            "lower_right": [1, 0],
+            "lower_left": [0, 0],
+        },
+        "metadata": {"survey": "Original group"},
+        "thumbnail": {"enabled": False},
+    }
+    text = json.dumps(config)
+    sha = calculate_input_sha(text)
+    tab.load_records([{"input_sha": sha, "row_count": 1, "import_params": text}])
+    tab._saved_config = Mock(side_effect=AssertionError("Use the group's parameters"))
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog, "getExistingDirectory", lambda *args: str(folder)
+    )
+
+    extensions = Mock(side_effect=AssertionError("Use the group's original glob rules"))
+    monkeypatch.setattr(glob_builder.GlobExtensionsDialog, "exec_", extensions)
+    # Any second glob traversal would search the group's original, broader glob.
+    discover = Mock(wraps=tasks.discover_image_paths)
+    monkeypatch.setattr(tasks, "discover_image_paths", discover)
+    monkeypatch.setattr(
+        importer,
+        "discover_image_paths",
+        Mock(side_effect=AssertionError("The selected folder was already searched")),
+    )
+    database.filter_existing_rows.side_effect = lambda paths: (
+        [] if all_existing else [str(path) for path in paths if path != existing]
+    )
+    button = tab.import_table.cellWidget(0, tab.ACTIONS_COLUMN)
+    action = "Folder Update New" if skip_existing else "Folder Update"
+    next(a for a in button.menu().actions() if a.text() == action).trigger()
+    wait_for_operation(tab)
+    discover.assert_called_once_with(
+        config["file_glob"],
+        cancel_event=tab._cancel_import_event,
+        search_folder=str(folder),
+    )
+    expected = {existing, fresh} | ({nested_image} if recursive else set())
+    if skip_existing:
+        database.filter_existing_rows.assert_called_once()
+        assert set(database.filter_existing_rows.call_args.args[0]) == expected
+        expected = set() if all_existing else expected - {existing}
+    else:
+        database.filter_existing_rows.assert_not_called()
+    if expected:
+        database.upsert_images.assert_called_once()
+        call = database.upsert_images.call_args
+        images = call.args[0]
+        assert set(images["image_url"]) == {str(path) for path in expected}
+        assert set(images["input_sha"]) == {sha}
+        for metadata in images["metadata"]:
+            assert metadata["survey"] == "Original group"
+            assert metadata["import_params"] == config
+        assert call.args[1] == "images"
+        assert call.kwargs == {"conflict": "update", "input_sha": sha}
+    else:
+        database.upsert_images.assert_not_called()
+        assert "No new images were found" in tab._show_message.call_args.args[0]
+    database.remove_unmatched_for_input.assert_not_called()
+    database.remove_all_for_input.assert_not_called()
+    tab._saved_config.assert_not_called()
+
+
+def test_update_folder_cancelled_dialog_does_not_start_import(tab, monkeypatch):
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getExistingDirectory",
+        lambda *args: "",
+    )
+    extensions = Mock(return_value=QtWidgets.QDialog.Rejected)
+    monkeypatch.setattr(glob_builder.GlobExtensionsDialog, "exec_", extensions)
+    tab._start_operation = Mock()
+    tab.run_row_update_folder(*configuration("original"))
+    tab._start_operation.assert_not_called()
+    extensions.assert_not_called()
+
+
+def test_update_folder_no_matches_reports_selected_glob(
+    tab, database, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(module, "choose_image_folder", lambda *args: str(tmp_path))
+    tab.run_row_update_folder(*configuration("original"))
+    wait_for_operation(tab)
+    assert "No files match" in tab._show_message.call_args.args[0]
+    assert str(tmp_path) in tab._show_message.call_args.args[0]
+    assert (
+        json.loads(configuration("original")[1])["file_glob"]
+        in tab._show_message.call_args.args[0]
+    )
+    database.upsert_images.assert_not_called()
+
+
+@pytest.mark.parametrize("drop_old", [False, True])
+@pytest.mark.parametrize("recursive", [False, True])
+def test_folder_drop_menu_uses_folder_extensions_and_stored_group(
+    tab, monkeypatch, drop_old, recursive
+):
+    tab._start_operation = Mock()
+    tab._saved_config = Mock(side_effect=AssertionError("Use stored group parameters"))
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog, "getExistingDirectory", lambda *args: "/selected"
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, "question", lambda *args: QtWidgets.QMessageBox.Yes
+    )
+
+    def select_extensions(dialog):
+        dialog.extension_inputs["jpg"].setChecked(True)
+        dialog.extension_inputs["png"].setChecked(True)
+        dialog.recursive_checkbox.setChecked(recursive)
+        dialog.okay_button.click()
+        return dialog.result()
+
+    monkeypatch.setattr(glob_builder.GlobExtensionsDialog, "exec_", select_extensions)
+    button = tab.import_table.cellWidget(1, tab.ACTIONS_COLUMN)
+    label = "Folder Drop Old" if drop_old else "Folder Drop All"
+    next(
+        action for action in button.menu().actions() if action.text() == label
+    ).trigger()
+    tab._start_operation.assert_called_once_with(
+        "drop_old" if drop_old else "drop_all",
+        [configuration("second")],
+        search_folder="/selected",
+        extensions=["jpg", "png"],
+        recursive=recursive,
+    )
+    tab._saved_config.assert_not_called()
+
+
+@pytest.mark.parametrize("cancel_at", ["folder", "extensions", "confirmation"])
+def test_folder_drop_cancelled_selection_or_confirmation_does_not_start(
+    tab, monkeypatch, cancel_at
+):
+    tab._start_operation = Mock()
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getExistingDirectory",
+        lambda *args: "" if cancel_at == "folder" else "/selected",
+    )
+    dialog = Mock()
+    dialog.exec_.return_value = cancel_at != "extensions"
+    dialog.selected_extensions.return_value = ["jpg"]
+    dialog.recursive_checkbox.isChecked.return_value = False
+    monkeypatch.setattr(glob_builder, "GlobExtensionsDialog", lambda *args: dialog)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, "question", lambda *args: QtWidgets.QMessageBox.No
+    )
+    tab.run_row_folder_drop(*configuration("stored"), drop_old=False)
+    tab._start_operation.assert_not_called()
+
+
+@pytest.mark.parametrize("drop_old", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_folder_drop_task_scopes_saved_urls_and_never_processes_images(
+    monkeypatch, tmp_path, drop_old, cancel
+):
+    folder = tmp_path / "selected"
+    folder.mkdir()
+    existing = folder / "existing.JPG"
+    existing.touch()
+    missing = folder / "missing.jpg"
+    db = MagicMock()
+    db.selected_table = Table(
+        "images", MetaData(), Column("image_url", Text), Column("input_sha", Text)
+    )
+    db.remove_unmatched_for_input.return_value = 1
+    db.remove_all_for_input.return_value = 2
+    connection = db.engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value = [
+        (str(path),)
+        for path in [
+            existing,
+            missing,
+            folder / "keep.png",
+            tmp_path / "other/missing.jpg",
+        ]
+    ]
+    monkeypatch.setattr(tasks, "open_database", lambda *args: db)
+    monkeypatch.setattr(tasks, "read_import_groups", lambda *args: [])
+    forbidden = Mock(side_effect=AssertionError("Folder drop must not process images"))
+    monkeypatch.setattr(tasks, "import_local_images", forbidden)
+    config = json.loads(configuration("stored")[1])
+    config["file_glob"] = str(tmp_path / "**/*.jpg")
+    text = json.dumps(config)
+    sha = calculate_input_sha(text)
+    task = tasks.ImportTask(
+        "drop_old" if drop_old else "drop_all",
+        [(sha, text)],
+        database_url="unused",
+        connect_args={},
+        table_name="images",
+        search_folder=str(folder),
+        extensions=["jpg"],
+        recursive=False,
+    )
+    if not drop_old:
+        monkeypatch.setattr(
+            tasks,
+            "discover_image_paths",
+            Mock(
+                side_effect=AssertionError(
+                    "Drop All must include missing files without globbing"
+                )
+            ),
+        )
+    if cancel:
+        connection.execute.side_effect = lambda *args: (task.cancel_event.set() or [])
+    assert task.run() == (not cancel), task.error
+    forbidden.assert_not_called()
+    compiled = connection.execute.call_args.args[0].compile(
+        dialect=postgresql.dialect()
+    )
+    assert "images.input_sha =" in str(compiled)
+    assert sha in compiled.params.values()
+    if cancel:
+        assert isinstance(task.error, tasks.ImportCancelledError)
+        db.remove_all_for_input.assert_not_called()
+        db.remove_unmatched_for_input.assert_not_called()
+    elif drop_old:
+        db.remove_unmatched_for_input.assert_called_once_with(
+            sha, [existing], scope_image_urls=[str(existing), str(missing)]
+        )
+        db.remove_all_for_input.assert_not_called()
+    else:
+        db.remove_all_for_input.assert_called_once_with(
+            sha, scope_image_urls=[str(existing), str(missing)]
+        )
+        db.remove_unmatched_for_input.assert_not_called()
 
 
 @pytest.mark.parametrize("crs", ["invalid", "EPSG:4326"])
@@ -601,7 +867,7 @@ def test_worker_batch_counts_remain_visible_during_database_writes(
     assert tab.progress_bar.text() == "Completed"
 
 
-@pytest.mark.parametrize("operation", ["update", "drop_old", "sync"])
+@pytest.mark.parametrize("operation", ["update", "update_folder", "drop_old"])
 @pytest.mark.parametrize("cancel", [False, True])
 def test_glob_work_keeps_qt_responsive_and_cancellation_stops_writes(
     tab, database, monkeypatch, operation, cancel
@@ -636,7 +902,11 @@ def test_glob_work_keeps_qt_responsive_and_cancellation_stops_writes(
     monkeypatch.setattr(tasks, "import_local_images", Mock(side_effect=load))
     monkeypatch.setattr(tasks, "read_import_groups", refresh)
     database.remove_unmatched_for_input.return_value = 0
-    tab._start_operation(operation, [configuration("photos")])
+    if operation == "update_folder":
+        monkeypatch.setattr(module, "choose_image_folder", lambda *args: "/selected")
+        tab.run_row_update_folder(*configuration("photos"))
+    else:
+        tab._start_operation(operation, [configuration("photos")])
     try:
         assert tab._import_active
         wait_until(entered.is_set)
@@ -661,7 +931,7 @@ def test_glob_work_keeps_qt_responsive_and_cancellation_stops_writes(
         database.remove_unmatched_for_input.assert_not_called()
         assert "cancelled" in tab._show_message.call_args.args[0]
     else:
-        if operation == "sync":
+        if operation == "update_folder":
             tasks.discover_image_paths.assert_called_once()
             assert (
                 tasks.import_local_images.call_args.kwargs["discovered_paths"] is paths

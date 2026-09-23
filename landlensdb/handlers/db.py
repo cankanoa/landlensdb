@@ -318,33 +318,32 @@ class Postgres:
 
         return [path for path in normalized_paths if path not in existing_paths]
 
-    def remove_unmatched_for_input(self, input_sha, image_paths):
-        """Delete rows in one import group whose source path no longer matches."""
+    def remove_unmatched_for_input(
+        self, input_sha, image_paths, *, scope_image_urls=None
+    ):
+        """Delete unmatched rows in a group, optionally limited to selected URLs."""
         if self.selected_table is None:
             raise ValueError("Select a table first with `table(table_name)`.")
         if "input_sha" not in self.selected_table.c:
             raise ValueError("The selected table has no 'input_sha' column.")
         matched_paths = [str(path) for path in image_paths]
         filters = [self.selected_table.c.input_sha == input_sha]
+        if scope_image_urls is not None:
+            scope_image_urls = [str(path) for path in scope_image_urls]
+            if not scope_image_urls:
+                return 0
+            filters.append(self.selected_table.c.image_url.in_(scope_image_urls))
         if matched_paths:
             filters.append(~self.selected_table.c.image_url.in_(matched_paths))
         with self.engine.begin() as conn:
             result = conn.execute(self.selected_table.delete().where(and_(*filters)))
         return result.rowcount or 0
 
-    def remove_all_for_input(self, input_sha):
-        """Delete every row belonging to one canonical import configuration."""
-        if self.selected_table is None:
-            raise ValueError("Select a table first with `table(table_name)`.")
-        if "input_sha" not in self.selected_table.c:
-            raise ValueError("The selected table has no 'input_sha' column.")
-        with self.engine.begin() as conn:
-            result = conn.execute(
-                self.selected_table.delete().where(
-                    self.selected_table.c.input_sha == input_sha
-                )
-            )
-        return result.rowcount or 0
+    def remove_all_for_input(self, input_sha, *, scope_image_urls=None):
+        """Delete all rows in a group, optionally limited to selected URLs."""
+        return self.remove_unmatched_for_input(
+            input_sha, [], scope_image_urls=scope_image_urls
+        )
 
     @staticmethod
     def _qualified_table_name(table):

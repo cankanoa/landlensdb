@@ -54,8 +54,8 @@ Image discovery still uses `file_glob`. Enabled thumbnails still require image
 processing; robust fingerprints still read the complete file. These operations
 can dominate total import time for large imagery. Disable thumbnails and
 fingerprints for imports that need only metadata and footprints. Discovered paths are retained in memory, but only one batch per worker is queued.
-Completed futures are released as batches are consumed. Sync shares its discovered
-paths with the importer, avoiding a second glob pass.
+Completed futures are released as batches are consumed. Folder updates share their
+discovered paths with the importer, avoiding a second glob pass.
 
 ## QGIS responsiveness
 
@@ -64,7 +64,7 @@ result refreshes on the UI thread. Its image-level thread pool did not protect
 those phases, and calling `processEvents()` only at progress updates left QGIS
 unresponsive between updates.
 
-Add, Update, Drop Old, Drop All, and Sync now run as `QgsTask` background jobs.
+Add, Update, Drop Old, Drop All, and folder actions run as `QgsTask` background jobs.
 The task receives a snapshot of settings, creates and disposes its own database
 engine, and fetches refreshed import groups before completing. Qt signals deliver
 progress, status, errors, and final records to the widgets on the main thread.

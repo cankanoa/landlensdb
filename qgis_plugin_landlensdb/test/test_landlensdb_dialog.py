@@ -175,7 +175,7 @@ class LandlensdbDialogTest(unittest.TestCase):
         import_tab._fetch_first_import_params = lambda input_sha: (
             first_json if input_sha == "a" * 64 else None
         )
-        import_tab._show_import_parameters = opened_json.append
+        import_tab._show_group_import_parameters = opened_json.append
         params_button.click()
         self.assertEqual(opened_json, [first_json])
         self.assertEqual(import_tab.open_json_button.text(), "Import Parameters…")
@@ -186,7 +186,6 @@ class LandlensdbDialogTest(unittest.TestCase):
             "Update New",
             "Drop Old",
             "Drop All",
-            "Sync (Drop Old/Update)",
             "Fetch Metadata Structure",
         ]
         self.assertEqual(
@@ -196,12 +195,22 @@ class LandlensdbDialogTest(unittest.TestCase):
         row_actions = import_tab.import_table.cellWidget(0, import_tab.ACTIONS_COLUMN)
         self.assertEqual(
             [action.text() for action in row_actions.menu().actions()],
-            expected_actions,
+            expected_actions
+            + [
+                "Folder Update",
+                "Folder Update New",
+                "Folder Drop Old",
+                "Folder Drop All",
+            ],
         )
         fetched = []
         import_tab.fetch_metadata = fetched.append
-        import_tab.actions_button.menu().actions()[-1].trigger()
-        row_actions.menu().actions()[-1].trigger()
+        for button in (import_tab.actions_button, row_actions):
+            next(
+                action
+                for action in button.menu().actions()
+                if action.text() == "Fetch Metadata Structure"
+            ).trigger()
         self.assertEqual(fetched, ["all", "a" * 64])
 
     def test_import_editor_saves_one_settings_document(self):

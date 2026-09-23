@@ -28,6 +28,7 @@ from ..shared.import_settings import (
     save_import_parameters,
 )
 from ..shared.import_task import ImportTask
+from ..shared.glob_builder import choose_folder_filter, choose_image_folder
 from ..shared.metadata_settings import fetch_metadata_tree
 from ..shared.json_editor import ImportGroupJsonDialog, ImportJsonDialog
 
@@ -503,12 +504,24 @@ class ImportTab(QtWidgets.QWidget):
                 ("Drop Old", lambda: self.run_row_drop_old(input_sha, json_text)),
                 ("Drop All", lambda: self.run_row_drop_all(input_sha, json_text)),
                 (
-                    "Sync (Drop Old/Update)",
-                    lambda: self.run_row_sync(input_sha, json_text),
-                ),
-                (
                     "Fetch Metadata Structure",
                     lambda checked=False: self.fetch_metadata(input_sha),
+                ),
+                (
+                    "Folder Update",
+                    lambda: self.run_row_update_folder(input_sha, json_text),
+                ),
+                (
+                    "Folder Update New",
+                    lambda: self.run_row_update_folder(input_sha, json_text, True),
+                ),
+                (
+                    "Folder Drop Old",
+                    lambda: self.run_row_folder_drop(input_sha, json_text, True),
+                ),
+                (
+                    "Folder Drop All",
+                    lambda: self.run_row_folder_drop(input_sha, json_text, False),
                 ),
             )
         else:
@@ -517,7 +530,6 @@ class ImportTab(QtWidgets.QWidget):
                 ("Update New", lambda: self.run_all_updates(True)),
                 ("Drop Old", self.run_all_drop_old),
                 ("Drop All", self.run_all_drop_all),
-                ("Sync (Drop Old/Update)", self.run_all_sync),
                 (
                     "Fetch Metadata Structure",
                     lambda checked=False: self.fetch_metadata("all"),
@@ -562,7 +574,16 @@ class ImportTab(QtWidgets.QWidget):
             return
         self._run_updates([config], skip_existing=True, add_only=True)
 
-    def _start_operation(self, operation, configs, skip_existing=False):
+    def _start_operation(
+        self,
+        operation,
+        configs,
+        skip_existing=False,
+        *,
+        search_folder=None,
+        extensions=None,
+        recursive=False,
+    ):
         if self._import_active:
             return
         table_name = self.current_table_name()
@@ -579,7 +600,7 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message("No import parameters are available.", Qgis.Warning)
             return
         try:
-            crs = self._output_crs() if operation in {"add", "update", "sync"} else None
+            crs = self._output_crs() if operation in {"add", "update"} else None
             self._cancel_import_event.clear()
             # Snapshot widget values now; the task never accesses any widget.
             task = ImportTask(
@@ -594,6 +615,9 @@ class ImportTab(QtWidgets.QWidget):
                 batch_size=self.batch_size_input.value(),
                 on_error=self.on_error_input.currentText(),
                 skip_existing=bool(skip_existing),
+                search_folder=search_folder,
+                extensions=extensions,
+                recursive=recursive,
                 cancel_event=self._cancel_import_event,
             )
             task.progress_updated.connect(
@@ -630,7 +654,7 @@ class ImportTab(QtWidgets.QWidget):
             self._show_message(
                 "Removed {} row(s).".format(result["deleted"]), Qgis.Info
             )
-        elif not result["wrote"] and result["operation"] != "sync":
+        elif not result["wrote"]:
             self._show_message("No new images were found.", Qgis.Info)
         else:
             self._show_message(
@@ -655,6 +679,18 @@ class ImportTab(QtWidgets.QWidget):
 
     def run_row_updates(self, input_sha, json_text, skip_existing=False):
         self._run_updates([(input_sha, json_text)], skip_existing)
+
+    def run_row_update_folder(self, input_sha, json_text, skip_existing=False):
+        if self._import_active:
+            return
+        search_folder = choose_image_folder(self)
+        if search_folder is not None:
+            self._start_operation(
+                "update",
+                [(input_sha, json_text)],
+                skip_existing=skip_existing,
+                search_folder=search_folder,
+            )
 
     def run_all_drop_old(self):
         self._run_drop_old(self._row_configs())
@@ -683,11 +719,34 @@ class ImportTab(QtWidgets.QWidget):
         ):
             self._run_drop_all([(input_sha, json_text)])
 
-    def run_all_sync(self):
-        self._start_operation("sync", self._row_configs())
-
-    def run_row_sync(self, input_sha, json_text):
-        self._start_operation("sync", [(input_sha, json_text)])
+    def run_row_folder_drop(self, input_sha, json_text, drop_old):
+        if self._import_active:
+            return
+        selection = choose_folder_filter(self)
+        if selection is None:
+            return
+        folder, extensions, recursive = selection
+        if (
+            not drop_old
+            and QtWidgets.QMessageBox.question(
+                self,
+                "Folder Drop All",
+                "Delete this import group's database rows for {} files in {}{}?".format(
+                    ", ".join(extensions),
+                    folder,
+                    " and its subfolders" if recursive else "",
+                ),
+            )
+            != QtWidgets.QMessageBox.Yes
+        ):
+            return
+        self._start_operation(
+            "drop_old" if drop_old else "drop_all",
+            [(input_sha, json_text)],
+            search_folder=folder,
+            extensions=extensions,
+            recursive=recursive,
+        )
 
     def fetch_metadata(self, input_sha):
         """Fetch one metadata row per input SHA and save the parameter tree."""

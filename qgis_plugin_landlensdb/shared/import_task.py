@@ -7,7 +7,11 @@ from qgis.core import QgsTask
 from sqlalchemy import create_engine, func, select
 
 from ..landlensdb import Postgres, import_local_images, parse_import_json
-from ..landlensdb.handlers.importer import discover_image_paths, prepare_import_paths
+from ..landlensdb.handlers.importer import (
+    discover_image_paths,
+    filter_folder_image_urls,
+    prepare_import_paths,
+)
 from ..landlensdb.handlers.local import ImportCancelledError
 
 
@@ -60,8 +64,13 @@ class ImportTask(QgsTask):
         batch_size=100,
         on_error="skip",
         skip_existing=False,
+        search_folder=None,
+        extensions=None,
+        recursive=False,
         cancel_event=None,
     ):
+        if operation not in {"add", "update", "drop_old", "drop_all"}:
+            raise ValueError("Unsupported import operation: {}".format(operation))
         super().__init__("Landlensdb {}".format(operation), QgsTask.CanCancel)
         self.operation = operation
         self.configs = tuple(configs)
@@ -74,6 +83,9 @@ class ImportTask(QgsTask):
         self.batch_size = batch_size
         self.on_error = on_error
         self.skip_existing = skip_existing
+        self.search_folder = search_folder
+        self.extensions = tuple(extensions or ())
+        self.recursive = recursive
         self.cancel_event = (
             cancel_event if cancel_event is not None else threading.Event()
         )
@@ -93,6 +105,20 @@ class ImportTask(QgsTask):
         if total:
             self.setProgress(100 * processed / total)
 
+    def folder_image_urls(self, database, input_sha, config):
+        table = database.selected_table
+        statement = select(table.c.image_url).where(table.c.input_sha == input_sha)
+        with database.engine.connect() as connection:
+            rows = connection.execute(statement.execution_options(yield_per=1000))
+            return filter_folder_image_urls(
+                config,
+                (row[0] for row in rows),
+                self.search_folder,
+                self.extensions,
+                recursive=self.recursive,
+                cancel_event=self.cancel_event,
+            )
+
     def run(self):
         database = None
         try:
@@ -101,7 +127,7 @@ class ImportTask(QgsTask):
             database = open_database(
                 self.database_url, self.connect_args, self.table_name
             )
-            updating = self.operation in {"add", "update", "sync"}
+            updating = self.operation in {"add", "update"}
             if updating:
                 geometry_column = database.selected_table.c.get("geometry")
                 srid = (
@@ -117,9 +143,12 @@ class ImportTask(QgsTask):
                     )
             # Validate every configuration before the first mutation.
             configs = []
+            needs_config = (
+                self.operation != "drop_all" or self.search_folder is not None
+            )
             for sha, text in self.configs:
                 self.check_cancelled()
-                if self.operation != "drop_all" and not text:
+                if needs_config and not text:
                     table = database.selected_table
                     with database.engine.connect() as connection:
                         text = connection.execute(
@@ -134,11 +163,7 @@ class ImportTask(QgsTask):
                 configs.append(
                     (
                         sha,
-                        (
-                            parse_import_json(text)
-                            if self.operation != "drop_all"
-                            else None
-                        ),
+                        (parse_import_json(text) if needs_config else None),
                     )
                 )
             deleted = 0
@@ -146,23 +171,56 @@ class ImportTask(QgsTask):
             for input_sha, config in configs:
                 self.check_cancelled()
                 paths = None
-                if self.operation in {"drop_old", "sync"}:
+                scope = {}
+                if self.search_folder is not None and not updating:
+                    self.phase_changed.emit("Finding rows in the selected folder…")
+                    scope["scope_image_urls"] = self.folder_image_urls(
+                        database, input_sha, config
+                    )
+                    self.check_cancelled()
+                if self.operation == "drop_old":
                     self.phase_changed.emit("Finding images…")
+                    discovery_options = (
+                        {
+                            "search_folder": self.search_folder,
+                            "recursive": self.recursive,
+                        }
+                        if self.search_folder is not None
+                        else {}
+                    )
                     paths = discover_image_paths(
-                        config["file_glob"], cancel_event=self.cancel_event
+                        config["file_glob"],
+                        cancel_event=self.cancel_event,
+                        **discovery_options,
                     )
                     self.check_cancelled()
                     self.phase_changed.emit("Removing stale rows…")
                     paths, image_urls = prepare_import_paths(config, paths)
+                    self.check_cancelled()
                     deleted += database.remove_unmatched_for_input(
-                        input_sha, image_urls
+                        input_sha, image_urls, **scope
                     )
                 elif self.operation == "drop_all":
                     self.phase_changed.emit("Removing rows…")
-                    deleted += database.remove_all_for_input(input_sha)
+                    deleted += database.remove_all_for_input(input_sha, **scope)
                 if updating:
                     self.check_cancelled()
                     self.phase_changed.emit("Finding images…")
+                    if self.search_folder is not None:
+                        # Limit this run's discovery without changing the stored
+                        # parameters or the SHA that identifies the import group.
+                        paths = discover_image_paths(
+                            config["file_glob"],
+                            cancel_event=self.cancel_event,
+                            search_folder=self.search_folder,
+                        )
+                        self.check_cancelled()
+                        if not paths:
+                            raise ValueError(
+                                "No files match `file_glob`: {} in folder {}".format(
+                                    config["file_glob"], self.search_folder
+                                )
+                            )
                     batches = None
                     try:
                         batches = import_local_images(

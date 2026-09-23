@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import sys
 import threading
 import warnings
@@ -76,16 +77,60 @@ def _check_cancelled(cancel_event):
         raise ImportCancelledError("Image import cancelled.")
 
 
-def discover_image_paths(file_glob: str, *, cancel_event=None) -> list[Path]:
-    """Return unique files from one full-path wcmatch pattern."""
+class _FolderGlob(wcglob.Glob):
+    """Run the original glob while pruning traversal to a selected subtree."""
+
+    def __init__(self, pattern, folder, cancel_event, recursive=True):
+        super().__init__(pattern, flags=WCMATCH_FLAGS)
+        self.folder = Path(os.path.abspath(folder))
+        self.cancel_event = cancel_event
+        self.recursive = recursive
+
+    def _iter(self, curdir, dir_only, deep):
+        # Use wcmatch's traversal hook so its pattern parsing, exclusions, and
+        # path spelling stay identical to a full import. Ancestors only expose
+        # the next directory leading to the selected folder, without scanning.
+        _check_cancelled(self.cancel_event)
+        directory = Path(os.path.abspath(curdir or "."))
+        if directory.is_relative_to(self.folder):
+            if not self.recursive and directory != self.folder:
+                return
+            for entry in super()._iter(curdir, dir_only, deep):
+                _check_cancelled(self.cancel_event)
+                yield entry
+        elif self.folder.is_relative_to(directory):
+            for special in self.specials:
+                yield special, True, True, False
+            child = self.folder.relative_to(directory).parts[0]
+            child_path = directory / child
+            if child_path.is_dir():
+                yield child, True, self._is_hidden(child), child_path.is_symlink()
+
+
+def discover_image_paths(
+    file_glob: str, *, cancel_event=None, search_folder=None, recursive=True
+) -> list[Path]:
+    """Return glob matches, optionally confined to a folder with optional recursion."""
     if not isinstance(file_glob, str) or not file_glob.strip():
         raise ValueError("`file_glob` must be a non-empty string.")
     _check_cancelled(cancel_event)
-    matches = wcglob.iglob(_escape_glob_separators(file_glob), flags=WCMATCH_FLAGS)
+    pattern = _escape_glob_separators(file_glob)
+    folder = Path(os.path.abspath(search_folder)) if search_folder is not None else None
+    matches = (
+        wcglob.iglob(pattern, flags=WCMATCH_FLAGS)
+        if folder is None
+        else _FolderGlob(pattern, folder, cancel_event, recursive).glob()
+    )
     paths = set()
     for match in matches:
         _check_cancelled(cancel_event)
         path = Path(match)
+        if folder is not None:
+            absolute = Path(os.path.abspath(path))
+            if not absolute.is_relative_to(folder):
+                continue
+            if not recursive and absolute.parent != folder:
+                continue
         if path.is_file():
             # Preserve mapped drives and symlink paths used by the search glob.
             paths.add(path.absolute())
@@ -114,6 +159,41 @@ def prepare_import_paths(config, paths):
         sources.append(path)
         outputs.append(output_dir / relative)
     return sources, outputs
+
+
+def filter_folder_image_urls(
+    config, image_urls, folder, extensions, *, recursive=False, cancel_event=None
+):
+    """Select stored URLs by source folder and extensions, including missing files."""
+    folder = Path(os.path.abspath(folder))
+    extensions = {extension.lower().lstrip(".") for extension in extensions}
+    if not extensions:
+        raise ValueError("Choose at least one extension.")
+    options = config.get("anonymize", {})
+    mapped = options.get("enabled", False) and not options.get("overwrite", False)
+    if mapped:
+        source_dir = Path(os.path.abspath(options["source_dir"]))
+        output_dir = Path(os.path.abspath(options["output_dir"]))
+    selected = []
+    for image_url in image_urls:
+        _check_cancelled(cancel_event)
+        source = Path(image_url)
+        if not source.is_absolute():
+            continue
+        source = Path(os.path.abspath(source))
+        if mapped:
+            if not source.is_relative_to(output_dir):
+                continue
+            source = source_dir / source.relative_to(output_dir)
+        if not source.is_relative_to(folder):
+            continue
+        relative = source.relative_to(folder)
+        if (recursive or len(relative.parts) == 1) and source.suffix.lower().lstrip(
+            "."
+        ) in extensions:
+            selected.append(image_url)
+    _check_cancelled(cancel_event)
+    return selected
 
 
 def _load_json_sidecar(path: Path) -> Any:
@@ -627,8 +707,9 @@ def import_local_images(
 ):
     """Import images from a parsed JSON config with separate runtime controls.
 
-    ``discovered_paths`` reuses files already found with this config's file glob
-    (for example, by Sync) without traversing the directories again.
+    ``discovered_paths`` reuses files already found by a folder-scoped update
+    without traversing the directories again
+    or changing the stored import parameters and group SHA.
     """
     if max_workers < 1 or batch_size < 1:
         raise ValueError("`max_workers` and `batch_size` must be positive integers.")

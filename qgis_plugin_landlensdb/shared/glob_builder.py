@@ -22,6 +22,31 @@ def build_file_glob(folder, extensions, recursive=False):
     )
 
 
+def choose_image_folder(parent=None):
+    """Choose an image folder, returning None when cancelled."""
+    return (
+        QtWidgets.QFileDialog.getExistingDirectory(parent, "Choose Image Folder")
+        or None
+    )
+
+
+def choose_folder_filter(parent=None):
+    """Choose a folder, extensions, and recursion, or return None on cancellation."""
+    folder = choose_image_folder(parent)
+    if not folder:
+        return None
+    dialog = GlobExtensionsDialog(parent)
+    if not dialog.exec_():
+        return None
+    return (folder, dialog.selected_extensions(), dialog.recursive_checkbox.isChecked())
+
+
+def choose_file_glob(parent=None):
+    """Choose a folder and extensions, returning None when either dialog is cancelled."""
+    selection = choose_folder_filter(parent)
+    return build_file_glob(*selection) if selection is not None else None
+
+
 class GlobExtensionsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)

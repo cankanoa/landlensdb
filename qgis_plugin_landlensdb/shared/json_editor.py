@@ -5,7 +5,7 @@ import json
 from qgis.PyQt import QtCore, QtGui, QtWidgets
 
 from ..landlensdb import import_config
-from .glob_builder import GlobExtensionsDialog, build_file_glob
+from .glob_builder import choose_file_glob
 from .import_settings import save_import_parameters
 
 
@@ -234,15 +234,9 @@ class ImportJsonDialog(QtWidgets.QDialog):
             self.resize(self.width(), self.layout().sizeHint().height())
 
     def create_file_glob(self):
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose Image Folder")
-        if not folder:
+        file_glob = choose_file_glob(self)
+        if file_glob is None:
             return
-        dialog = GlobExtensionsDialog(self)
-        if not dialog.exec_():
-            return
-        file_glob = build_file_glob(
-            folder, dialog.selected_extensions(), dialog.recursive_checkbox.isChecked()
-        )
         self.file_glob_input.setText(file_glob)
         self.update_file_glob(file_glob)
 

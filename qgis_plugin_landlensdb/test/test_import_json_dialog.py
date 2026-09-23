@@ -78,6 +78,18 @@ class ImportJsonDialogTest(unittest.TestCase):
         self.dialog.file_glob_input.setText(value)
         self.dialog.file_glob_input.textEdited.emit(value)
 
+    def test_select_uses_shared_folder_picker_and_preserves_other_parameters(self):
+        file_glob = "/selected/*.@(jpg|JPG)"
+        with patch.object(json_editor, "choose_file_glob", return_value=file_glob):
+            self.dialog.create_glob_button.click()
+        expected = json.loads(self.current_json)
+        expected["file_glob"] = file_glob
+        self.assertEqual(json.loads(self.dialog.json_text()), expected)
+        self.assertEqual(json.loads(load_import_parameters("default")), expected)
+        with patch.object(json_editor, "choose_file_glob", return_value=None):
+            self.dialog.create_glob_button.click()
+        self.assertEqual(json.loads(self.dialog.json_text()), expected)
+
     def test_search_glob_saves_only_that_field_and_reopens_without_save(self):
         self.edit_glob("/new photos/**/*.@(jpg|jpeg|png)")
         expected = json.loads(self.current_json)
