@@ -69,7 +69,7 @@ See the [sidecar performance audit](docs/sidecar-performance.md) for lookup meas
 
 ## Image anonymization
 
-To blur faces and license plates during a geotagged-photo import, add an optional section to the photo configuration:
+The geotagged-photo template includes an `anonymize` section, disabled by default. To blur faces and license plates, enable it and set the source and output directories to match your photos:
 
 ```python
 config["anonymize"] = {
@@ -80,7 +80,7 @@ config["anonymize"] = {
 images = import_local_images(config, on_error="error")
 ```
 
-Relative folders beneath `source_dir` are preserved in `output_dir`. The stored `image_url`, metadata path, and thumbnails use the processed image; GPS/EXIF metadata is retained. Add and Sync compare these output URLs to existing rows and exclude generated copies from discovery results. For explicit in-place processing, use `{"enabled": true, "overwrite": true}` instead of source/output directories. `model_path` optionally selects a detector; otherwise the upstream model discovery/download behavior applies.
+Blurring processes the full-resolution photo; thumbnail size is controlled separately by the `thumbnail` section. Relative folders beneath `source_dir` are preserved in `output_dir`. The stored `image_url`, metadata path, and thumbnails use the processed image; GPS/EXIF metadata is retained. Add and Sync compare these output URLs to existing rows and exclude generated copies from discovery results. For explicit in-place processing, use `{"enabled": true, "overwrite": true}` instead of source/output directories. `model_path` optionally selects a detector; otherwise the upstream model discovery/download behavior applies.
 
 Anonymization is off unless enabled. It supports `point_from_exif` photos with `image_url: file.path` and source thumbnails (or disabled thumbnails). The model is loaded only when a new valid image needs processing, and inference is serialized while metadata work can run concurrently. Processing errors follow `on_error` and do not import an unprocessed fallback. The standalone `landlensdb.process.Anonymizer` and `anonymize_images` APIs are also available.
 
