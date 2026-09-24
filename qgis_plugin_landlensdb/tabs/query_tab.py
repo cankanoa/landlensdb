@@ -25,8 +25,11 @@ from qgis.core import (
     QgsFeatureRequest,
     QgsGeometry,
     QgsLayerTreeGroup,
+    QgsMarkerSymbol,
     QgsProject,
     QgsRasterLayer,
+    QgsSingleSymbolRenderer,
+    QgsSvgMarkerSymbolLayer,
     QgsVectorLayer,
     QgsWkbTypes,
 )
@@ -71,6 +74,15 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
     SHARED_COMMENT_KEY = "landlensdb"
     SHARED_QUERY_KEY = "shared_queries"
     SHARED_TABLE_KEY = "Landlensdb/shared_query_table"
+    POINT_STYLE_KEY = "Landlensdb/point_style"
+    CAMERA_MARKER_PATH = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "assets",
+            "camera_upward_direction_marker.svg",
+        )
+    )
     SOURCE_TABLE_RE = re.compile(
         r'\bFROM\s+(?:(?P<schema>"(?:[^"]|"")+"|[\w]+)\s*\.\s*)?'
         r'(?P<table>"(?:[^"]|"")+"|[\w]+)',
@@ -157,6 +169,7 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         self.add_button.setEnabled(False)
         self._setup_add_menu()
         self._setup_copy_menu()
+        self._setup_geometry_style_menu()
 
         self.builder_controller = SqlBuilderController(
             self,
@@ -308,6 +321,48 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         copy_action = self.copy_menu.addAction("Copy")
         copy_action.setEnabled(bool(self._staged_metadata_items))
         copy_action.triggered.connect(self.copy_last_query_to_csv)
+
+    def _setup_geometry_style_menu(self):
+        self._point_style = QtCore.QSettings().value(
+            self.POINT_STYLE_KEY, "camera", type=str
+        )
+        if self._point_style not in ("camera", "point"):
+            self._point_style = "camera"
+
+        self.geometry_style_button = QtWidgets.QPushButton("Geometry style", self)
+        self.geometry_style_button.setToolTip(
+            "Choose styles for geometry layers added from Query or View."
+        )
+        menu = QtWidgets.QMenu(self.geometry_style_button)
+        point_menu = menu.addMenu("Point")
+        self.point_style_group = QtWidgets.QActionGroup(point_menu)
+        self.point_style_group.setExclusive(True)
+        for style, label in (("camera", "Camera direction icon"), ("point", "Point")):
+            action = point_menu.addAction(label)
+            action.setData(style)
+            action.setCheckable(True)
+            self.point_style_group.addAction(action)
+            action.setChecked(style == self._point_style)
+            if style == "camera":
+                action.setIcon(QtGui.QIcon(self.CAMERA_MARKER_PATH))
+        self.point_style_group.triggered.connect(self._set_point_style)
+
+        polygon_menu = menu.addMenu("Polygon")
+        polygon_group = QtWidgets.QActionGroup(polygon_menu)
+        polygon_group.setExclusive(True)
+        polygon_action = polygon_menu.addAction("Polygon")
+        polygon_action.setCheckable(True)
+        polygon_group.addAction(polygon_action)
+        polygon_action.setChecked(True)
+
+        self.geometry_style_button.setMenu(menu)
+        self.buttonLayout.insertWidget(
+            self.buttonLayout.indexOf(self.query_button), self.geometry_style_button
+        )
+
+    def _set_point_style(self, action):
+        self._point_style = action.data()
+        QtCore.QSettings().setValue(self.POINT_STYLE_KEY, self._point_style)
 
     def _stage_metadata_item(self, section_label, path_parts):
         label = self._metadata_stage_label(section_label, path_parts)
@@ -2191,8 +2246,21 @@ class QueryTab(QtWidgets.QWidget, FORM_CLASS):
         if layer.isValid():
             layer.setCustomProperty("landlensdb/query_text", query_text)
             layer.setCustomProperty("landlensdb/geometry_column", geometry_column)
+            self._apply_geometry_style(layer)
             self._add_open_image_action(layer)
         return layer if layer.isValid() else None
+
+    def _apply_geometry_style(self, layer):
+        if (
+            layer.geometryType() == QgsWkbTypes.PointGeometry
+            and self._point_style == "camera"
+        ):
+            # QGIS caches this unrotated SVG as an image for map rendering,
+            # while retaining vector detail for enlarged and printed symbols.
+            symbol = QgsMarkerSymbol(
+                [QgsSvgMarkerSymbolLayer(self.CAMERA_MARKER_PATH, 6)]
+            )
+            layer.setRenderer(QgsSingleSymbolRenderer(symbol))
 
     def _add_open_image_action(self, layer):
         field_names = [field.name() for field in layer.fields()]

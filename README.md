@@ -98,6 +98,7 @@ Build with `make qgis-build`, then install `qgis_plugin_landlensdb.zip` through 
 - Selecting a table checks its required column names and types. Invalid tables cannot be imported into until their schema is corrected.
 - Set threads, batch size, error handling, and output CRS below the table. CRS must match the destination table.
 - **File Spatial Query** uses a vector file; **Select Bbox Query** lets you draw a rectangle on the map.
+- **Geometry style**, immediately left of **Query**, controls newly added geometry layers from Query and View. **Point → Camera direction icon** uses the bundled SVG by default; **Point → Point** keeps QGIS's default point styling. **Polygon → Polygon** keeps polygon styling unchanged. The point choice is remembered between sessions.
 - In **View**, check images beside their preview/path labels, or use **Add → Select all** to check every image in the viewer. **Add Both**, **Add Geometry**, and **Add Thumbnail** are greyed out until an image is checked. These actions create a query on the checked images' exact stored `image_url` values and add layers through the Query workflow. The query is available in the Query editor and history. Only checked images currently displayed are included; changing Preview/Path or North up keeps the checks.
 
 ## Development
