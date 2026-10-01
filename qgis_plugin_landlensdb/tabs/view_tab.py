@@ -10,6 +10,11 @@ from ..shared.connection_utils import (
     psycopg2,
     sql,
 )
+from ..shared.image_sources import (
+    metadata_field_paths,
+    metadata_value,
+    resolve_image_path,
+)
 
 
 class ImageCanvas(QtWidgets.QGraphicsView):
@@ -148,6 +153,8 @@ class ViewTab(QtWidgets.QWidget):
         self._last_grid_columns = 0
         self._organize_path = None
         self._navigation_cache = None
+        self._source_mode = "preview"
+        self._source_metadata_path = ()
 
         outer_layout = QtWidgets.QVBoxLayout(self)
         outer_layout.setContentsMargins(12, 12, 12, 12)
@@ -159,10 +166,8 @@ class ViewTab(QtWidgets.QWidget):
         header_row.addWidget(QtWidgets.QLabel("Source:", self))
         self.source_button = QtWidgets.QPushButton("Preview", self)
         self.source_menu = QtWidgets.QMenu(self)
-        self.preview_action = self.source_menu.addAction("Preview")
-        self.path_action = self.source_menu.addAction("Path")
-        self.preview_action.triggered.connect(lambda: self._set_source_mode("preview"))
-        self.path_action.triggered.connect(lambda: self._set_source_mode("path"))
+        self.source_menu.aboutToShow.connect(self._rebuild_source_menu)
+        self._rebuild_source_menu()
         self.source_button.setMenu(self.source_menu)
         header_row.addWidget(self.source_button)
 
@@ -269,7 +274,6 @@ class ViewTab(QtWidgets.QWidget):
         self.grid_layout.setSpacing(0)
         self.scroll_area.setWidget(self.grid_host)
 
-        self._source_mode = "preview"
         self._refresh_layer_selector()
         self._update_navigation_buttons()
 
@@ -339,9 +343,56 @@ class ViewTab(QtWidgets.QWidget):
             self._source_query, image_urls, add_thumbnail, add_geometry
         )
 
-    def _set_source_mode(self, mode):
+    def _rebuild_source_menu(self):
+        self.source_menu.clear()
+        for mode, label in (("preview", "Preview"), ("image_url", "image_url")):
+            action = self.source_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self._source_mode == mode)
+            action.triggered.connect(
+                lambda _checked=False, mode=mode: self._set_source_mode(mode)
+            )
+
+        metadata_menu = self.source_menu.addMenu("Metadata")
+        paths = set()
+        frame = self._current_geoimageframe
+        if frame is not None and "metadata" in frame.columns:
+            for value in frame["metadata"]:
+                paths.update(metadata_field_paths(value))
+        menus = {(): metadata_menu}
+        for path in sorted(paths, key=lambda parts: tuple(str(part) for part in parts)):
+            for length in range(1, len(path)):
+                prefix = path[:length]
+                if prefix not in menus:
+                    menus[prefix] = menus[prefix[:-1]].addMenu(str(prefix[-1]))
+            action = menus[path[:-1]].addAction(str(path[-1]))
+            action.setCheckable(True)
+            action.setChecked(
+                self._source_mode == "metadata" and self._source_metadata_path == path
+            )
+            action.triggered.connect(
+                lambda _checked=False, path=path: self._set_source_mode(
+                    "metadata", path
+                )
+            )
+        if not paths:
+            metadata_menu.addAction("No metadata fields").setEnabled(False)
+
+    def _set_source_mode(self, mode, metadata_path=()):
         self._source_mode = mode
-        self.source_button.setText("Preview" if mode == "preview" else "Path")
+        self._source_metadata_path = tuple(metadata_path)
+        label = (
+            "metadata.{}".format(".".join(str(part) for part in metadata_path))
+            if mode == "metadata"
+            else "Preview" if mode == "preview" else "image_url"
+        )
+        # Deep field names stay visible in the tooltip without widening the toolbar.
+        self.source_button.setText(
+            self.source_button.fontMetrics().elidedText(
+                label, QtCore.Qt.ElideMiddle, 220
+            )
+        )
+        self.source_button.setToolTip(label)
         self._render_geoimageframe()
 
     def _handle_layer_selector_changed(self, _index):
@@ -847,6 +898,13 @@ class ViewTab(QtWidgets.QWidget):
 
         image_path = self._image_path_for_row(row)
         if not image_path:
+            if self._source_mode == "metadata":
+                return (
+                    None,
+                    "No Image\nNo image path in metadata.{} for this image.".format(
+                        ".".join(str(part) for part in self._source_metadata_path)
+                    ),
+                )
             return None, "No Image\nNo image path is available for this image."
         image = QtGui.QImage(image_path)
         if image.isNull():
@@ -874,6 +932,9 @@ class ViewTab(QtWidgets.QWidget):
         return angle
 
     def _image_path_for_row(self, row):
+        if self._source_mode == "metadata":
+            value = metadata_value(row.get("metadata"), self._source_metadata_path)
+            return resolve_image_path(value, row.get("image_url"))
         return row.get("image_url")
 
     def _compute_grid_size(self, image_count):
